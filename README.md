@@ -8,4 +8,4 @@ Hepatocellular carcimonia (HCC) is the most common liver cancer in adults and re
 
 ## License
 
-The repository is licensed under the 'apache-2.0' license.
+The repository is licensed under the `apache-2.0` license.
