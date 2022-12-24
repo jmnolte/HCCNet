@@ -1,6 +1,6 @@
 # Detecting hepatocellular carcinoma in non-alcoholic fatty liver disease patients using deep learning based radiomics
 
-This repository contains the data along with the corresponding python code to reproduce all results presented in the project's preliminary [research report](https://github.com/jmnolte/thesis/blob/master/report/midway_report_draft.pdf). The research report was created as part of the author's master thesis at the University of Utrecht.
+This repository contains the data along with the corresponding python code to reproduce all results presented in the project's preliminary [research report](https://github.com/jmnolte/thesis/tree/master/report). The research report was created as part of the author's master thesis at the University of Utrecht.
 
 ## Abstract
 
