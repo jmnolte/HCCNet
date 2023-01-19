@@ -1,6 +1,6 @@
 # Detecting hepatocellular carcinoma in non-alcoholic fatty liver disease patients using deep learning based radiomics
 
-This repository contains the data along with the corresponding python code to reproduce all results presented in the project's preliminary [research report](https://github.com/jmnolte/thesis/tree/master/report). The research report was created as part of the author's master thesis at the University of Utrecht.
+This repository contains the [data](https://github.com/jmnolte/thesis/tree/master/test_data) along with the corresponding [code](https://github.com/jmnolte/thesis/tree/master/test_scripts) to reproduce all results presented in the project's preliminary [research report](https://github.com/jmnolte/thesis/tree/master/report). The research report was created as part of the author's master thesis at the University of Utrecht.
 
 ## Abstract
 
@@ -10,7 +10,7 @@ Early stage diagnosis could reduce the burden of hepatocellular carcimonia (HCC)
 
 ### Requirements
 
-To reproduce the results presented in the project's [research report](https://github.com/jmnolte/thesis/tree/master/report) a Google Drive account as well as access to Google Colab are required. All required package versions are listed in [requirements.txt](https://github.com/jmnolte/thesis/blob/master/requirements.txt). To ensure a reproducible workflow, install them by running `pip install -r requirements.txt` in your command line.
+To reproduce the results presented in the project's [research report](https://github.com/jmnolte/thesis/tree/master/report) a Google Drive account as well as access to Google Colab are required. All required package versions are listed in [requirements.txt](https://github.com/jmnolte/thesis/blob/master/requirements.txt). To ensure a fully reproducible workflow, install them by running `pip install -r requirements.txt` in your command line.
 
 ### Workflow
 
