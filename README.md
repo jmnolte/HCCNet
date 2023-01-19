@@ -10,7 +10,7 @@ Early stage diagnosis could reduce the burden of hepatocellular carcimonia (HCC)
 
 ### Requirements
 
-To reproduce the results presented in the project's [research report](https://github.com/jmnolte/thesis/tree/master/report) a Google Drive account as well as access to Google Colab are required. All required package versions are listed in [`requirements.txt`](https://github.com/jmnolte/thesis/blob/master/requirements.txt). To ensure a reproducible workflow, install them by running `pip install -r requirements.txt` in your command line.
+To reproduce the results presented in the project's [research report](https://github.com/jmnolte/thesis/tree/master/report) a Google Drive account as well as access to Google Colab are required. All required package versions are listed in [requirements.txt](https://github.com/jmnolte/thesis/blob/master/requirements.txt). To ensure a reproducible workflow, install them by running `pip install -r requirements.txt` in your command line.
 
 ### Workflow
 
