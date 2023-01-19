@@ -8,16 +8,18 @@ Early stage diagnosis could reduce the burden of hepatocellular carcimonia (HCC)
 
 ## Reproducing the Results
 
-To reproduce the results presented in the project's [research report](https://github.com/jmnolte/thesis/tree/master/report) a Google Drive account as well as access to Google Colab are required.
+### Requirements
 
-The script for the [baseline](https://github.com/jmnolte/thesis/tree/master/test_scripts/baseline_approach) and the [deep learning](https://github.com/jmnolte/thesis/tree/master/test_scripts/deep_learning_approach) approach are self contained and can be executed independently. The scripts for the baseline approach follow the following order:
+To reproduce the results presented in the project's [research report](https://github.com/jmnolte/thesis/tree/master/report) a Google Drive account as well as access to Google Colab are required. All required package versions are listed in [`requirements.txt`](https://github.com/jmnolte/thesis/blob/master/requirements.txt). To ensure a reproducible workflow, install them by running `pip install -r requirements.txt` in your command line.
+
+### Workflow
+
+The script for the [baseline](https://github.com/jmnolte/thesis/tree/master/test_scripts/baseline_approach) and the [deep learning](https://github.com/jmnolte/thesis/tree/master/test_scripts/deep_learning_approach) approach are self contained and can be executed independently. The scripts for the baseline approach are executed in the following order:
 
 1. [segmentation.ipynb](https://github.com/jmnolte/thesis/blob/master/test_scripts/baseline_approach/segmentation.ipynb)
 2. [segmentation_visual.ipynb](https://github.com/jmnolte/thesis/blob/master/test_scripts/baseline_approach/segmentation_visual.ipynb) (optional)
 3. [feature_extraction.ipynb](https://github.com/jmnolte/thesis/blob/master/test_scripts/baseline_approach/feature_extraction.ipynb)
 4. [model_building.ipynb](https://github.com/jmnolte/thesis/blob/master/test_scripts/baseline_approach/model_building.ipynb)
-
-## Requirements
 
 ## License
 
