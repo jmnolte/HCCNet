@@ -14,7 +14,7 @@ To reproduce the results presented in the project's [research report](https://gi
 
 ### Workflow
 
-The script for the [baseline](https://github.com/jmnolte/thesis/tree/master/test_scripts/baseline_approach) and the [deep learning](https://github.com/jmnolte/thesis/tree/master/test_scripts/deep_learning_approach) approach are self contained and can be executed independently. The scripts for the baseline approach are executed in the following order:
+The scripts for the [baseline](https://github.com/jmnolte/thesis/tree/master/test_scripts/baseline_approach) and the [deep learning](https://github.com/jmnolte/thesis/tree/master/test_scripts/deep_learning_approach) approach are self contained and can be executed independently. The scripts for the baseline approach are executed in the following order:
 
 1. [segmentation.ipynb](https://github.com/jmnolte/thesis/blob/master/test_scripts/baseline_approach/segmentation.ipynb)
 2. [segmentation_visual.ipynb](https://github.com/jmnolte/thesis/blob/master/test_scripts/baseline_approach/segmentation_visual.ipynb) (optional)
