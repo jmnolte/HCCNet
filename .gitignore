@@ -48,4 +48,8 @@ Temporary Items
 # iCloud generated files
 *.icloud
 
+### sensitive data and helper scripts
+thesis/data/
+thesis/new_scripts/
+
 # End of https://www.toptal.com/developers/gitignore/api/macos,jupyternotebooks
