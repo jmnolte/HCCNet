@@ -4,8 +4,29 @@ import pydicom as pm
 import shutil
 from tqdm import tqdm
 from natsort import natsorted
+import random
+import numpy as np
+import torch
+
+class ReproducibilityUtils:
+
+    def seed_everything(seed):
+
+        '''
+        Seed everything for reproducibility.
+        '''
+
+        random.seed(seed)
+        os.environ['PYTHONHASHSEED'] = str(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 class EnvironmentUtils:
+
     def __init__(self, path: str) -> None:
 
         '''
@@ -18,9 +39,6 @@ class EnvironmentUtils:
         self.path = path
         self.sequences = glob(os.path.join(self.path, '*/DICOM/*/*'), recursive = True)
         self.folders = glob(os.path.join(self.path, '*/DICOM/*'), recursive = True)
-
-        # elif self.subfolders == 'names':
-        #     self.folders = glob(os.path.join(self.path, '*'), recursive = True)
 
     def create_subfolders(self, subfolders: list) -> None:
 
