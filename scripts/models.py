@@ -100,11 +100,11 @@ class ResNet(torch.nn.Module):
             if param.requires_grad == True:
                 print(name)
 
-WEIGHTS_PATH = '/Users/noltinho/MedicalNet/pytorch_files/pretrain'
-
-resnet50 = ResNet(num_channels=1, version='resnet50')
-resnet50.define_output_layer(num_classes=2)
-resnet50.intialize_model(weights_path=WEIGHTS_PATH, pretrained=True)
-resnet50.extract_features(feature_extraction=True)
-resnet50.assert_unfrozen_parameters()
+if __name__ == '__main__':
+    WEIGHTS_PATH = '/Users/noltinho/MedicalNet/pytorch_files/pretrain'
+    resnet50 = ResNet(num_channels=1, version='resnet50')
+    resnet50.define_output_layer(num_classes=2)
+    resnet50.intialize_model(weights_path=WEIGHTS_PATH, pretrained=True)
+    resnet50.extract_features(feature_extraction=True)
+    resnet50.assert_unfrozen_parameters()
         
