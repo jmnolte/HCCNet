@@ -234,6 +234,6 @@ poetry.toml
 .ionide
 
 ### Sensitive Patient Information and Data ###
-data/
+sensitive_data/
 
 # End of https://www.toptal.com/developers/gitignore/api/python,macos,jupyternotebooks,visualstudiocode
