@@ -89,6 +89,17 @@ class Preprocessing:
 
         print('{} out of {} observations include all required images'.format(len(observation_list), len(self.nifti_patients)))
         return observation_list
+    
+    def split_observations_by_modality(self, observation_list: list, modality: str) -> list:
+
+        '''
+        Split the observation paths by modality.
+
+        Args:
+            observation_list (list): List of observations to split.
+            modality (str): Modality to split by.
+        '''
+        return [glob(os.path.join(observation, modality + '.nii.gz')) for observation in observation_list]
 
     def clean_directory(self, image_list) -> None:
 
@@ -130,7 +141,8 @@ class Preprocessing:
             monai.transforms.RandRotated(keys=image_list, prob=0.1,
                                          range_x=np.pi/8, range_y=np.pi/8, range_z=np.pi/8),
             monai.transforms.RandGaussianNoised(keys=image_list, prob=0.1, mean=0, std=0.1),
-            monai.transforms.RandAxisFlipd(keys=image_list, prob=0.1)
+            monai.transforms.RandAxisFlipd(keys=image_list, prob=0.1),
+            monai.transforms.RandAdjustContrastd(keys=image_list, prob=0.1, gamma=(0.5, 2.0)),
         ])
         
         postprocessing = monai.transforms.Compose([
@@ -158,10 +170,3 @@ if __name__ == '__main__':
     observation_list = np.random.choice(observation_list, 5, replace=False)
     # IMAGES_TO_DELETE = ['T1_dyn','T2_short_ET','T1_in_out','T2W_ETS']
     # prep.clean_directory(IMAGES_TO_DELETE)
-    labels = np.random.randint(2, size=561)
-    dwi_b0_paths = [glob(os.path.join(observation, 'DWI_b0.nii.gz')) for observation in observation_list]
-    dwi_b150_paths = [glob(os.path.join(observation, 'DWI_b150.nii.gz')) for observation in observation_list]
-    data_dict = [{'DWI_b0': dwi_b0, 'DWI_b150': dwi_b150, 'label': label} for dwi_b0, dwi_b150, label in zip(dwi_b0_paths, dwi_b150_paths, labels)]
-    train_transforms = prep.apply_transformations(['DWI_b0', 'DWI_b150'], 'train')
-    train_dataset = monai.data.CacheDataset(data_dict, train_transforms)
-    print(train_dataset[0]['image'].shape)

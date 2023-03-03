@@ -1,14 +1,19 @@
 import torch
+import monai
 import os
 import time
 import copy
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn import metrics
+from preprocessing import Preprocessing
+from models import ResNet
+from utils import ReproducibilityUtils
+import platform
 
 class Training:
     
-    def __init__(self, model, version: str, device, dataloaders: dict, output_dir: str) -> None:
+    def __init__(self, model, device: torch.device, dataloaders: dict, output_dir: str) -> None:
 
         '''
         Initialize the training class.
@@ -22,7 +27,8 @@ class Training:
         '''
 
         self.model = model
-        self.version = version
+        self.model.to(device)
+        self.version = str(model)
         self.device = device
         self.dataloaders = dataloaders
         self.output_dir = output_dir
@@ -38,6 +44,8 @@ class Training:
 
         folder_name = 'resnet_' + str(self.version.strip('resnet')) + '_weights.pth'
         weights_path = os.path.join(self.output_dir, 'model_weights', folder_name)
+        if not os.path.exists(weights_path):
+            os.makedirs(weights_path)
         torch.save(best_model_weights, weights_path)
 
     def save_training_history(self, training_hist: list) -> None:
@@ -51,6 +59,8 @@ class Training:
     
         folder_name = 'resnet_' + str(self.version.strip('resnet')) + '_hist.npy'
         history_path = os.path.join(self.output_dir, 'model_history', folder_name)
+        if not os.path.exists(history_path):
+            os.makedirs(history_path)
         np.save(history_path, training_hist)
 
     def save_model_preds(self, preds: list) -> None:
@@ -64,10 +74,12 @@ class Training:
     
         folder_name = 'resnet_' + str(self.version.strip('resnet')) + '_preds.npy'
         preds_path = os.path.join(self.output_dir, 'model_preds', folder_name)
+        if not os.path.exists(preds_path):
+            os.makedirs(preds_path)
         np.save(preds_path, preds)
             
 
-    def train_model(self, min_epochs: int, criterion, optimizer, early_stopping: bool = True, patience: int = 10) -> list:
+    def train_model(self, min_epochs: int, criterion: torch.nn, optimizer: torch.optim, early_stopping: bool = True, patience: int = 10) -> None:
 
         '''
         Train the model.
@@ -146,8 +158,8 @@ class Training:
                     break
 
         time_elapsed = time.time() - since
-        Training.save_best_model(best_model_weigths=best_model_weights)
-        Training.save_training_history(training_hist=history)
+        Training.save_best_model(best_model_weights)
+        Training.save_training_history(history)
 
         print('Training complete in {:.0f}m {:.0f}s'.format(time_elapsed // 60, time_elapsed % 60))
         print('Performance Metrics on Validation set:')
@@ -267,5 +279,28 @@ class Training:
 
         
 RESULTS_DIR = '/Users/noltinho/thesis/results'
-  
+PATH = '/Users/noltinho/thesis_private/data'
+COMPLETE_IMAGE_LIST = ['T1W_OOP','T1W_IP','T1W_DYN','T2W_TES','T2W_TEL','DWI_b0','DWI_b150','DWI_b400','DWI_b800']
+WEIGHTS_PATH = '/Users/noltinho/MedicalNet/pytorch_files/pretrain'
 
+if __name__ == '__main__':
+    print(platform.platform())
+    ReproducibilityUtils.seed_everything(123)
+    prep = Preprocessing(PATH)
+    observation_list = prep.assert_observation_completeness(COMPLETE_IMAGE_LIST)
+    observation_list = np.random.choice(observation_list, 10, replace=False)
+    labels = np.random.randint(2, size=561)
+    dwi_b0_paths = prep.split_observations_by_modality(observation_list, 'DWI_b0')
+    dwi_b150_paths = prep.split_observations_by_modality(observation_list, 'DWI_b150')
+    data_dict = [{'DWI_b0': dwi_b0, 'DWI_b150': dwi_b150, 'label': label} for dwi_b0, dwi_b150, label in zip(dwi_b0_paths, dwi_b150_paths, labels)]
+    train_transforms = prep.apply_transformations(['DWI_b0', 'DWI_b150'], 'train')
+    val_transforms = prep.apply_transformations(['DWI_b0','DWI_b150'], 'val')
+    dataset = {'train': monai.data.CacheDataset(data_dict[:5], train_transforms), 
+               'val': monai.data.CacheDataset(data_dict[5:], val_transforms)}
+    dataloader_dict = {x: monai.data.DataLoader(dataset[x], batch_size=2, shuffle=True, num_workers=4) for x in ['train', 'val']}
+    resnet50 = ResNet(version='resnet50', num_out_classes=2, num_in_channels=2, pretrained=True, feature_extraction=True, weights_path=WEIGHTS_PATH)
+    # device = torch.device('cuda')
+    # training = Training(resnet50, device, dataloader_dict, RESULTS_DIR)
+    # criterion = torch.nn.CrossEntropyLoss()
+    # optimizer = torch.optim.SGD(resnet50.parameters(), lr=0.001, momentum=0.9)
+    # training.train_model(5, criterion, optimizer)
