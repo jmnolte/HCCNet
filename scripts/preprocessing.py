@@ -7,8 +7,6 @@ from tqdm import tqdm
 from natsort import natsorted
 from glob import glob
 import dicom2nifti
-from collections import Counter, OrderedDict
-from operator import itemgetter
 from utils import MetadataUtils
 
 class Preprocessing:
@@ -71,7 +69,7 @@ class Preprocessing:
 
         return image_list
     
-    def assert_observation_completeness(self, image_list: list) -> None:
+    def assert_observation_completeness(self, image_list: list) -> list:
 
         '''
         Assert that all observations include all required images.
@@ -110,34 +108,16 @@ class Preprocessing:
                     print('Deleting {}.'.format(image))
 
 
-    def transform_images(self, image_list: list) -> monai.transforms:
+    def apply_transformations(self, image_list: list, dataset: str) -> monai.transforms:
 
         '''
         Perform data transformations on image and image labels.
 
         Args:
             image_list (list): List of images to apply transformations on.
+            dataset (str): Dataset to apply transformations on.
         '''
 
-        return monai.transforms.Compose([
-            monai.transforms.LoadImaged(keys=image_list),
-            monai.transforms.EnsureChannelFirstd(keys=image_list),
-            monai.transforms.Orientationd(keys=image_list, axcodes='ASL'),
-            monai.transforms.Resized(keys=image_list, spatial_size=(224, 224, 224)),
-            monai.transforms.NormalizeIntensityd(keys=image_list, channel_wise=True),
-            monai.transforms.ConcatItemsd(keys=image_list, name='image', dim=0),
-            monai.transforms.IntensityStatsd(keys='image', key_prefix='orig', ops=['mean', 'std'], channel_wise=True),
-            monai.transforms.ToTensord(keys=['image', 'label'])
-            ])
-    
-    def augment_data(self, image_list: list, transforms_list: list) -> monai.transforms:
-
-        '''
-        Perform data augmentation on the images and labels.
-
-        Args:
-            image_list (list): List of images to apply transformations on.
-        '''
         preprocessing = monai.transforms.Compose([
             monai.transforms.LoadImaged(keys=image_list),
             monai.transforms.EnsureChannelFirstd(keys=image_list),
@@ -146,10 +126,12 @@ class Preprocessing:
             monai.transforms.NormalizeIntensityd(keys=image_list, channel_wise=True)
             ])
         
-        rand_rotation = monai.transforms.RandRotated(keys=image_list, prob=1,
-                                                    range_x=np.pi/8, range_y=np.pi/8, range_z=np.pi/8)
-        rand_gauss_noise = monai.transforms.RandGaussianNoised(keys=image_list, prob=1, mean=0, std=0.1)
-        rand_axis_flip = monai.transforms.RandAxisFlipd(keys=image_list, prob=1)
+        data_augmentation = monai.transforms.Compose([
+            monai.transforms.RandRotated(keys=image_list, prob=0.1,
+                                         range_x=np.pi/8, range_y=np.pi/8, range_z=np.pi/8),
+            monai.transforms.RandGaussianNoised(keys=image_list, prob=0.1, mean=0, std=0.1),
+            monai.transforms.RandAxisFlipd(keys=image_list, prob=0.1)
+        ])
         
         postprocessing = monai.transforms.Compose([
             monai.transforms.ConcatItemsd(keys=image_list, name='image', dim=0),
@@ -157,20 +139,10 @@ class Preprocessing:
             monai.transforms.ToTensord(keys=['image', 'label'])
         ])
 
-        if set(transforms_list) == set(['rand_rotation']):
-            return monai.transforms.Compose([preprocessing, rand_rotation, postprocessing])
-        elif set(transforms_list) == set(['rand_gauss_noise']):
-            return monai.transforms.Compose([preprocessing, rand_gauss_noise, postprocessing])
-        elif set(transforms_list) == set(['rand_axis_flip']):
-            return monai.transforms.Compose([preprocessing, rand_axis_flip, postprocessing])
-        elif set(transforms_list) == set(['rand_rotation','rand_gauss_noise']):
-            return monai.transforms.Compose([preprocessing, rand_rotation, rand_gauss_noise, postprocessing])
-        elif set(transforms_list) == set(['rand_rotation','rand_axis_flip']):
-            return monai.transforms.Compose([preprocessing, rand_rotation, rand_axis_flip, postprocessing])
-        elif set(transforms_list) == set(['rand_gauss_noise','rand_axis_flip']):
-            return monai.transforms.Compose([preprocessing, rand_gauss_noise, rand_axis_flip, postprocessing])
-        elif set(transforms_list) == set(['rand_contrast','rand_gauss_noise','rand_axis_flip']):
-            return monai.transforms.Compose([preprocessing, rand_rotation, rand_gauss_noise, rand_axis_flip, postprocessing])
+        if dataset == 'train':
+            return monai.transforms.Compose([preprocessing, data_augmentation, postprocessing])
+        else:
+            return monai.transforms.Compose([preprocessing, postprocessing])
         
 
 if __name__ == '__main__':
@@ -190,8 +162,6 @@ if __name__ == '__main__':
     dwi_b0_paths = [glob(os.path.join(observation, 'DWI_b0.nii.gz')) for observation in observation_list]
     dwi_b150_paths = [glob(os.path.join(observation, 'DWI_b150.nii.gz')) for observation in observation_list]
     data_dict = [{'DWI_b0': dwi_b0, 'DWI_b150': dwi_b150, 'label': label} for dwi_b0, dwi_b150, label in zip(dwi_b0_paths, dwi_b150_paths, labels)]
-    transforms = prep.transform_images(['DWI_b0', 'DWI_b150'])
-    dataset = monai.data.CacheDataset(data_dict, transforms)
-    rand_rotation_transforms = prep.augment_data(['DWI_b0', 'DWI_b150'],['rand_rotation'])
-    rand_rotation_dataset = monai.data.CacheDataset(data_dict, rand_rotation_transforms)
-    train_dataset = zip(dataset, rand_rotation_dataset)
+    train_transforms = prep.apply_transformations(['DWI_b0', 'DWI_b150'], 'train')
+    train_dataset = monai.data.CacheDataset(data_dict, train_transforms)
+    print(train_dataset[0]['image'].shape)
