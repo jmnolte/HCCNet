@@ -236,4 +236,7 @@ poetry.toml
 ### Sensitive Patient Information and Data ###
 sensitive_data/
 
+### Retrained model weigths ###
+results/model_weights/
+
 # End of https://www.toptal.com/developers/gitignore/api/python,macos,jupyternotebooks,visualstudiocode
