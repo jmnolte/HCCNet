@@ -10,14 +10,20 @@ class ResNet(torch.nn.Module):
         Define the model's version and set the number of input channels.
 
         Args:
-            version (str): ResNet model version.
+            version (str): ResNet model version. Can be 'resnet10', 'resnet18', 'resnet34', 'resnet50',
+                'resnet101', 'resnet152', or 'resnet200'.
             num_out_classes (int): Number of output classes.
             num_in_channels (int): Number of input channels.
             pretrained (bool): If True, pretrained weights are used.
             feature_extraction (bool): If True, only the last layer is updated during training. If False,
-            all layers are updated.
+                all layers are updated.
             weights_path (str): Path to the pretrained weights.
         '''
+        try: 
+            assert any(version == version_item for version_item in ['resnet10','resnet18','resnet34','resnet50','resnet101','resnet152','resnet200'])
+        except AssertionError:
+            print('Invalid version. Please choose from: resnet10, resnet18, resnet34, resnet50, resnet101, resnet152, resnet200')
+            exit(1)
 
         self.version = version
         self.num_in_channels = num_in_channels
@@ -41,8 +47,19 @@ class ResNet(torch.nn.Module):
         if self.pretrained:
             model_dict = self.intialize_model(weights_path)
             self.model.load_state_dict(model_dict)
-            print('Loading pretrained weights...')
+            print('Pretrained weights are loaded.')
         self.extract_features(feature_extraction)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+
+        '''
+        Forward pass through the model.
+
+        Args:
+            input (torch.Tensor): Input tensor.
+        '''
+        x = self.model(x)
+        return x
     
     def define_output_layer(self, num_classes: int) -> torch.nn.Linear:
 
@@ -113,5 +130,3 @@ class ResNet(torch.nn.Module):
 if __name__ == '__main__':
     WEIGHTS_PATH = '/Users/noltinho/MedicalNet/pytorch_files/pretrain'
     resnet50 = ResNet(version='resnet50', num_out_classes=2, num_in_channels=9, pretrained=True, feature_extraction=True, weights_path=WEIGHTS_PATH)
-    resnet50.assert_unfrozen_parameters()
-        
