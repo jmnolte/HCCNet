@@ -1,12 +1,11 @@
 import torch
-import monai
 import os
 import time
 import copy
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn import metrics
-from preprocessing import PreprocessingUtils, DataLoader
+from preprocessing import DataLoader
 from models import ResNet
 from utils import ReproducibilityUtils
 from tqdm import tqdm
@@ -94,7 +93,7 @@ class Training:
         best_loss = 10000.0
         counter = 0
 
-        for epoch in range(max_epochs):
+        for epoch in range(min_epochs):
             print('Epoch {}'.format(epoch))
             print('-' * 10)
 
@@ -218,19 +217,16 @@ if __name__ == '__main__':
     parser.add_argument("-ml", "--modality_list", default=MODALITY_LIST, nargs='+', help="List of modalities to use for training")
     parser.add_argument("-s", "--seed", default=123, type=int, help="Seed to use for reproducibility")
     parser.add_argument("-d", "--device", default='cuda', type=str, help="Device to use for training")
+    parser.add_argument("-ts", "--test_set", default=False, type=bool, help="Flag to load test or training and validation set")
     parser.add_argument("-dd", "--data_dir", default=DATA_DIR, type=str, help="Path to data directory")
     parser.add_argument("-rd", "--results_dir", default=RESULTS_DIR, type=str, help="Path to results directory")
     parser.add_argument("-wd", "--weights_dir", default=WEIGHTS_DIR, type=str, help="Path to pretrained weights")
     args = vars(parser.parse_args())
     ReproducibilityUtils.seed_everything(args['seed'])
-    prep = PreprocessingUtils(args['data_dir'])
-    observation_list = prep.assert_observation_completeness(args['modality_list'])
-    observation_list = np.random.choice(observation_list, 20, replace=False)
-    path_dict = {modality: prep.split_observations_by_modality(observation_list, modality) for modality in args['modality_list']}
-    path_dict['label'] = list(np.random.randint(2, size=20))
-    data_dict = [dict(zip(path_dict.keys(), vals)) for vals in zip(*(path_dict[k] for k in path_dict.keys()))]
-    dataloader = DataLoader(image_list=args['modality_list'])
-    dataloader_dict = dataloader.load_data(data_dict, [0.6, 0.2, 0.2], args['batch_size'], 4)
+    dataloader = DataLoader(args['data_dir'], args['modality_list'])
+    labels = np.random.randint(2, size=20)
+    data_dict = dataloader.create_data_dict(labels)
+    dataloader_dict = dataloader.load_data(data_dict, [0.6, 0.2, 0.2], args['batch_size'], 4, args['test_set'])
     model = ResNet(args['version'], 2, len(args['modality_list']), args['pretrained'], args['feature_extraction'], args['weights_dir'])
     criterion = torch.nn.CrossEntropyLoss()
     optimizer = torch.optim.SGD(model.parameters(), args['learning_rate'], args['momentum'])

@@ -2,7 +2,6 @@ import monai
 import numpy as np
 import glob
 import os
-import nibabel as nib
 from tqdm import tqdm
 from natsort import natsorted
 from glob import glob
@@ -83,8 +82,77 @@ class PreprocessingUtils:
                 image_list.append(image_head)
 
         return image_list
-    
-    def assert_observation_completeness(self, image_list: list) -> list:
+
+    def clean_directory(self, image_list) -> None:
+
+        '''
+        Clean the directory.
+
+        Args:
+            image_list (list): List of images to delete.
+        '''
+
+        for observation in tqdm(natsorted(self.nifti_patients)):
+            images = glob(os.path.join(observation, '*.nii.gz'))
+            for image in images:
+                _, image_head = os.path.split(image)
+                if image_head.startswith('S') or any(str(image + '.nii.gz') == image_head for image in image_list):
+                    os.remove(image)
+                    print('Deleting {}.'.format(image))
+
+class DataLoader:
+
+    def __init__(self, path: str, modality_list: list) -> None:
+
+        '''
+        Initialize the data loader class.
+
+        Args:
+            path (str): Path to the data.
+            modality_list (list): List of modalities to load.
+        '''
+
+        self.modality_list = modality_list
+        self.nifti_dir = os.path.join(path, 'nifti')
+        self.nifti_patients = glob(os.path.join(self.nifti_dir, '*'), recursive = True)
+
+    def apply_transformations(self, dataset_indicator: str) -> monai.transforms:
+
+        '''
+        Perform data transformations on image and image labels.
+
+        Args:
+            dataset_indicator (str): Dataset to apply transformations on. Can be 'train', 'val' or 'test'.
+        '''
+
+        preprocessing = monai.transforms.Compose([
+            monai.transforms.LoadImaged(keys=self.modality_list),
+            monai.transforms.EnsureChannelFirstd(keys=self.modality_list),
+            monai.transforms.Orientationd(keys=self.modality_list, axcodes='ASL'),
+            monai.transforms.Resized(keys=self.modality_list, spatial_size=(224, 224, 224)),
+            monai.transforms.ConcatItemsd(keys=self.modality_list, name='image', dim=0),
+            monai.transforms.NormalizeIntensityd(keys='image', channel_wise=True)
+            ])
+        
+        augmentation = monai.transforms.Compose([
+            monai.transforms.RandRotated(keys='image', prob=0.1,
+                                         range_x=np.pi/8, range_y=np.pi/8, range_z=np.pi/8),
+            monai.transforms.RandGaussianNoised(keys='image', prob=0.1, mean=0, std=0.1),
+            monai.transforms.RandAxisFlipd(keys='image', prob=0.1),
+            monai.transforms.RandAdjustContrastd(keys='image', prob=0.1, gamma=(0.5, 2.0)),
+        ])
+        
+        postprocessing = monai.transforms.Compose([
+            monai.transforms.IntensityStatsd(keys='image', key_prefix='orig', ops=['mean', 'std'], channel_wise=True),
+            monai.transforms.ToTensord(keys=['image', 'label'])
+        ])
+
+        if dataset_indicator == 'train':
+            return monai.transforms.Compose([preprocessing, augmentation, postprocessing])
+        else:
+            return monai.transforms.Compose([preprocessing, postprocessing])
+        
+    def assert_observation_completeness(self) -> list:
 
         '''
         Assert that all observations include all required images.
@@ -93,7 +161,7 @@ class PreprocessingUtils:
             image_list (list): List of images to check.
             include_quant (bool): Whether to include the quant series images.
         '''
-        image_names_list = [image_name + '.nii.gz' for image_name in image_list]
+        image_names_list = [image_name + '.nii.gz' for image_name in self.modality_list]
         observation_list = []
         for observation in tqdm(natsorted(self.nifti_patients)):
             images = [image for image in glob(os.path.join(observation, '*.nii.gz'))]
@@ -116,74 +184,23 @@ class PreprocessingUtils:
             modality (str): Modality to split by.
         '''
         return [glob(os.path.join(observation, modality + '.nii.gz')) for observation in observation_list]
-
-    def clean_directory(self, image_list) -> None:
+            
+    def create_data_dict(self, labels: list) -> dict:
 
         '''
-        Clean the directory.
+        Create a dictionary containing the data.
 
         Args:
-            image_list (list): List of images to delete.
+            data_dict (dict): Dictionary containing the data.
+            label (list): List of labels to add.
         '''
-
-        for observation in tqdm(natsorted(self.nifti_patients)):
-            images = glob(os.path.join(observation, '*.nii.gz'))
-            for image in images:
-                _, image_head = os.path.split(image)
-                if image_head.startswith('S') or any(str(image + '.nii.gz') == image_head for image in image_list):
-                    os.remove(image)
-                    print('Deleting {}.'.format(image))
-
-class DataLoader:
-
-    def __init__(self, image_list: list) -> None:
-
-        '''
-        Initialize the data loader class.
-
-        Args:
-            image_list (list): List of images to load.
-        '''
-
-        self.image_list = image_list
-
-    def apply_transformations(self, dataset_indicator: str) -> monai.transforms:
-
-        '''
-        Perform data transformations on image and image labels.
-
-        Args:
-            dataset_indicator (str): Dataset to apply transformations on. Can be 'train', 'val' or 'test'.
-        '''
-
-        preprocessing = monai.transforms.Compose([
-            monai.transforms.LoadImaged(keys=self.image_list),
-            monai.transforms.EnsureChannelFirstd(keys=self.image_list),
-            monai.transforms.Orientationd(keys=self.image_list, axcodes='ASL'),
-            monai.transforms.Resized(keys=self.image_list, spatial_size=(224, 224, 224)),
-            monai.transforms.ConcatItemsd(keys=self.image_list, name='image', dim=0),
-            monai.transforms.NormalizeIntensityd(keys='image', channel_wise=True)
-            ])
+        observation_list = self.assert_observation_completeness()
+        observation_list = np.random.choice(observation_list, 20, replace=False)
+        path_dict = {modality: self.split_observations_by_modality(observation_list, modality) for modality in self.modality_list}
+        path_dict['label'] = list(labels)
+        return [dict(zip(path_dict.keys(), vals)) for vals in zip(*(path_dict[k] for k in path_dict.keys()))]
         
-        augmentation = monai.transforms.Compose([
-            monai.transforms.RandRotated(keys='image', prob=0.1,
-                                         range_x=np.pi/8, range_y=np.pi/8, range_z=np.pi/8),
-            monai.transforms.RandGaussianNoised(keys='image', prob=0.1, mean=0, std=0.1),
-            monai.transforms.RandAxisFlipd(keys='image', prob=0.1),
-            monai.transforms.RandAdjustContrastd(keys='image', prob=0.1, gamma=(0.5, 2.0)),
-        ])
-        
-        postprocessing = monai.transforms.Compose([
-            monai.transforms.IntensityStatsd(keys='image', key_prefix='orig', ops=['mean', 'std'], channel_wise=True),
-            monai.transforms.ToTensord(keys=['image', 'label'])
-        ])
-
-        if dataset_indicator == 'train':
-            return monai.transforms.Compose([preprocessing, augmentation, postprocessing])
-        else:
-            return monai.transforms.Compose([preprocessing, postprocessing])
-        
-    def load_data(self, data_dict, split_ratio: list, batch_size: int, num_workers: int) -> dict:
+    def load_data(self, data_dict, split_ratio: list, batch_size: int, num_workers: int, test_set: bool) -> dict:
 
         '''
         Load the data.
@@ -198,20 +215,24 @@ class DataLoader:
         data_split = monai.data.utils.partition_dataset(data_dict, shuffle=True, ratios=split_ratio)
         data_split_dict = {x: [] for x in ['train', 'val', 'test']}
         data_split_dict['train'], data_split_dict['val'], data_split_dict['test'] = data_split[0], data_split[1], data_split[2]
-        datasets = {x: monai.data.CacheDataset(data=data_split_dict[x], transform=self.apply_transformations(x)) for x in ['train', 'val', 'test']}
-        return {x: monai.data.DataLoader(datasets[x], batch_size=batch_size, shuffle=True, num_workers=num_workers) for x in ['train', 'val', 'test']}
+        if test_set:
+            test_dataset = monai.data.CacheDataset(data=data_split_dict['test'], transform=self.apply_transformations('test'))
+            return {'test': monai.data.DataLoader(test_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers)}
+        else:
+            datasets = {x: monai.data.CacheDataset(data=data_split_dict[x], transform=self.apply_transformations(x)) for x in ['train', 'val']}
+            return {x: monai.data.DataLoader(datasets[x], batch_size=batch_size, shuffle=True, num_workers=num_workers) for x in ['train', 'val']}
         
 
 if __name__ == '__main__':
     PATH = '/Users/noltinho/thesis_private/data'
     prep = DicomToNifti(PATH)
-    # dicom2nifti.settings.disable_validate_slice_increment()
-    # prep.convert_dicom_to_nifti()
-    # image_list = prep.extract_image_names()
-    # metadata = MetadataUtils(PATH)
-    # metadata.count_series_freq(image_list)
+    dicom2nifti.settings.disable_validate_slice_increment()
+    prep.convert_dicom_to_nifti()
+    image_list = prep.extract_image_names()
+    metadata = MetadataUtils(PATH)
+    metadata.count_series_freq(image_list)
     COMPLETE_IMAGE_LIST = ['T1W_OOP','T1W_IP','T1W_DYN','T2W_TES','T2W_TEL','DWI_b0','DWI_b150','DWI_b400','DWI_b800']
     observation_list = prep.assert_observation_completeness(COMPLETE_IMAGE_LIST)
     observation_list = np.random.choice(observation_list, 5, replace=False)
-    # IMAGES_TO_DELETE = ['T1_dyn','T2_short_ET','T1_in_out','T2W_ETS']
-    # prep.clean_directory(IMAGES_TO_DELETE)
+    IMAGES_TO_DELETE = ['T1_dyn','T2_short_ET','T1_in_out','T2W_ETS']
+    prep.clean_directory(IMAGES_TO_DELETE)
