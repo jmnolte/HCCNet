@@ -1,0 +1,10 @@
+dicom2nifti==2.4.7
+matplotlib==3.6.3
+monai==1.1.0
+natsort==8.2.0
+nibabel==5.0.1
+numpy==1.23.5
+pydicom==2.3.1
+scikit_learn==1.2.1
+torch==1.13.1
+tqdm==4.64.1
