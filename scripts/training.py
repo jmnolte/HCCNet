@@ -10,6 +10,7 @@ from preprocessing import PreprocessingUtils, DataLoader
 from models import ResNet
 from utils import ReproducibilityUtils
 from tqdm import tqdm
+import argparse
 
 class Training:
     
@@ -73,7 +74,7 @@ class Training:
         else:
             np.save(folder_path, output_dict)
 
-    def train_model(self, min_epochs: int, criterion: torch.nn, optimizer: torch.optim, early_stopping: bool = True, patience: int = 10) -> None:
+    def train_model(self, min_epochs: int, criterion: torch.nn, optimizer: torch.optim, early_stopping: bool, patience: int) -> None:
 
         '''
         Train the model.
@@ -93,7 +94,7 @@ class Training:
         best_loss = 10000.0
         counter = 0
 
-        for epoch in range(0, max_epochs):
+        for epoch in range(max_epochs):
             print('Epoch {}'.format(epoch))
             print('-' * 10)
 
@@ -160,69 +161,19 @@ class Training:
         print('Precision: {:4f}'.format(prec.item()))
         print('Recall: {:4f}'.format(recall.item()))
         print('F1-Score: {:4f}'.format(fscore.item()))
-    
-    def run_inference(self) -> None:
 
-        '''
-        Run inference on the test set.
-        '''
-
-        weights_path = os.path.join(self.output_dir, 'model_weights', self.version + '_weights.pth')
-        weights_dict = torch.load(weights_path)
-        self.model.load_state_dict(weights_dict)
-        self.model.eval()
-        results = {'preds': [],'proba': [], 'labels': []}
-        for batch_data in tqdm(self.dataloaders['test']):
-            inputs, labels = batch_data['image'].to(self.device), batch_data['label'].to(self.device)
-            with torch.no_grad():
-                outputs = self.model(inputs)
-                _, preds = torch.max(outputs, 1)
-                proba = torch.nn.functional.softmax(outputs, dim=1)[:,1]
-                results['preds'].append(preds.cpu())
-                results['proba'].append(proba.cpu())
-                results['labels'].append(labels.cpu())
-        results['preds'] = np.concatenate(results['preds'])
-        results['proba'] = np.concatenate(results['proba'])
-        results['labels'] = np.concatenate(results['labels'])
-        self.save_output(results, 'preds')
-
-    def calculate_test_metrics(self) -> None:
-
-        '''
-        Calculate performance metrics on the test set.
-        '''
-
-        path = os.path.join(self.output_dir, 'model_preds', self.version + '_preds.npy')
-        results = np.load(path, allow_pickle='TRUE').item()
-        preds, proba, labels = results['preds'], results['proba'][:,1], results['labels']
-        acc = metrics.accuracy_score(labels, preds)
-        prec = metrics.precision_score(labels, preds)
-        recall = metrics.recall_score(labels, preds)
-        fscore = metrics.f1_score(labels, preds)
-        auc_score = metrics.roc_auc_score(labels, proba)
-        avg_prec_score = metrics.average_precision_score(labels, proba)
-        print('Performance Metrics on Test set:')
-        print('Acc: {:4f}'.format(acc))
-        print('Precision: {:4f}'.format(prec))
-        print('Recall: {:4f}'.format(recall))
-        print('F1-Score: {:4f}'.format(fscore))
-        print('AUC: {:4f}'.format(auc_score))
-        print('AP: {:4f}'.format(avg_prec_score))
-
-    def visualize_training(self, phase: str, metric: str) -> None:
+    def visualize_training(self, metric: str) -> None:
 
         '''
         Visualize the training and validation history.
 
         Args:
-            phase (str): 'train' or 'val'.
             metric (str): 'loss' or 'acc'.
         '''
         try: 
-            assert any(phase == phase_item for phase_item in ['train','val'])
             assert any(metric == metric_item for metric_item in ['loss','acc'])
         except AssertionError:
-            print('Invalid input. Please choose phase from: train or val. Likewise, choose metric from: loss or acc.')
+            print('Invalid input. Please choose from: loss or acc.')
             exit(1)
 
         if metric == 'loss':
@@ -231,121 +182,59 @@ class Training:
             metric_label = 'Accuracy'
 
         file_name = self.version + '_hist.npy'
-        plot_name = self.version + '_' + phase + '_' + metric + '.png'
+        plot_name = self.version + '_' + metric + '.png'
         history = np.load(os.path.join(self.output_dir, 'model_history', file_name), allow_pickle='TRUE').item()
-        plt.plot(history[phase + '_' + metric])
+        plt.plot(history['train_' + metric], color='dimgray',)
+        plt.plot(history['val_' + metric], color='darkgray',)
         plt.ylabel(metric_label, fontsize=20, labelpad=10)
         plt.xlabel('Training Epoch', fontsize=20, labelpad=10)
         plt.legend(['Training', 'Validation'], loc='lower right')
-        plt.savefig(os.path.join(self.output_dir, 'model_history', plot_name), dpi=300, bbox_inches="tight")
-        plt.gray()
-
-    def plot_test_metrics(self, metric: str) -> None:
-
-        '''
-        Plot the ROC curve and calculate the AUC score.
-
-        Args:
-            metric (str): 'auc' or 'ap'.
-        '''
-        try:
-            assert any(metric == metric_item for metric_item in ['auc','ap'])
-        except AssertionError:
-            print('Invalid input. Please choose metric from: auc or ap')
-            exit(1)
-        
-        file_name = self.version + '_preds.npy'
-        path = os.path.join(self.output_dir, 'model_preds', file_name)
-        results = np.load(path, allow_pickle='TRUE').item()
-        proba, labels = results['proba'][:,1], results['labels']
-
-        if metric == 'auc':
-            metric_x, metric_y, _ = metrics.roc_curve(labels, proba)
-            score = metrics.auc(metric_x, metric_y)
-            metric_label = 'AUC'
-            metric_x_label = 'False Positive Rate'
-            metric_y_label = 'True Positive Rate'
-        elif metric == 'ap':
-            metric_x, metric_y, _ = metrics.precision_recall_curve(labels, proba)
-            score = metrics.average_precision_score(labels, proba)
-            metric_label = 'AP'
-            metric_x_label = 'Precision'
-            metric_y_label = 'Recall'
-
-        plt.plot(metric_x, metric_y, color='dimgray', lw=2, label=metric_label + '= %0.2f' % score)
-        plt.plot([0, 1], [0, 1], color='darkgray', lw=2, linestyle='--')
-        plt.xlim([0.0, 1.0])
-        plt.ylim([0.0, 1.05])
-        plt.xlabel(metric_x_label, fontsize=20, labelpad=10)
-        plt.ylabel(metric_y_label, fontsize=20, labelpad=10)
-        plt.legend(loc="lower right")
-        file_name = self.version + '_' + metric + '.png'
-        plt.savefig(os.path.join(self.output_dir, 'model_history', file_name), dpi=300, bbox_inches="tight")
-        plt.gray()
-
-    def get_random_test_image(self) -> torch.tensor:
-
-        '''
-        Get a random image from the test set.
-
-        Returns:
-            image (torch.tensor): The image.
-            label (int): The label.
-        '''
-        test_data = next(iter(self.dataloaders['test']))
-        return test_data['image'].to(self.device), test_data['label'].unsqueeze(0).to(self.device)
-    
-    def visualize_activations(self, batch_size: int) -> None:
-
-        '''
-        Get the occlusion sensitivity map for a given image.
-
-        Args:
-            test_image (torch.tensor): The image.
-        '''
-        image, label = self.get_random_test_image()
-        weights_path = os.path.join(self.output_dir, 'model_weights', self.version + '_weights.pth')
-        weights_dict = torch.load(weights_path)
-        self.model.load_state_dict(weights_dict)
-        self.model.eval()
-        occ_sens = monai.visualize.OcclusionSensitivity(nn_module=self.model, n_batch=batch_size)
-        z_slice = image.shape[-1] // 2
-        occ_sens_b_box = [-1, -1, -1, -1, z_slice - 1, z_slice]
-
-        occ_result, _ = occ_sens(image, b_box=occ_sens_b_box)
-        occ_result = occ_result[0, label.argmax().item()][None]
-        fig, axes = plt.subplots(1, 2, figsize=(25, 15), facecolor="white")
-
-        for i, im in enumerate([image[:, :, z_slice, ...], occ_result]):
-            cmap = "gray" if i == 0 else "jet"
-            ax = axes[i]
-            im_show = ax.imshow(np.squeeze(im[0][0].detach().cpu()), cmap=cmap)
-            ax.axis("off")
-            fig.colorbar(im_show, ax=ax)
+        file_path = os.path.join(self.output_dir, 'model_history/diagnostics', plot_name)
+        file_path_root, _ = os.path.split(file_path)
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        elif not os.path.exists(file_path_root):
+            os.makedirs(file_path_root)
+        plt.savefig(file_path, dpi=300, bbox_inches="tight")
+        plt.close()
 
         
 RESULTS_DIR = '/Users/noltinho/thesis/results'
-PATH = '/Users/noltinho/thesis_private/data'
-COMPLETE_IMAGE_LIST = ['T1W_OOP','T1W_IP','T1W_DYN','T2W_TES','T2W_TEL','DWI_b0','DWI_b150','DWI_b400','DWI_b800']
-WEIGHTS_PATH = '/Users/noltinho/MedicalNet/pytorch_files/pretrain'
+DATA_DIR = '/Users/noltinho/thesis_private/data'
+MODALITY_LIST = ['T1W_OOP','T1W_IP','T1W_DYN','T2W_TES','T2W_TEL','DWI_b0','DWI_b150','DWI_b400','DWI_b800']
+WEIGHTS_DIR = '/Users/noltinho/MedicalNet/pytorch_files/pretrain'
 
 if __name__ == '__main__':
-    ReproducibilityUtils.seed_everything(123)
-    prep = PreprocessingUtils(PATH)
-    observation_list = prep.assert_observation_completeness(COMPLETE_IMAGE_LIST)
+    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument("-v", "--version", required=True, type=str, help="Model version to train")
+    parser.add_argument("-p", "--pretrained", default=True, type=bool, help="Flag to use pretrained weights")
+    parser.add_argument("-fe", "--feature_extraction", default=True, type=bool, help="Flag to use feature extraction")
+    parser.add_argument("-e", "--epochs", required=True, type=int, help="Number of epochs to train for")
+    parser.add_argument("-b", "--batch_size", default=4, type=int, help="Batch size to use for training")
+    parser.add_argument("-lr", "--learning_rate", default=0.00001, type=float, help="Learning rate to use for training")
+    parser.add_argument("-m", "--momentum", default=0.9, type=float, help="Momentum to use for training")
+    parser.add_argument("-es", "--early_stopping", default=True, type=bool, help="Flag to use early stopping")
+    parser.add_argument("-pa", "--patience", default=10, type=int, help="Patience to use for early stopping")
+    parser.add_argument("-ml", "--modality_list", default=MODALITY_LIST, nargs='+', help="List of modalities to use for training")
+    parser.add_argument("-s", "--seed", default=123, type=int, help="Seed to use for reproducibility")
+    parser.add_argument("-d", "--device", default='cuda', type=str, help="Device to use for training")
+    parser.add_argument("-dd", "--data_dir", default=DATA_DIR, type=str, help="Path to data directory")
+    parser.add_argument("-rd", "--results_dir", default=RESULTS_DIR, type=str, help="Path to results directory")
+    parser.add_argument("-wd", "--weights_dir", default=WEIGHTS_DIR, type=str, help="Path to pretrained weights")
+    args = vars(parser.parse_args())
+    ReproducibilityUtils.seed_everything(args['seed'])
+    prep = PreprocessingUtils(args['data_dir'])
+    observation_list = prep.assert_observation_completeness(args['modality_list'])
     observation_list = np.random.choice(observation_list, 20, replace=False)
-    labels = np.random.randint(2, size=561)
-    dwi_b0_paths = prep.split_observations_by_modality(observation_list, 'DWI_b0')
-    dwi_b150_paths = prep.split_observations_by_modality(observation_list, 'DWI_b150')
-    data_dict = [{'DWI_b0': dwi_b0, 'DWI_b150': dwi_b150, 'label': label} for dwi_b0, dwi_b150, label in zip(dwi_b0_paths, dwi_b150_paths, labels)]
-    dataloader = DataLoader(image_list=['DWI_b0','DWI_b150'])
-    dataloader_dict = dataloader.load_data(data_dict, split_ratio=[0.6, 0.2, 0.2], batch_size=1, num_workers=4)
-    resnet50 = ResNet(version='resnet50', num_out_classes=2, num_in_channels=2, pretrained=True, feature_extraction=True, weights_path=WEIGHTS_PATH)
-    device = torch.device('cpu')
-    # criterion = torch.nn.CrossEntropyLoss()
-    # optimizer = torch.optim.SGD(resnet50.parameters(), lr=0.00001, momentum=0.9)
-    train = Training(resnet50, 'resnet50', device, dataloader_dict, RESULTS_DIR)
-    # train.train_model(1, criterion, optimizer)
-    # train.run_inference()
-    train.visualize_activations(1)
-
+    path_dict = {modality: prep.split_observations_by_modality(observation_list, modality) for modality in args['modality_list']}
+    path_dict['label'] = list(np.random.randint(2, size=20))
+    data_dict = [dict(zip(path_dict.keys(), vals)) for vals in zip(*(path_dict[k] for k in path_dict.keys()))]
+    dataloader = DataLoader(image_list=args['modality_list'])
+    dataloader_dict = dataloader.load_data(data_dict, [0.6, 0.2, 0.2], args['batch_size'], 4)
+    model = ResNet(args['version'], 2, len(args['modality_list']), args['pretrained'], args['feature_extraction'], args['weights_dir'])
+    criterion = torch.nn.CrossEntropyLoss()
+    optimizer = torch.optim.SGD(model.parameters(), args['learning_rate'], args['momentum'])
+    train = Training(model, args['version'], args['device'], dataloader_dict, args['results_dir'])
+    train.train_model(args['epochs'], criterion, optimizer, args['early_stopping'], args['patience'])
+    train.visualize_training('loss')
+    train.visualize_training('acc')

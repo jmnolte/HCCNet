@@ -161,19 +161,19 @@ class DataLoader:
             monai.transforms.EnsureChannelFirstd(keys=self.image_list),
             monai.transforms.Orientationd(keys=self.image_list, axcodes='ASL'),
             monai.transforms.Resized(keys=self.image_list, spatial_size=(224, 224, 224)),
-            monai.transforms.NormalizeIntensityd(keys=self.image_list, channel_wise=True)
+            monai.transforms.ConcatItemsd(keys=self.image_list, name='image', dim=0),
+            monai.transforms.NormalizeIntensityd(keys='image', channel_wise=True)
             ])
         
         augmentation = monai.transforms.Compose([
-            monai.transforms.RandRotated(keys=self.image_list, prob=0.1,
+            monai.transforms.RandRotated(keys='image', prob=0.1,
                                          range_x=np.pi/8, range_y=np.pi/8, range_z=np.pi/8),
-            monai.transforms.RandGaussianNoised(keys=self.image_list, prob=0.1, mean=0, std=0.1),
-            monai.transforms.RandAxisFlipd(keys=self.image_list, prob=0.1),
-            monai.transforms.RandAdjustContrastd(keys=self.image_list, prob=0.1, gamma=(0.5, 2.0)),
+            monai.transforms.RandGaussianNoised(keys='image', prob=0.1, mean=0, std=0.1),
+            monai.transforms.RandAxisFlipd(keys='image', prob=0.1),
+            monai.transforms.RandAdjustContrastd(keys='image', prob=0.1, gamma=(0.5, 2.0)),
         ])
         
         postprocessing = monai.transforms.Compose([
-            monai.transforms.ConcatItemsd(keys=self.image_list, name='image', dim=0),
             monai.transforms.IntensityStatsd(keys='image', key_prefix='orig', ops=['mean', 'std'], channel_wise=True),
             monai.transforms.ToTensord(keys=['image', 'label'])
         ])
