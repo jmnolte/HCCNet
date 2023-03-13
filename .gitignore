@@ -239,4 +239,10 @@ sensitive_data/
 ### Retrained model weigths ###
 results/model_weights/
 
+### Files created in preparation for the research report ###
+research_report/
+
+### Miscellaneous ###
+miscellaneous/
+
 # End of https://www.toptal.com/developers/gitignore/api/python,macos,jupyternotebooks,visualstudiocode

@@ -2,11 +2,13 @@ import monai
 import numpy as np
 import glob
 import os
+import tempfile
 from tqdm import tqdm
 from natsort import natsorted
 from glob import glob
 import dicom2nifti
-from utils import MetadataUtils
+from utils import MetadataUtils, ReproducibilityUtils
+import pandas as pd
 
 class DicomToNifti:
 
@@ -63,7 +65,9 @@ class PreprocessingUtils:
         '''
 
         self.nifti_dir = os.path.join(path, 'nifti')
+        self.dicom_dir = os.path.join(path, 'dicom')
         self.nifti_patients = glob(os.path.join(self.nifti_dir, '*'), recursive = True)
+        self.dicom_patients = glob(os.path.join(self.dicom_dir, '*'), recursive = True)
 
     def extract_image_names(self) -> list:
 
@@ -100,6 +104,35 @@ class PreprocessingUtils:
                     os.remove(image)
                     print('Deleting {}.'.format(image))
 
+    def create_label_list(self, label_path) -> list:
+
+        '''
+        Create a list of labels.
+
+        Args:
+            label_path (str): Path to the label file.
+        '''
+        observation_dict = {'Study_nr': [], 'date': [], 'observation': []}
+        for folder_path in natsorted(self.dicom_patients):
+            _, patient_id = os.path.split(folder_path)
+            for idx, observation in enumerate(natsorted(glob(os.path.join(folder_path, 'DICOM/*')))):
+                _, date = os.path.split(observation)
+                observation_dict['Study_nr'].append(patient_id)
+                observation_dict['observation'].append(idx+1)
+                observation_dict['date'].append(date)
+        observation_df = pd.DataFrame.from_dict(observation_dict)
+        labels_df = pd.read_csv(label_path, sep=';')
+        labels_df = labels_df.loc[:, ['Study_nr', 'HCC', 'HCC_date_of_diagnosis']]
+        labels_df['Study_nr'] = labels_df['Study_nr'].astype('string')
+        labels_df['HCC_date_of_diagnosis'] = pd.to_datetime(labels_df['HCC_date_of_diagnosis'], errors='coerce')
+        labels_df['HCC_date_of_diagnosis'] = labels_df['HCC_date_of_diagnosis'].dt.strftime('%Y%m%d')
+        labels_df = labels_df.merge(observation_df, on=['Study_nr'], how='left')
+        labels_df = labels_df.dropna(subset=['observation'])
+        labels_df['observation'] = labels_df['observation'].astype('int64')
+        labels_df['label'] = np.where(labels_df['HCC_date_of_diagnosis'] < labels_df['date'], 1, 0)
+        labels_df = labels_df.drop(columns=['HCC', 'HCC_date_of_diagnosis', 'date'])
+        return labels_df
+
 class DataLoader:
 
     def __init__(self, path: str, modality_list: list) -> None:
@@ -128,8 +161,8 @@ class DataLoader:
         preprocessing = monai.transforms.Compose([
             monai.transforms.LoadImaged(keys=self.modality_list),
             monai.transforms.EnsureChannelFirstd(keys=self.modality_list),
-            monai.transforms.Orientationd(keys=self.modality_list, axcodes='ASL'),
-            monai.transforms.Resized(keys=self.modality_list, spatial_size=(224, 224, 224)),
+            monai.transforms.Orientationd(keys=self.modality_list, axcodes='PLI'),
+            monai.transforms.Resized(keys=self.modality_list, spatial_size=(128, 128, 128)),
             monai.transforms.ConcatItemsd(keys=self.modality_list, name='image', dim=0),
             monai.transforms.NormalizeIntensityd(keys='image', channel_wise=True)
             ])
@@ -137,9 +170,9 @@ class DataLoader:
         augmentation = monai.transforms.Compose([
             monai.transforms.RandRotated(keys='image', prob=0.1,
                                          range_x=np.pi/8, range_y=np.pi/8, range_z=np.pi/8),
-            monai.transforms.RandGaussianNoised(keys='image', prob=0.1, mean=0, std=0.1),
-            monai.transforms.RandAxisFlipd(keys='image', prob=0.1),
-            monai.transforms.RandAdjustContrastd(keys='image', prob=0.1, gamma=(0.5, 2.0)),
+            monai.transforms.RandGibbsNoised(keys='image', prob=0.1, alpha=(0.6, 0.8)),
+            monai.transforms.RandFlipd(keys='image', prob=0.1, spatial_axis=2),
+            monai.transforms.RandAdjustContrastd(keys='image', prob=0.1, gamma=(0.5, 2.0))
         ])
         
         postprocessing = monai.transforms.Compose([
@@ -185,19 +218,18 @@ class DataLoader:
         '''
         return [glob(os.path.join(observation, modality + '.nii.gz')) for observation in observation_list]
             
-    def create_data_dict(self, labels: list) -> dict:
+    def create_data_dict(self, label_list: list) -> dict:
 
         '''
         Create a dictionary containing the data.
 
         Args:
-            data_dict (dict): Dictionary containing the data.
-            label (list): List of labels to add.
+            label_list (list): List of labels to add.
         '''
         observation_list = self.assert_observation_completeness()
         observation_list = np.random.choice(observation_list, 20, replace=False)
         path_dict = {modality: self.split_observations_by_modality(observation_list, modality) for modality in self.modality_list}
-        path_dict['label'] = list(labels)
+        path_dict['label'] = list(label_list)
         return [dict(zip(path_dict.keys(), vals)) for vals in zip(*(path_dict[k] for k in path_dict.keys()))]
         
     def load_data(self, data_dict, split_ratio: list, batch_size: int, num_workers: int, test_set: bool) -> dict:
@@ -215,24 +247,26 @@ class DataLoader:
         data_split = monai.data.utils.partition_dataset(data_dict, shuffle=True, ratios=split_ratio)
         data_split_dict = {x: [] for x in ['train', 'val', 'test']}
         data_split_dict['train'], data_split_dict['val'], data_split_dict['test'] = data_split[0], data_split[1], data_split[2]
+        persistent_cache = os.path.join(tempfile.mkdtemp(), "persistent_cache")
         if test_set:
-            test_dataset = monai.data.CacheDataset(data=data_split_dict['test'], transform=self.apply_transformations('test'))
+            test_dataset = monai.data.PersistentDataset(data=data_split_dict['test'], transform=self.apply_transformations('test'), cache_dir=persistent_cache)
             return {'test': monai.data.DataLoader(test_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers)}
         else:
-            datasets = {x: monai.data.CacheDataset(data=data_split_dict[x], transform=self.apply_transformations(x)) for x in ['train', 'val']}
+            datasets = {x: monai.data.PersistentDataset(data=data_split_dict[x], transform=self.apply_transformations(x), cache_dir=persistent_cache) for x in ['train', 'val']}
             return {x: monai.data.DataLoader(datasets[x], batch_size=batch_size, shuffle=True, num_workers=num_workers) for x in ['train', 'val']}
         
 
 if __name__ == '__main__':
-    PATH = '/Users/noltinho/thesis_private/data'
-    prep = DicomToNifti(PATH)
-    dicom2nifti.settings.disable_validate_slice_increment()
-    prep.convert_dicom_to_nifti()
-    image_list = prep.extract_image_names()
-    metadata = MetadataUtils(PATH)
-    metadata.count_series_freq(image_list)
-    COMPLETE_IMAGE_LIST = ['T1W_OOP','T1W_IP','T1W_DYN','T2W_TES','T2W_TEL','DWI_b0','DWI_b150','DWI_b400','DWI_b800']
-    observation_list = prep.assert_observation_completeness(COMPLETE_IMAGE_LIST)
-    observation_list = np.random.choice(observation_list, 5, replace=False)
-    IMAGES_TO_DELETE = ['T1_dyn','T2_short_ET','T1_in_out','T2W_ETS']
-    prep.clean_directory(IMAGES_TO_DELETE)
+    # ReproducibilityUtils.seed_everything(123)
+    DATA_DIR = '/Users/noltinho/thesis_private/data'
+    LABEL_DIR = '/Users/noltinho/thesis'
+    MODALITY_LIST = ['T1W_OOP','T1W_IP','T1W_DYN','T2W_TES','T2W_TEL','DWI_b0','DWI_b150','DWI_b400','DWI_b800']
+    # dicom2nifti.settings.disable_validate_slice_increment()
+    # DicomToNifti(DATA_DIR).convert_dicom_to_nifti()
+    prep = PreprocessingUtils(DATA_DIR)
+    # image_list = prep.extract_image_names()
+    # metadata = MetadataUtils(DATA_DIR)
+    # metadata.count_series_freq(image_list)
+    # IMAGES_TO_DELETE = ['T1_dyn','T2_short_ET','T1_in_out','T2W_ETS']
+    # prep.clean_directory(IMAGES_TO_DELETE)
+    prep.create_label_list(os.path.join(LABEL_DIR, 'hcc_labels.csv'))

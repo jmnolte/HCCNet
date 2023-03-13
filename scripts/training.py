@@ -123,8 +123,8 @@ class Training:
                     running_loss += loss.item() * inputs.size(0)
                     running_corrects += torch.sum(preds == labels.data)
 
-                epoch_loss = running_loss / len(self.dataloaders[phase].dataset)
-                epoch_acc = running_corrects.double() / len(self.dataloaders[phase].dataset)
+                epoch_loss = copy.deepcopy(running_loss / len(self.dataloaders[phase].dataset))
+                epoch_acc = copy.deepcopy(running_corrects.double() / len(self.dataloaders[phase].dataset))
 
                 print('{} Loss: {:.4f} Acc: {:.4f}'.format(phase, epoch_loss, epoch_acc.item()))
 
@@ -222,11 +222,17 @@ if __name__ == '__main__':
     parser.add_argument("-rd", "--results_dir", default=RESULTS_DIR, type=str, help="Path to results directory")
     parser.add_argument("-wd", "--weights_dir", default=WEIGHTS_DIR, type=str, help="Path to pretrained weights")
     args = vars(parser.parse_args())
+    try: 
+        assert torch.cuda.is_available()
+    except AssertionError:
+        print('Cuda is not available. Please use a device with a GPU.')
+        exit(1)
+    torch.multiprocessing.set_sharing_strategy('file_system')
     ReproducibilityUtils.seed_everything(args['seed'])
     dataloader = DataLoader(args['data_dir'], args['modality_list'])
     labels = np.random.randint(2, size=20)
     data_dict = dataloader.create_data_dict(labels)
-    dataloader_dict = dataloader.load_data(data_dict, [0.6, 0.2, 0.2], args['batch_size'], 4, args['test_set'])
+    dataloader_dict = dataloader.load_data(data_dict, [0.6, 0.2, 0.2], args['batch_size'], 2, args['test_set'])
     model = ResNet(args['version'], 2, len(args['modality_list']), args['pretrained'], args['feature_extraction'], args['weights_dir'])
     criterion = torch.nn.CrossEntropyLoss()
     optimizer = torch.optim.SGD(model.parameters(), args['learning_rate'], args['momentum'])
