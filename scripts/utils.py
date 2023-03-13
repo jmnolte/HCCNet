@@ -340,10 +340,9 @@ class MetadataUtils:
                         if not os.path.exists(new_folder):
                             os.makedirs(new_folder)
                         shutil.move(sequence_path, new_folder)
-        
 
 if __name__ == '__main__':
-    PATH = '/Users/noltinho/thesis_private/data/Batch_13'
+    PATH = '/Users/noltinho/thesis_private/data'
     T1_IOP = ['mDIXON BH','DIXON','mDIXON','DIXON 4 reconstructies','mDIXON obese','4 reconstructies DIXON','mDIXON W 4s','mDIXON BH b-buik','mDIXON BH laat']
     T1_DYN = ['mDIXON W DYN BH','DIXON 4 FASEN','DIXON','mDIXON_dyn','DIXON fast 4 FASEN']
     T1_QUANT = ['mDIXON-Quant_BH','QUANT','QUANT T0','QUANT T1','QUANT T2','mDIXON-Quant_BH obese']
