@@ -86,7 +86,7 @@ class ResNet(torch.nn.Module):
 
         model_dict = self.model.state_dict()
         new_weights_path = os.path.join(weights_path, 'resnet_' + str(self.version.strip('resnet')) + '.pth')
-        weights_dict = torch.load(new_weights_path, map_location=torch.device('cpu'))
+        weights_dict = torch.load(new_weights_path, map_location=torch.device('cuda'))
         weights_dict = {k.replace('module.', ''): v for k, v in weights_dict['state_dict'].items()}
         model_dict.update(weights_dict)
         conv1_weight = model_dict['conv1.weight']

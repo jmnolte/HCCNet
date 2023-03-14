@@ -25,5 +25,5 @@ echo "Gpu devices                 : "$CUDA_VISIBLE_DEVICES
 echo "Starting worker: "
 
 # run the python script -v is the model version -e the number of epochs -dd the data directory -rd the results directory -wd the directory with the pretrained weights
-python /home/x3007104/training.py -v resnet10 -e 10 -ml DWI_b0 DWI_b150 -dd /home/x3007104/data -rd /home/x3007104/results -wd /home/x3007104/pretrain
+python /home/x3007104/thesis/scripts/diagnostics.py -v resnet10 -b 1 -ml DWI_b0 DWI_b150 -dd /home/x3007104/thesis/sensitive_data -rd /home/x3007104/thesis/results -wd /home/x3007104/thesis/pretrained_models
 
