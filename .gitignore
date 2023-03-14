@@ -235,9 +235,14 @@ poetry.toml
 
 ### Sensitive Patient Information and Data ###
 sensitive_data/
+scripts/data/
 
 ### Retrained model weigths ###
 results/model_weights/
+
+### Pretrained Models ###
+pretrained_models/
+scripts/pretrained_models/
 
 ### Files created in preparation for the research report ###
 research_report/

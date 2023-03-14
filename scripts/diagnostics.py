@@ -8,6 +8,7 @@ from preprocessing import DataLoader
 from models import ResNet
 from utils import ReproducibilityUtils
 from training import Training
+from tqdm import tqdm
 import argparse
 import seaborn as sns
 
@@ -112,21 +113,17 @@ class Diagnostics(Training):
         self.model.load_state_dict(torch.load(weights_path))
         print('Model weights are updated.')
         self.model.eval()
+
         occ_sens = monai.visualize.OcclusionSensitivity(nn_module=self.model, n_batch=1)
-        z_slice = image.shape[-1] // 2
-        occ_sens_b_box = [-1, -1, -1, -1, z_slice - 1, z_slice]
-
-        occ_result, _ = occ_sens(image, b_box=occ_sens_b_box)
+        depth_slice = image.shape[2] // 2
+        occ_sens_b_box = [depth_slice - 1, depth_slice, -1, -1, -1, -1]
+        occ_result, _ = occ_sens(x=image, b_box=occ_sens_b_box)
         occ_result = occ_result[0, label.argmax().item()][None]
-        fig, axes = plt.subplots(1, 2, figsize=(25, 15), facecolor="white")
 
-        for idx, slice in enumerate([image[:, :, z_slice, ...], occ_result]):
-            cmap = "gray" if idx == 0 else "jet"
-            ax = axes[idx]
-            im_show = ax.imshow(np.squeeze(slice[0][0].detach().cpu()), cmap=cmap)
-            ax.axis("off")
-            fig.colorbar(im_show, ax=ax)
-
+        for idx, im in enumerate([image[:, :, depth_slice, ...], occ_result]):
+            plt.imshow(np.squeeze(im[0][0].detach().cpu()), cmap='jet')
+            plt.axis('off')
+        
         file_path = os.path.join(self.output_dir, 'model_history/diagnostics', self.version + '_occ_sens')
         file_path_root, _ = os.path.split(file_path)
         if os.path.exists(file_path):
@@ -136,6 +133,18 @@ class Diagnostics(Training):
         plt.savefig(file_path, dpi=300, bbox_inches="tight")
         plt.close()
 
+        image = np.squeeze(image[0][0].detach().cpu())
+        plt.imshow(image[:, :, depth_slice], cmap='gray')
+        plt.axis('off')
+        file_path = os.path.join(self.output_dir, 'model_history/diagnostics', self.version + '_orig_img')
+        file_path_root, _ = os.path.split(file_path)
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        elif not os.path.exists(file_path_root):
+            os.makedirs(file_path_root)
+        plt.savefig(file_path, dpi=300, bbox_inches="tight")
+        plt.close()
+        print('Script finished')
 
 RESULTS_DIR = '/Users/noltinho/thesis/results'
 DATA_DIR = '/Users/noltinho/thesis_private/data'
@@ -156,11 +165,12 @@ if __name__ == '__main__':
     parser.add_argument("-rd", "--results_dir", default=RESULTS_DIR, type=str, help="Path to results directory")
     parser.add_argument("-wd", "--weights_dir", default=WEIGHTS_DIR, type=str, help="Path to pretrained weights")
     args = vars(parser.parse_args())
+    torch.multiprocessing.set_sharing_strategy('file_system')
     ReproducibilityUtils.seed_everything(args['seed'])
     dataloader = DataLoader(args['data_dir'], args['modality_list'])
     labels = np.random.randint(2, size=20)
     data_dict = dataloader.create_data_dict(labels)
-    dataloader_dict = dataloader.load_data(data_dict, [0.6, 0.2, 0.2], args['batch_size'], 4, args['test_set'])
+    dataloader_dict = dataloader.load_data(data_dict, [0.6, 0.2, 0.2], args['batch_size'], 2, args['test_set'])
     model = ResNet(args['version'], 2, len(args['modality_list']), args['pretrained'], args['feature_extraction'], args['weights_dir'])
     inference = Diagnostics(model, args['version'], args['device'], dataloader_dict, args['results_dir'])
     if args['batch_size'] == 1:

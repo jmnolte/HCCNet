@@ -146,8 +146,7 @@ class DataLoader:
         '''
 
         self.modality_list = modality_list
-        self.nifti_dir = os.path.join(path, 'nifti')
-        self.nifti_patients = glob(os.path.join(self.nifti_dir, '*'), recursive = True)
+        self.nifti_patients = glob(os.path.join(path, '*'), recursive = True)
 
     def apply_transformations(self, dataset_indicator: str) -> monai.transforms:
 
@@ -163,9 +162,9 @@ class DataLoader:
             monai.transforms.EnsureChannelFirstd(keys=self.modality_list),
             monai.transforms.Orientationd(keys=self.modality_list, axcodes='PLI'),
             monai.transforms.Resized(keys=self.modality_list, spatial_size=(128, 128, 128)),
-            monai.transforms.ConcatItemsd(keys=self.modality_list, name='image', dim=0),
-            monai.transforms.NormalizeIntensityd(keys='image', channel_wise=True)
-            ])
+            monai.transforms.NormalizeIntensityd(keys=self.modality_list, channel_wise=True),
+            monai.transforms.ConcatItemsd(keys=self.modality_list, name='image', dim=0)
+        ])
         
         augmentation = monai.transforms.Compose([
             monai.transforms.RandRotated(keys='image', prob=0.1,
