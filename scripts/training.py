@@ -87,13 +87,13 @@ class Training:
         '''
     
         since = time.time()
-        max_epochs = min_epochs * 10
+        max_epochs = min_epochs * 100
 
         history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': []}
         best_loss = 10000.0
         counter = 0
 
-        for epoch in range(min_epochs):
+        for epoch in range(max_epochs):
             print('Epoch {}'.format(epoch))
             print('-' * 10)
 
@@ -199,7 +199,7 @@ class Training:
 
         
 RESULTS_DIR = '/Users/noltinho/thesis/results'
-DATA_DIR = '/Users/noltinho/thesis_private/data'
+DATA_DIR = '/Users/noltinho/thesis/sensitive_data'
 MODALITY_LIST = ['T1W_OOP','T1W_IP','T1W_DYN','T2W_TES','T2W_TEL','DWI_b0','DWI_b150','DWI_b400','DWI_b800']
 WEIGHTS_DIR = '/Users/noltinho/MedicalNet/pytorch_files/pretrain'
 
@@ -210,32 +210,34 @@ if __name__ == '__main__':
     parser.add_argument("-fe", "--feature_extraction", default=True, type=bool, help="Flag to use feature extraction")
     parser.add_argument("-e", "--epochs", required=True, type=int, help="Number of epochs to train for")
     parser.add_argument("-b", "--batch_size", default=4, type=int, help="Batch size to use for training")
-    parser.add_argument("-lr", "--learning_rate", default=0.00001, type=float, help="Learning rate to use for training")
-    parser.add_argument("-m", "--momentum", default=0.9, type=float, help="Momentum to use for training")
+    parser.add_argument("-lr", "--learning_rate", default=1e-6, type=float, help="Learning rate to use for training")
+    parser.add_argument("-wd", "--weight_decay", default=1e-8, type=float, help="Weight decay to use for training")
     parser.add_argument("-es", "--early_stopping", default=True, type=bool, help="Flag to use early stopping")
     parser.add_argument("-pa", "--patience", default=10, type=int, help="Patience to use for early stopping")
     parser.add_argument("-ml", "--modality_list", default=MODALITY_LIST, nargs='+', help="List of modalities to use for training")
     parser.add_argument("-s", "--seed", default=123, type=int, help="Seed to use for reproducibility")
     parser.add_argument("-d", "--device", default='cuda', type=str, help="Device to use for training")
     parser.add_argument("-ts", "--test_set", default=False, type=bool, help="Flag to load test or training and validation set")
+    parser.add_argument("-q", "--quant_images", default=False, type=bool, help="Flag to run analysis on quant images")
     parser.add_argument("-dd", "--data_dir", default=DATA_DIR, type=str, help="Path to data directory")
     parser.add_argument("-rd", "--results_dir", default=RESULTS_DIR, type=str, help="Path to results directory")
     parser.add_argument("-wd", "--weights_dir", default=WEIGHTS_DIR, type=str, help="Path to pretrained weights")
     args = vars(parser.parse_args())
-    try: 
-        assert torch.cuda.is_available()
-    except AssertionError:
-        print('Cuda is not available. Please use a device with a GPU.')
-        exit(1)
+    if args['device'] == 'cuda':
+        try: 
+            assert torch.cuda.is_available()
+        except AssertionError:
+            print('Cuda is not available. Please use a device with a GPU.')
+            exit(1)
     torch.multiprocessing.set_sharing_strategy('file_system')
     ReproducibilityUtils.seed_everything(args['seed'])
     dataloader = DataLoader(args['data_dir'], args['modality_list'])
-    labels = np.random.randint(2, size=20)
-    data_dict = dataloader.create_data_dict(labels)
-    dataloader_dict = dataloader.load_data(data_dict, [0.6, 0.2, 0.2], args['batch_size'], 2, args['test_set'])
+    data_dict = dataloader.create_data_dict()
+    dataloader_dict = dataloader.load_data(data_dict, 0.8, args['batch_size'], 2, args['test_set'], args['quant_images'])
     model = ResNet(args['version'], 2, len(args['modality_list']), args['pretrained'], args['feature_extraction'], args['weights_dir'])
-    criterion = torch.nn.CrossEntropyLoss()
-    optimizer = torch.optim.SGD(model.parameters(), args['learning_rate'], args['momentum'])
+    criterion = torch.nn.CrossEntropyLoss(weight=torch.tensor([739, 60]) / 799)
+    quant_criterion = torch.nn.CrossEntropyLoss(weight=torch.tensor([189, 19]) / 208)
+    optimizer = torch.optim.Adam(model.parameters(), args['learning_rate'], args['momentum'])
     train = Training(model, args['version'], args['device'], dataloader_dict, args['results_dir'])
     train.train_model(args['epochs'], criterion, optimizer, args['early_stopping'], args['patience'])
     train.visualize_training('loss')
