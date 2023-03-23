@@ -378,7 +378,7 @@ class DataLoader:
             
 
 if __name__ == '__main__':
-    DATA_DIR = '/Users/noltinho/thesis/sensitive_data'
+    DATA_DIR = '/deepstore/datasets/bms/hcc_study'
     QUANT_LIST = ['T1W_QNT']
     MODALITY_LIST = ['T1W_OOP','T1W_IP','T1W_DYN','T2W_TES','T2W_TEL','DWI_b150','DWI_b400','DWI_b800']
     IMAGES_TO_KEEP = ['T1W_OOP','T1W_IP','T1W_DYN','T1W_QNT','T2W_TES','T2W_TEL','DWI_b0','DWI_b150','DWI_b400','DWI_b800']
@@ -386,7 +386,10 @@ if __name__ == '__main__':
     # DicomToNifti(DATA_DIR).convert_dicom_to_nifti(os.path.join(DATA_DIR, 'labels/labels.csv'))
     # prep = PreprocessingUtils(DATA_DIR)
     # prep.clean_directory(IMAGES_TO_KEEP)
-    ReproducibilityUtils.seed_everything(123)
+    # ReproducibilityUtils.seed_everything(123)
     dataloader = DataLoader(DATA_DIR, MODALITY_LIST)
-    data_dict = dataloader.create_data_dict()
-    dataloader_dict = dataloader.load_data(data_dict, 0.8, 16, 4, False, True)
+    obs_list = dataloader.assert_observation_completeness(MODALITY_LIST, True)
+    obs_df = pd.DataFrame(obs_list)
+    obs_df.to_csv('/home/x3007104/thesis/scripts/obs_list.csv')
+    # data_dict = dataloader.create_data_dict()
+    # dataloader_dict = dataloader.load_data(data_dict, 0.8, 16, 4, False, True)

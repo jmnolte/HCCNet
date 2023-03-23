@@ -247,6 +247,10 @@ scripts/pretrained_models/
 ### Files created in preparation for the research report ###
 research_report/
 
+### Output files ###
+*.out
+*.err
+
 ### Miscellaneous ###
 miscellaneous/
 
