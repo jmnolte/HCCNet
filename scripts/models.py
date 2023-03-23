@@ -57,6 +57,9 @@ class ResNet(torch.nn.Module):
 
         Args:
             input (torch.Tensor): Input tensor.
+
+        Returns:
+            torch.Tensor: Output tensor.
         '''
         x = self.model(x)
         return x
@@ -68,6 +71,9 @@ class ResNet(torch.nn.Module):
 
         Args:
             num_classes (int): Number of output classes.
+    
+        Returns:
+            torch.nn.Linear: Output layer.
         '''
 
         num_ftrs = self.model.fc.in_features
@@ -82,6 +88,9 @@ class ResNet(torch.nn.Module):
 
         Args:
             weights_path (str): Path to the pretrained weights.
+        
+        Returns:
+            dict: Dictionary containing the model's weights.
         '''
 
         model_dict = self.model.state_dict()
