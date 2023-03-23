@@ -236,8 +236,10 @@ if __name__ == '__main__':
     data_dict = dataloader.create_data_dict()
     dataloader_dict = dataloader.load_data(data_dict, args['train_ratio'], args['batch_size'], 2, args['test_set'], args['quant_images'])
     model = ResNet(args['version'], 2, len(args['modality_list']), args['pretrained'], args['feature_extraction'], args['weights_dir'])
-    criterion = torch.nn.CrossEntropyLoss(weight=torch.tensor([739, 60]) / 799)
-    quant_criterion = torch.nn.CrossEntropyLoss(weight=torch.tensor([189, 19]) / 208)
+    if args['quant_images']:
+        criterion = torch.nn.CrossEntropyLoss(weight=torch.tensor([189, 19]) / 208)
+    else:
+        criterion = torch.nn.CrossEntropyLoss(weight=torch.tensor([739, 60]) / 799)
     optimizer = torch.optim.Adam(model.parameters(), args['learning_rate'], args['momentum'])
     train = Training(model, args['version'], args['device'], dataloader_dict, args['results_dir'])
     train.train_model(args['epochs'], criterion, optimizer, args['early_stopping'], args['patience'])
