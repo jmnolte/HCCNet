@@ -200,7 +200,7 @@ class Training:
         
 RESULTS_DIR = '/Users/noltinho/thesis/results'
 DATA_DIR = '/Users/noltinho/thesis/sensitive_data'
-MODALITY_LIST = ['T1W_OOP','T1W_IP','T1W_DYN','T2W_TES','T2W_TEL','DWI_b0','DWI_b150','DWI_b400','DWI_b800']
+MODALITY_LIST = ['T1W_OOP','T1W_IP','T1W_DYN','T2W_TES','T2W_TEL','DWI_b150','DWI_b400','DWI_b800']
 WEIGHTS_DIR = '/Users/noltinho/MedicalNet/pytorch_files/pretrain'
 
 if __name__ == '__main__':
@@ -212,7 +212,7 @@ if __name__ == '__main__':
     parser.add_argument("-b", "--batch_size", default=4, type=int, help="Batch size to use for training")
     parser.add_argument("-tr", "--train_ratio", default=0.8, type=float, help="Ratio of training data to use for training")
     parser.add_argument("-lr", "--learning_rate", default=1e-6, type=float, help="Learning rate to use for training")
-    parser.add_argument("-wd", "--weight_decay", default=1e-8, type=float, help="Weight decay to use for training")
+    parser.add_argument("-w", "--weight_decay", default=1e-8, type=float, help="Weight decay to use for training")
     parser.add_argument("-es", "--early_stopping", default=True, type=bool, help="Flag to use early stopping")
     parser.add_argument("-pa", "--patience", default=10, type=int, help="Patience to use for early stopping")
     parser.add_argument("-ml", "--modality_list", default=MODALITY_LIST, nargs='+', help="List of modalities to use for training")
@@ -231,6 +231,7 @@ if __name__ == '__main__':
             print('Cuda is not available. Please use a device with a GPU.')
             exit(1)
     torch.multiprocessing.set_sharing_strategy('file_system')
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
     ReproducibilityUtils.seed_everything(args['seed'])
     dataloader = DataLoader(args['data_dir'], args['modality_list'])
     data_dict = dataloader.create_data_dict()
@@ -240,7 +241,7 @@ if __name__ == '__main__':
         criterion = torch.nn.CrossEntropyLoss(weight=torch.tensor([189, 19]) / 208)
     else:
         criterion = torch.nn.CrossEntropyLoss(weight=torch.tensor([739, 60]) / 799)
-    optimizer = torch.optim.Adam(model.parameters(), args['learning_rate'], args['momentum'])
+    optimizer = torch.optim.Adam(model.parameters(), lr=args['learning_rate'], weight_decay=args['weight_decay'])
     train = Training(model, args['version'], args['device'], dataloader_dict, args['results_dir'])
     train.train_model(args['epochs'], criterion, optimizer, args['early_stopping'], args['patience'])
     train.visualize_training('loss')
