@@ -10,6 +10,7 @@ import dicom2nifti
 from utils import ReproducibilityUtils
 import pandas as pd
 from sklearn.model_selection import train_test_split, GroupShuffleSplit
+from torch.utils.data.distributed import DistributedSampler
 
 class DicomToNifti:
 
@@ -186,7 +187,7 @@ class DataLoader:
             monai.transforms.LoadImaged(keys=self.modality_list),
             monai.transforms.EnsureChannelFirstd(keys=self.modality_list),
             monai.transforms.Orientationd(keys=self.modality_list, axcodes='PLI'),
-            monai.transforms.Resized(keys=self.modality_list, spatial_size=(128, 128, 128)),
+            monai.transforms.Resized(keys=self.modality_list, spatial_size=(96, 96, 96)),
             monai.transforms.NormalizeIntensityd(keys=self.modality_list, channel_wise=True),
             monai.transforms.ConcatItemsd(keys=self.modality_list, name='image', dim=0)
         ])
@@ -371,10 +372,12 @@ class DataLoader:
         persistent_cache = os.path.join(tempfile.mkdtemp(), 'persistent_cache')
         if test_set:
             test_dataset = monai.data.PersistentDataset(data=data_split_dict['test'], transform=self.apply_transformations('test'), cache_dir=persistent_cache)
-            return {'test': monai.data.DataLoader(test_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers)}
+            test_sampler = monai.data.DistributedSampler(dataset=test_dataset, even_divisible=True, shuffle=True)
+            return {'test': monai.data.DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, sampler=test_sampler)}
         else:
             datasets = {x: monai.data.PersistentDataset(data=data_split_dict[x], transform=self.apply_transformations(x), cache_dir=persistent_cache) for x in ['train', 'val']}
-            return {x: monai.data.DataLoader(datasets[x], batch_size=batch_size, shuffle=True, num_workers=num_workers) for x in ['train', 'val']}
+            sampler = {x: monai.data.DistributedSampler(dataset=datasets[x], even_divisible=True, shuffle=True) for x in ['train', 'val']}
+            return {x: monai.data.DataLoader(datasets[x], batch_size=batch_size, shuffle=False, num_workers=num_workers, sampler=sampler[x]) for x in ['train', 'val']}
             
 
 if __name__ == '__main__':
@@ -386,10 +389,6 @@ if __name__ == '__main__':
     # DicomToNifti(DATA_DIR).convert_dicom_to_nifti(os.path.join(DATA_DIR, 'labels/labels.csv'))
     # prep = PreprocessingUtils(DATA_DIR)
     # prep.clean_directory(IMAGES_TO_KEEP)
-    # ReproducibilityUtils.seed_everything(123)
-    dataloader = DataLoader(DATA_DIR, MODALITY_LIST)
-    obs_list = dataloader.assert_observation_completeness(MODALITY_LIST, True)
-    obs_df = pd.DataFrame(obs_list)
-    obs_df.to_csv('/home/x3007104/thesis/scripts/obs_list.csv')
-    # data_dict = dataloader.create_data_dict()
-    # dataloader_dict = dataloader.load_data(data_dict, 0.8, 16, 4, False, True)
+    ReproducibilityUtils.seed_everything(123)
+    data_dict = dataloader.create_data_dict()
+    dataloader_dict = dataloader.load_data(data_dict, 0.8, 16, 4, False, True)
