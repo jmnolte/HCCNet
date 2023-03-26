@@ -10,10 +10,19 @@ from models import ResNet
 from utils import ReproducibilityUtils
 from tqdm import tqdm
 import argparse
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 class Training:
     
-    def __init__(self, model: torch.nn.Module, version: str, device: torch.device, dataloaders: dict, output_dir: str) -> None:
+    def __init__(
+        self, 
+        model: torch.nn.Module, 
+        version: str, 
+        dataloaders: dict, 
+        save_every: int,
+        snapshot_path: str,
+        output_dir: str
+    ) -> None:
 
         '''
         Initialize the training class.
@@ -32,12 +41,41 @@ class Training:
             print('Invalid version. Please choose from: resnet10, resnet18, resnet34, resnet50, resnet101, resnet152, resnet200')
             exit(1)
 
-        self.model = model
-        self.model.to(device)
+        self.gpu_id = int(os.environ['LOCAL_RANK'])
+        self.model = model.to(self.gpu_id)
         self.version = version
-        self.device = device
         self.dataloaders = dataloaders
         self.output_dir = output_dir
+        self.save_every = save_every
+        self.epochs_run = 0
+        self.snapshot_path = os.path.join(output_dir, 'snapshots' + version + '_' + 'snapshot.pth')
+        if self.epochs_run != 0 and os.path.exists(self.snapshot_path):
+            print('Loading snapshot')
+            self.load_snapshot(self.snapshot_path)
+        self.model = DDP(self.model, device_ids=[self.gpu_id])
+    
+    def load_snapshot(self, snapshot_path: str) -> dict:
+
+        snapshot = torch.load(snapshot_path)
+        self.model.load_state_dict(snapshot['MODEL_STATE'])
+        self.epochs_run = snapshot['EPOCHS_RUN']
+        print('Resuming training from epoch:'.format(self.epochs_run))
+
+    def save_snapshot(self, epoch: int) -> None:
+
+        snapshot = {}
+        snapshot['MODEL_STATE'] = self.model.module.state_dict()
+        snapshot['EPOCHS_RUN'] = epoch
+        folder_name = self.version + '_' + 'snapshot.pth'
+        folder_path = os.path.join(self.output_dir, 'snapshots', folder_name)
+        folder_path_root = os.path.join(self.output_dir, 'snapshots')
+
+        if os.path.exists(folder_path):
+            os.remove(folder_path)
+        elif not os.path.exists(folder_path_root):
+            os.makedirs(folder_path_root)
+        torch.save(snapshot, folder_path)
+        print('Epoch {}: Training snapshot saved at snapshot.pth')
 
     def save_output(self, output_dict: dict, output_type: str) -> None:
 
@@ -69,7 +107,7 @@ class Training:
             os.makedirs(folder_path_root)
 
         if output_type == 'weights':
-            torch.save(self.model.state_dict(output_dict), folder_path)
+            torch.save(self.model.module.state_dict(output_dict), folder_path)
         else:
             np.save(folder_path, output_dict)
 
@@ -92,9 +130,12 @@ class Training:
         history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': []}
         best_loss = 10000.0
         counter = 0
+        criterion = criterion.to(self.gpu_id)
+        average_epoch_loss = []
+        average_epoch_acc = []
 
-        for epoch in range(max_epochs):
-            print('Epoch {}'.format(epoch))
+        for epoch in range(self.epochs_run, max_epochs):
+            print(f"[GPU{self.gpu_id}] Epoch {epoch}")
             print('-' * 10)
 
             for phase in ['train', 'val']:
@@ -107,7 +148,7 @@ class Training:
                 running_corrects = 0
 
                 for batch_data in tqdm(self.dataloaders[phase]):
-                    inputs, labels = batch_data['image'].to(self.device), batch_data['label'].to(self.device)
+                    inputs, labels = batch_data['image'].to(self.gpu_id), batch_data['label'].to(self.gpu_id)
                     optimizer.zero_grad()
 
                     with torch.set_grad_enabled(phase == 'train'):
@@ -126,7 +167,7 @@ class Training:
                 epoch_loss = copy.deepcopy(running_loss / len(self.dataloaders[phase].dataset))
                 epoch_acc = copy.deepcopy(running_corrects.double() / len(self.dataloaders[phase].dataset))
 
-                print('{} Loss: {:.4f} Acc: {:.4f}'.format(phase, epoch_loss, epoch_acc.item()))
+                print('{} Loss: {:.4f} Accuracy: {:.4f}'.format(phase, epoch_loss, epoch_acc.item()))
 
                 if phase == 'train':
                     history['train_loss'].append(epoch_loss)
@@ -138,13 +179,17 @@ class Training:
                 if phase == 'val' and epoch_loss < best_loss:
                     best_loss = epoch_loss
                     acc = epoch_acc
-                    prec = metrics.precision_score(labels.cpu(), preds.cpu()) 
-                    recall = metrics.recall_score(labels.cpu(), preds.cpu())
-                    fscore = metrics.f1_score(labels.cpu(), preds.cpu())
                     counter = 0
-                    best_weights = copy.deepcopy(self.model.state_dict())
+                    if self.gpu_id == 0:
+                        prec = metrics.precision_score(labels.cpu(), preds.cpu()) 
+                        recall = metrics.recall_score(labels.cpu(), preds.cpu())
+                        fscore = metrics.f1_score(labels.cpu(), preds.cpu())
+                        best_weights = copy.deepcopy(self.model.state_dict())
                 elif phase == 'val' and epoch_loss >= best_loss:
                     counter += 1
+
+            if self.gpu_id == 0 and epoch % self.save_every == 0:
+                self.save_snapshot(epoch)
 
             if early_stopping == True:
                 if epoch > min_epochs - 1 and counter == patience:
@@ -197,7 +242,10 @@ class Training:
         plt.savefig(file_path, dpi=300, bbox_inches="tight")
         plt.close()
 
-        
+def ddp_setup() -> None:
+
+    torch.distributed.init_process_group(backend="nccl")
+
 RESULTS_DIR = '/Users/noltinho/thesis/results'
 DATA_DIR = '/Users/noltinho/thesis/sensitive_data'
 MODALITY_LIST = ['T1W_OOP','T1W_IP','T1W_DYN','T2W_TES','T2W_TEL','DWI_b150','DWI_b400','DWI_b800']
@@ -211,38 +259,41 @@ if __name__ == '__main__':
     parser.add_argument("-e", "--epochs", required=True, type=int, help="Number of epochs to train for")
     parser.add_argument("-b", "--batch_size", default=4, type=int, help="Batch size to use for training")
     parser.add_argument("-tr", "--train_ratio", default=0.8, type=float, help="Ratio of training data to use for training")
-    parser.add_argument("-lr", "--learning_rate", default=1e-6, type=float, help="Learning rate to use for training")
-    parser.add_argument("-w", "--weight_decay", default=1e-8, type=float, help="Weight decay to use for training")
+    parser.add_argument("-lr", "--learning_rate", default=1e-5, type=float, help="Learning rate to use for training")
+    parser.add_argument("-w", "--weight_decay", default=1e-7, type=float, help="Weight decay to use for training")
     parser.add_argument("-es", "--early_stopping", default=True, type=bool, help="Flag to use early stopping")
     parser.add_argument("-pa", "--patience", default=10, type=int, help="Patience to use for early stopping")
     parser.add_argument("-ml", "--modality_list", default=MODALITY_LIST, nargs='+', help="List of modalities to use for training")
     parser.add_argument("-s", "--seed", default=123, type=int, help="Seed to use for reproducibility")
-    parser.add_argument("-d", "--device", default='cuda', type=str, help="Device to use for training")
+    # parser.add_argument("-d", "--device", default='cuda', type=str, help="Device to use for training")
     parser.add_argument("-ts", "--test_set", default=False, type=bool, help="Flag to load test or training and validation set")
     parser.add_argument("-q", "--quant_images", default=False, type=bool, help="Flag to run analysis on quant images")
     parser.add_argument("-dd", "--data_dir", default=DATA_DIR, type=str, help="Path to data directory")
     parser.add_argument("-rd", "--results_dir", default=RESULTS_DIR, type=str, help="Path to results directory")
     parser.add_argument("-wd", "--weights_dir", default=WEIGHTS_DIR, type=str, help="Path to pretrained weights")
     args = vars(parser.parse_args())
-    if args['device'] == 'cuda':
-        try: 
-            assert torch.cuda.is_available()
-        except AssertionError:
-            print('Cuda is not available. Please use a device with a GPU.')
-            exit(1)
-    torch.multiprocessing.set_sharing_strategy('file_system')
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
+    # if args['device'] == 'cuda':
+    #     try: 
+    #         assert torch.cuda.is_available()
+    #     except AssertionError:
+    #         print('Cuda is not available. Please use a device with a GPU.')
+    #         exit(1)
+    # os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:1024"
     ReproducibilityUtils.seed_everything(args['seed'])
+    ddp_setup()
     dataloader = DataLoader(args['data_dir'], args['modality_list'])
     data_dict = dataloader.create_data_dict()
     dataloader_dict = dataloader.load_data(data_dict, args['train_ratio'], args['batch_size'], 2, args['test_set'], args['quant_images'])
     model = ResNet(args['version'], 2, len(args['modality_list']), args['pretrained'], args['feature_extraction'], args['weights_dir'])
     if args['quant_images']:
-        criterion = torch.nn.CrossEntropyLoss(weight=torch.tensor([189, 19]) / 208)
+        weight = torch.tensor([189, 19]) / 208
     else:
-        criterion = torch.nn.CrossEntropyLoss(weight=torch.tensor([739, 60]) / 799)
+        weight = torch.tensor([739, 60]) / 799
+    criterion = torch.nn.CrossEntropyLoss(weight=weight)
     optimizer = torch.optim.Adam(model.parameters(), lr=args['learning_rate'], weight_decay=args['weight_decay'])
-    train = Training(model, args['version'], args['device'], dataloader_dict, args['results_dir'])
+    train = Training(model, args['version'], dataloader_dict, 10, os.path.join(args['results_dir'], 'snapshots'), args['results_dir'])
     train.train_model(args['epochs'], criterion, optimizer, args['early_stopping'], args['patience'])
     train.visualize_training('loss')
     train.visualize_training('acc')
+    torch.distributed.destroy_process_group()
+    
