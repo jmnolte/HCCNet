@@ -75,7 +75,7 @@ class Training:
         elif not os.path.exists(folder_path_root):
             os.makedirs(folder_path_root)
         torch.save(snapshot, folder_path)
-        print('Epoch {}: Training snapshot saved at snapshot.pth')
+        print('Epoch {}: Training snapshot saved at snapshot.pth'.format(epoch))
 
     def save_output(self, output_dict: dict, output_type: str) -> None:
 
@@ -131,8 +131,6 @@ class Training:
         best_loss = 10000.0
         counter = 0
         criterion = criterion.to(self.gpu_id)
-        average_epoch_loss = []
-        average_epoch_acc = []
 
         for epoch in range(self.epochs_run, max_epochs):
             print(f"[GPU{self.gpu_id}] Epoch {epoch}")
@@ -166,25 +164,23 @@ class Training:
 
                 epoch_loss = copy.deepcopy(running_loss / len(self.dataloaders[phase].dataset))
                 epoch_acc = copy.deepcopy(running_corrects.double() / len(self.dataloaders[phase].dataset))
+                epoch_kappa = (epoch_acc.item() - 0.075) / (1 - 0.075)
 
-                print('{} Loss: {:.4f} Accuracy: {:.4f}'.format(phase, epoch_loss, epoch_acc.item()))
+                print('{} Loss: {:.4f} Accuracy: {:.4f} Kappa: {:.4f}'.format(phase, epoch_loss, epoch_acc.item(), epoch_kappa))
 
                 if phase == 'train':
                     history['train_loss'].append(epoch_loss)
-                    history['train_acc'].append(epoch_acc)
+                    history['train_acc'].append(epoch_acc.cpu().item())
                 elif phase == 'val':
                     history['val_loss'].append(epoch_loss)
-                    history['val_acc'].append(epoch_acc)
+                    history['val_acc'].append(epoch_acc.cpu().item())
 
                 if phase == 'val' and epoch_loss < best_loss:
                     best_loss = epoch_loss
                     acc = epoch_acc
+                    kappa = epoch_kappa
                     counter = 0
-                    if self.gpu_id == 0:
-                        prec = metrics.precision_score(labels.cpu(), preds.cpu()) 
-                        recall = metrics.recall_score(labels.cpu(), preds.cpu())
-                        fscore = metrics.f1_score(labels.cpu(), preds.cpu())
-                        best_weights = copy.deepcopy(self.model.state_dict())
+                    best_weights = copy.deepcopy(self.model.state_dict())
                 elif phase == 'val' and epoch_loss >= best_loss:
                     counter += 1
 
@@ -200,11 +196,9 @@ class Training:
         self.save_output(history, 'history')
 
         print('Training complete in {:.0f}m {:.0f}s'.format(time_elapsed // 60, time_elapsed % 60))
-        print('Performance Metrics on Validation set:')
-        print('Acc: {:4f}'.format(acc.item())) 
-        print('Precision: {:4f}'.format(prec.item()))
-        print('Recall: {:4f}'.format(recall.item()))
-        print('F1-Score: {:4f}'.format(fscore.item()))
+        print('Perfrormance Metrics on Validation set:')
+        print('Accuracy:'.format(acc.item()))
+        print('Kappa:'.format(kappa))
 
     def visualize_training(self, metric: str) -> None:
 
@@ -265,35 +259,28 @@ if __name__ == '__main__':
     parser.add_argument("-pa", "--patience", default=10, type=int, help="Patience to use for early stopping")
     parser.add_argument("-ml", "--modality_list", default=MODALITY_LIST, nargs='+', help="List of modalities to use for training")
     parser.add_argument("-s", "--seed", default=123, type=int, help="Seed to use for reproducibility")
-    # parser.add_argument("-d", "--device", default='cuda', type=str, help="Device to use for training")
     parser.add_argument("-ts", "--test_set", default=False, type=bool, help="Flag to load test or training and validation set")
     parser.add_argument("-q", "--quant_images", default=False, type=bool, help="Flag to run analysis on quant images")
     parser.add_argument("-dd", "--data_dir", default=DATA_DIR, type=str, help="Path to data directory")
     parser.add_argument("-rd", "--results_dir", default=RESULTS_DIR, type=str, help="Path to results directory")
     parser.add_argument("-wd", "--weights_dir", default=WEIGHTS_DIR, type=str, help="Path to pretrained weights")
     args = vars(parser.parse_args())
-    # if args['device'] == 'cuda':
-    #     try: 
-    #         assert torch.cuda.is_available()
-    #     except AssertionError:
-    #         print('Cuda is not available. Please use a device with a GPU.')
-    #         exit(1)
-    # os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:1024"
     ReproducibilityUtils.seed_everything(args['seed'])
     ddp_setup()
+    torch.multiprocessing.set_sharing_strategy('file_system')
     dataloader = DataLoader(args['data_dir'], args['modality_list'])
     data_dict = dataloader.create_data_dict()
     dataloader_dict = dataloader.load_data(data_dict, args['train_ratio'], args['batch_size'], 2, args['test_set'], args['quant_images'])
     model = ResNet(args['version'], 2, len(args['modality_list']), args['pretrained'], args['feature_extraction'], args['weights_dir'])
     if args['quant_images']:
-        weight = torch.tensor([189, 19]) / 208
+        weight = torch.tensor([19, 189]) / 208
     else:
-        weight = torch.tensor([739, 60]) / 799
+        weight = torch.tensor([60, 739]) / 799
     criterion = torch.nn.CrossEntropyLoss(weight=weight)
     optimizer = torch.optim.Adam(model.parameters(), lr=args['learning_rate'], weight_decay=args['weight_decay'])
     train = Training(model, args['version'], dataloader_dict, 10, os.path.join(args['results_dir'], 'snapshots'), args['results_dir'])
     train.train_model(args['epochs'], criterion, optimizer, args['early_stopping'], args['patience'])
+    torch.distributed.destroy_process_group()
     train.visualize_training('loss')
     train.visualize_training('acc')
-    torch.distributed.destroy_process_group()
     
