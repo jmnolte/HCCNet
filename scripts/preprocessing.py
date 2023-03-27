@@ -188,7 +188,6 @@ class DataLoader:
             monai.transforms.EnsureChannelFirstd(keys=self.modality_list),
             monai.transforms.Orientationd(keys=self.modality_list, axcodes='PLI'),
             monai.transforms.Resized(keys=self.modality_list, spatial_size=(96, 96, 96)),
-            monai.transforms.NormalizeIntensityd(keys=self.modality_list, channel_wise=True),
             monai.transforms.ConcatItemsd(keys=self.modality_list, name='image', dim=0)
         ])
         
@@ -201,6 +200,7 @@ class DataLoader:
         ])
         
         postprocessing = monai.transforms.Compose([
+            monai.transforms.NormalizeIntensityd(keys='image', channel_wise=True),
             monai.transforms.IntensityStatsd(keys='image', key_prefix='orig', ops=['mean', 'std'], channel_wise=True),
             monai.transforms.ToTensord(keys=['image', 'label'])
         ])
