@@ -12,7 +12,7 @@ from tqdm import tqdm
 import argparse
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-class Training:
+class Trainer:
     
     def __init__(
         self, 
@@ -52,6 +52,7 @@ class Training:
         if self.epochs_run != 0 and os.path.exists(self.snapshot_path):
             print('Loading snapshot')
             self.load_snapshot(self.snapshot_path)
+        self.model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.model)
         self.model = DDP(self.model, device_ids=[self.gpu_id])
     
     def load_snapshot(self, snapshot_path: str) -> dict:
@@ -111,7 +112,13 @@ class Training:
         else:
             np.save(folder_path, output_dict)
 
-    def train_model(self, min_epochs: int, criterion: torch.nn, optimizer: torch.optim, early_stopping: bool, patience: int) -> None:
+    def train_model(
+        self, 
+        criterion: torch.nn, 
+        optimizer: torch.optim, 
+        early_stopping: bool, 
+        patience: int
+    ) -> None:
 
         '''
         Train the model.
@@ -130,11 +137,11 @@ class Training:
         history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': []}
         best_loss = 10000.0
         counter = 0
-        criterion = criterion.to(self.gpu_id)
+        criterion.to(self.gpu_id)
 
         for epoch in range(self.epochs_run, max_epochs):
-            print(f"[GPU{self.gpu_id}] Epoch {epoch}")
-            print('-' * 10)
+
+            self.dataloaders['train'].sampler.set_epoch(epoch)
 
             for phase in ['train', 'val']:
                 if phase == 'train':
@@ -166,6 +173,8 @@ class Training:
                 epoch_acc = copy.deepcopy(running_corrects.double() / len(self.dataloaders[phase].dataset))
                 epoch_kappa = (epoch_acc.item() - 0.075) / (1 - 0.075)
 
+                print(f"[GPU{self.gpu_id}] Epoch {epoch}")
+                print('-' * 10)
                 print('{} Loss: {:.4f} Accuracy: {:.4f} Kappa: {:.4f}'.format(phase, epoch_loss, epoch_acc.item(), epoch_kappa))
 
                 if phase == 'train':
@@ -180,14 +189,15 @@ class Training:
                     acc = epoch_acc
                     kappa = epoch_kappa
                     counter = 0
-                    best_weights = copy.deepcopy(self.model.state_dict())
+                    if self.gpu_id == 0
+                        best_weights = copy.deepcopy(self.model.state_dict())
                 elif phase == 'val' and epoch_loss >= best_loss:
                     counter += 1
 
             if self.gpu_id == 0 and epoch % self.save_every == 0:
                 self.save_snapshot(epoch)
 
-            if early_stopping == True:
+            if early_stopping:
                 if epoch > min_epochs - 1 and counter == patience:
                     break
 
@@ -272,12 +282,13 @@ if __name__ == '__main__':
     data_dict = dataloader.create_data_dict()
     dataloader_dict = dataloader.load_data(data_dict, args['train_ratio'], args['batch_size'], 2, args['test_set'], args['quant_images'])
     model = ResNet(args['version'], 2, len(args['modality_list']), args['pretrained'], args['feature_extraction'], args['weights_dir'])
+    model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
     if args['quant_images']:
-        weight = torch.tensor([19, 189]) / 208
+        weights = 19 / torch.tensor([189, 19])
     else:
-        weight = torch.tensor([60, 739]) / 799
-    criterion = torch.nn.CrossEntropyLoss(weight=weight)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args['learning_rate'], weight_decay=args['weight_decay'])
+        weights = 60 / torch.tensor([739, 60])
+    criterion = torch.nn.CrossEntropyLoss(weight=weights)
+    optimizer = torch.optim.SGD(model.parameters(), lr=args['learning_rate'], momentum=0.9)
     train = Training(model, args['version'], dataloader_dict, 10, os.path.join(args['results_dir'], 'snapshots'), args['results_dir'])
     train.train_model(args['epochs'], criterion, optimizer, args['early_stopping'], args['patience'])
     torch.distributed.destroy_process_group()
