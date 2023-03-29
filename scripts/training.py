@@ -223,6 +223,9 @@ class Trainer:
         epoch_loss_values = []
         self.model.train()
         self.dataloaders['train'].sampler.set_epoch(epoch)
+        if self.gpu_id == 0:
+            print(f'Epoch {epoch}')
+            print('-' * 10)
         for step, batch_data in enumerate(self.dataloaders['train']):
             inputs, labels = batch_data['image'].to(self.gpu_id), batch_data['label'].to(self.gpu_id)
             self.optimizer.zero_grad()
@@ -233,17 +236,17 @@ class Trainer:
             self.optimizer.step()
 
             running_loss += loss.item()
-            metric.update(preds, labels)
-            epoch_len = len(self.dataloaders['train'].dataset) // self.dataloaders['train'].batch_size
-            if self.gpu_id == 0:
-                print(f"{step}/{epoch_len}, Batch Loss: {loss.item():.4f}")
-        epoch_loss = running_loss / step
+            batch_f1score = metric(preds, labels)
+            epoch_len = len(self.dataloaders['train'].dataset) // self.dataloaders['train'].batch_size // 4
+            if self.gpu_id == 0 and step % 5 == 0:
+                print(f"{step}/{epoch_len}, Batch Loss: {loss.item():.4f}, Batch F1-Score: {batch_f1score.item():.4f}")
+        epoch_loss = running_loss / (step + 1)
         epoch_loss_values.append(running_loss)
-        epoch_acc = metric.compute()
+        epoch_f1score = metric.compute()
         metric.reset()
         if self.gpu_id == 0:
-            print(f"GPU {self.gpu_id}: Epoch {epoch}, Loss: {epoch_loss:.4f}, Accuracy: {epoch_acc:.4f}")
-        return epoch_loss, epoch_acc
+            print(f"[GPU {self.gpu_id}] Epoch {epoch}, Training Loss: {epoch_loss:.4f}, Training F1-Score: {epoch_f1score.item():.4f}")
+        return epoch_loss, epoch_f1score
 
     def validate(self, metric: torchmetrics, epoch: int) -> tuple:
 
@@ -267,15 +270,15 @@ class Trainer:
 
                 running_loss += loss.item()
                 metric.update(preds, labels)
-            epoch_loss = running_loss / step
+            epoch_loss = running_loss / (step + 1)
             epoch_loss_values.append(running_loss)
-            epoch_acc = metric.compute()
+            epoch_f1score = metric.compute()
             metric.reset()
             if self.gpu_id == 0:
-                print(f"GPU {self.gpu_id}: Epoch {epoch}, Loss: {running_loss:.4f}, Accuracy: {epoch_acc:.4f}")
-        return epoch_loss, epoch_acc
+                print(f"[GPU {self.gpu_id}] Epoch {epoch}, Validation Loss: {epoch_loss:.4f}, Validation F1-Score: {epoch_f1score.item():.4f}")
+        return epoch_loss, epoch_f1score
     
-    def training_loop(self, metric: torchmetrics, min_epochs: int, patience: int, early_stopping: bool) -> None:
+    def training_loop(self, metric: torchmetrics, min_epochs: int, early_stopping: bool, patience: int) -> None:
 
         '''
         Training loop.
@@ -287,21 +290,26 @@ class Trainer:
             early_stopping (bool): Whether to use early stopping.
         '''
         since = time.time()
+        max_epochs = min_epochs * 100
         best_loss = np.inf
         counter = 0
-        history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': []}
-        acc = 0
-        for epoch in range(self.epochs):
-            train_loss, train_acc = self.train(metric, epoch)
-            val_loss, val_acc = self.validate(metric, epoch)
+        history = {'train_loss': [], 'train_f1score': [], 'val_loss': [], 'val_f1score': []}
+        f1score = 0
+        for epoch in range(max_epochs):
+            start_time = time.time()
+            train_loss, train_f1score = self.train(metric, epoch)
+            val_loss, val_f1score = self.validate(metric, epoch)
+            train_time = time.time() - start_time
+            if self.gpu_id == 0:
+                print(f'Epoch {epoch} complete in {train_time // 60}min {train_time % 60}sec')
             history['train_loss'].append(train_loss)
-            history['train_acc'].append(train_acc)
+            history['train_f1score'].append(train_f1score)
             history['val_loss'].append(val_loss)
-            history['val_acc'].append(val_acc)
+            history['val_f1score'].append(val_f1score)
 
             if val_loss < best_loss:
                 best_loss = val_loss
-                acc = val_acc
+                f1score = train_f1score
                 counter = 0
                 if self.gpu_id == 0:
                     best_weights = copy.deepcopy(self.model.state_dict())
@@ -314,7 +322,7 @@ class Trainer:
                     self.save_output(best_weights, 'weights')
                     self.save_output(history, 'history')
                     print('Training complete in {:.0f}m {:.0f}s'.format(time_elapsed // 60, time_elapsed % 60))
-                    print('Accuracy of best model configuration:'.format(acc.item()))
+                    print('F1-Score of best model configuration:'.format(f1score.item()))
                     break
 
     def visualize_training(self, metric: str) -> None:
@@ -323,18 +331,18 @@ class Trainer:
         Visualize the training and validation history.
 
         Args:
-            metric (str): 'loss' or 'acc'.
+            metric (str): 'loss' or 'f1score'.
         '''
         try: 
-            assert any(metric == metric_item for metric_item in ['loss','acc'])
+            assert any(metric == metric_item for metric_item in ['loss','f1score'])
         except AssertionError:
-            print('Invalid input. Please choose from: loss or acc.')
+            print('Invalid input. Please choose from: loss or f1score.')
             exit(1)
 
         if metric == 'loss':
             metric_label = 'Loss'
-        elif metric == 'acc':
-            metric_label = 'Accuracy'
+        elif metric == 'f1score':
+            metric_label = 'F1-Score'
 
         file_name = self.version + '_hist.npy'
         plot_name = self.version + '_' + metric + '.png'
@@ -395,8 +403,7 @@ def parse_args() -> argparse.Namespace:
                         help="Path to results directory")
     parser.add_argument("--weights-dir", default=WEIGHTS_DIR, type=str, 
                         help="Path to pretrained weights")
-    args = vars(parser.parse_args())
-    return args
+    return parser.parse_args()
 
 def load_train_objs(args: argparse.Namespace) -> tuple:
 
@@ -420,7 +427,8 @@ def load_train_objs(args: argparse.Namespace) -> tuple:
         weights = 60 / torch.tensor([739, 60])
     criterion = torch.nn.CrossEntropyLoss(weight=weights)
 
-    metric = torchmetrics.Accuracy()
+    metric = torchmetrics.F1Score(task='binary')
+    model.metric = metric
     return dataloader_dict, model, optimizer, criterion, metric
 
 def setup() -> None:
@@ -447,12 +455,12 @@ def main(args: argparse.Namespace) -> None:
     '''
     ReproducibilityUtils.seed_everything(args.seed)
     setup()
-    dataloader_dict, model, optimizer, criterion, metric = load_train_objs()
-    trainer = Trainer(model, args.version, dataloader_dict, optimizer, criterion, os.path.join(args.results_dir, 'snapshots'), args.results_dir)
+    dataloader_dict, model, optimizer, criterion, metric = load_train_objs(args)
+    trainer = Trainer(model, args.version, dataloader_dict, optimizer, criterion, args.results_dir)
     trainer.training_loop(metric, args.epochs, args.early_stopping, args.patience)
     cleanup()
     trainer.visualize_training('loss')
-    trainer.visualize_training('acc')
+    trainer.visualize_training('f1score')
     
 
 RESULTS_DIR = '/Users/noltinho/thesis/results'
