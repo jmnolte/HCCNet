@@ -188,20 +188,19 @@ class DataLoader:
             monai.transforms.EnsureChannelFirstd(keys=self.modality_list),
             monai.transforms.Orientationd(keys=self.modality_list, axcodes='PLI'),
             monai.transforms.Resized(keys=self.modality_list, spatial_size=(96, 96, 96)),
-            monai.transforms.ConcatItemsd(keys=self.modality_list, name='image', dim=0)
+            monai.transforms.ConcatItemsd(keys=self.modality_list, name='image', dim=0),
+            monai.transforms.ScaleIntensityd(keys='image', minv=0.0, maxv=1.0, channel_wise=True)
         ])
         
         augmentation = monai.transforms.Compose([
-            monai.transforms.RandRotated(keys='image', prob=0.1,
-                                         range_x=np.pi/8, range_y=np.pi/8, range_z=np.pi/8),
-            monai.transforms.RandGibbsNoised(keys='image', prob=0.1, alpha=(0.6, 0.8)),
-            monai.transforms.RandFlipd(keys='image', prob=0.1, spatial_axis=2),
-            monai.transforms.RandAdjustContrastd(keys='image', prob=0.1, gamma=(0.5, 2.0))
+            monai.transforms.RandRotated(keys='image', prob=0.2, range_x=np.pi/4),
+            monai.transforms.RandFlipd(keys='image', prob=0.2, spatial_axis=2),
+            monai.transforms.RandZoomd(keys='image', prob=0.2, min_zoom=1.1, max_zoom=1.5),
+            monai.transforms.RandGibbsNoised(keys='image', prob=0.2, alpha=(0.6, 0.8)),
+            monai.transforms.RandAdjustContrastd(keys='image', prob=0.2, gamma=(0.5, 2.0))
         ])
         
         postprocessing = monai.transforms.Compose([
-            monai.transforms.NormalizeIntensityd(keys='image', channel_wise=True),
-            monai.transforms.IntensityStatsd(keys='image', key_prefix='orig', ops=['mean', 'std'], channel_wise=True),
             monai.transforms.ToTensord(keys=['image', 'label'])
         ])
 
@@ -373,11 +372,12 @@ class DataLoader:
         if test_set:
             test_dataset = monai.data.PersistentDataset(data=data_split_dict['test'], transform=self.apply_transformations('test'), cache_dir=persistent_cache)
             test_sampler = monai.data.DistributedSampler(dataset=test_dataset, even_divisible=True, shuffle=True)
-            return {'test': monai.data.DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, sampler=test_sampler)}
+            return {'test': monai.data.DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, sampler=test_sampler, pin_memory=True)}
         else:
             datasets = {x: monai.data.PersistentDataset(data=data_split_dict[x], transform=self.apply_transformations(x), cache_dir=persistent_cache) for x in ['train', 'val']}
-            sampler = {x: monai.data.DistributedSampler(dataset=datasets[x], even_divisible=True, shuffle=True) for x in ['train', 'val']}
-            return {x: monai.data.DataLoader(datasets[x], batch_size=batch_size, shuffle=False, num_workers=num_workers, sampler=sampler[x]) for x in ['train', 'val']}
+            sampler = {'train': None, 'val': None}
+            sampler['train'] = monai.data.DistributedSampler(dataset=datasets['train'], even_divisible=True, shuffle=True)
+            return {x: monai.data.DataLoader(datasets[x], batch_size=batch_size, shuffle=(sampler[x] is None), num_workers=num_workers, sampler=sampler[x], pin_memory=True) for x in ['train', 'val']}
             
 
 if __name__ == '__main__':
