@@ -375,8 +375,7 @@ class DataLoader:
             return {'test': monai.data.DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, sampler=test_sampler, pin_memory=True)}
         else:
             datasets = {x: monai.data.PersistentDataset(data=data_split_dict[x], transform=self.apply_transformations(x), cache_dir=persistent_cache) for x in ['train', 'val']}
-            sampler = {'train': None, 'val': None}
-            sampler['train'] = monai.data.DistributedSampler(dataset=datasets['train'], even_divisible=True, shuffle=True)
+            sampler = {x: monai.data.DistributedSampler(dataset=datasets[x], even_divisible=True, shuffle=True) for x in ['train', 'val']}
             return {x: monai.data.DataLoader(datasets[x], batch_size=batch_size, shuffle=(sampler[x] is None), num_workers=num_workers, sampler=sampler[x], pin_memory=True) for x in ['train', 'val']}
             
 
