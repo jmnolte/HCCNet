@@ -3,6 +3,8 @@ import numpy as np
 import glob
 import os
 import tempfile
+import torch
+import math
 from tqdm import tqdm
 from natsort import natsorted
 from glob import glob
@@ -11,6 +13,8 @@ from utils import ReproducibilityUtils
 import pandas as pd
 from sklearn.model_selection import train_test_split, GroupShuffleSplit
 from torch.utils.data.distributed import DistributedSampler
+from catalyst.data.dataset import DatasetFromSampler
+from catalyst.data.sampler import DistributedSamplerWrapper
 
 class DicomToNifti:
 
@@ -187,17 +191,18 @@ class DataLoader:
             monai.transforms.LoadImaged(keys=self.modality_list),
             monai.transforms.EnsureChannelFirstd(keys=self.modality_list),
             monai.transforms.Orientationd(keys=self.modality_list, axcodes='PLI'),
-            monai.transforms.Resized(keys=self.modality_list, spatial_size=(96, 96, 96)),
+            monai.transforms.Resized(keys=self.modality_list, spatial_size=(176, 176, 176)),
             monai.transforms.ConcatItemsd(keys=self.modality_list, name='image', dim=0),
-            monai.transforms.ScaleIntensityd(keys='image', minv=0.0, maxv=1.0, channel_wise=True)
+            monai.transforms.ScaleIntensityRangePercentilesd(keys='image', lower=5, upper=95, b_min=0, b_max=1, clip=True, channel_wise=True),
+            monai.transforms.NormalizeIntensityd(keys='image', channel_wise=True)
         ])
         
         augmentation = monai.transforms.Compose([
-            monai.transforms.RandRotated(keys='image', prob=0.2, range_x=np.pi/4),
+            monai.transforms.RandRotated(keys='image', prob=0.2, range_x=np.pi/8),
             monai.transforms.RandFlipd(keys='image', prob=0.2, spatial_axis=2),
-            monai.transforms.RandZoomd(keys='image', prob=0.2, min_zoom=1.1, max_zoom=1.5),
-            monai.transforms.RandGibbsNoised(keys='image', prob=0.2, alpha=(0.6, 0.8)),
-            monai.transforms.RandAdjustContrastd(keys='image', prob=0.2, gamma=(0.5, 2.0))
+            monai.transforms.RandZoomd(keys='image', prob=0.2, min_zoom=1.1, max_zoom=1.3),
+            monai.transforms.RandGibbsNoised(keys='image', prob=0.1, alpha=(0.6, 0.8)),
+            monai.transforms.RandAdjustContrastd(keys='image', prob=0.1, gamma=(0.5, 2.0))
         ])
         
         postprocessing = monai.transforms.Compose([
@@ -271,7 +276,10 @@ class DataLoader:
                 labels_df.loc[idx, 'uid'] = row['id'] + '_0' + str(row['observation'])
         for observation in observation_list:
             observation_id = os.path.basename(observation)
-            label = labels_df.loc[labels_df['uid'] == observation_id, 'outcome'].item()
+            if observation_id not in labels_df['uid'].values:
+                continue
+            else:
+                label = labels_df.loc[labels_df['uid'] == observation_id, 'outcome'].values.item()
             label_dict['label'].append(label)
             label_dict['uid'].append(observation_id)
         return label_dict
@@ -286,9 +294,16 @@ class DataLoader:
         '''
         observation_list = self.assert_observation_completeness(self.modality_list, True)
         path_dict = {modality: self.split_observations_by_modality(observation_list, modality) for modality in self.modality_list}
-        path_dict['label'] = self.create_label_dict(observation_list, os.path.join(self.label_dir, 'labels.csv'))['label']
-        path_dict['uid'] = self.create_label_dict(observation_list, os.path.join(self.label_dir, 'labels.csv'))['uid']
-        return [dict(zip(path_dict.keys(), vals)) for vals in zip(*(path_dict[k] for k in path_dict.keys()))]
+        label_dict = self.create_label_dict(observation_list, os.path.join(self.label_dir, 'labels.csv'))
+        path_dict['uid'] = [os.path.basename(observation) for observation in observation_list]
+        path_dict = [dict(zip(path_dict.keys(), vals)) for vals in zip(*(path_dict[k] for k in path_dict.keys()))]
+        label_dict = [dict(zip(label_dict.keys(), vals)) for vals in zip(*(label_dict[k] for k in label_dict.keys()))]
+        for idx, patient in enumerate(path_dict):
+            if patient['uid'] in [label['uid'] for label in label_dict]:
+                path_dict[idx]['label'] = label_dict[[label['uid'] for label in label_dict].index(patient['uid'])]['label']
+            else:
+                path_dict[idx]['label'] = None
+        return [patient for patient in path_dict if not (patient['label'] == None)]
     
     @staticmethod
     def stratified_data_split(df: pd.DataFrame, test_ratio: float, n_splits: int = 100) -> pd.DataFrame:
@@ -304,14 +319,15 @@ class DataLoader:
         Returns:
             dataframes (pd.DataFrame): Dataframes split according to the test ratio.
         '''
-        label_ratio = 1
-        splits = GroupShuffleSplit(test_size=test_ratio, n_splits=n_splits).split(df, groups=df['patient_id'])
-        for split in splits:
-            set1, set2 = df.iloc[split[0]], df.iloc[split[1]]
-            if abs(set1['label'].mean() - set2['label'].mean()) < label_ratio:
-                label_ratio = abs(set1['label'].mean() - set2['label'].mean())
-                best_split = split
-        return df.iloc[best_split[0]], df.iloc[best_split[1]]
+        # label_ratio = 1
+        # splits = GroupShuffleSplit(test_size=test_ratio, n_splits=n_splits).split(df, groups=df['patient_id'])
+        # for split in splits:
+        #     set1, set2 = df.iloc[split[0]], df.iloc[split[1]]
+        #     if abs(set1['label'].mean() - set2['label'].mean()) < label_ratio:
+        #         if len(set1) / (1 - test_ratio) > len(set2) / test_ratio * 0.95 and len(set1) / (1 - test_ratio) < len(set1) / test_ratio * 1.05:
+        #             label_ratio = abs(set1['label'].mean() - set2['label'].mean())
+        #             best_split = split
+        return train_test_split(df, test_size=test_ratio, stratify=df['label'])
 
     def split_dataset(self, train_ratio: float, quant: bool) -> dict:
 
@@ -348,7 +364,7 @@ class DataLoader:
                 print('{} total observations in {} set with {} positive cases ({} %).'.format(len(df), name, df['label'].sum(), round(df['label'].mean(), ndigits=3)))
             return {'train': train[['uid']].values, 'val': val[['uid']].values, 'test': test[['uid']].values}
         
-    def load_data(self, data_dict: dict, train_ratio: float, batch_size: int, num_workers: int, test_set: bool, quant_images: bool) -> dict:
+    def load_data(self, data_dict: dict, train_ratio: float, batch_size: int, num_workers: int, weighted_sampler: bool, quant_images: bool) -> dict:
 
         '''
         Load the data.
@@ -365,18 +381,27 @@ class DataLoader:
         '''
         split_dict = self.split_dataset(train_ratio, quant_images)
         data_split_dict = {x: [patient for patient in data_dict if patient['uid'] in split_dict[x]] for x in ['train', 'val', 'test']}
+        labels = {x: [patient['label'] for patient in data_split_dict[x]] for x in ['train', 'val', 'test']}
+        class_sample_count = {x: np.array([len(np.where(labels[x] == t)[0]) for t in np.unique(labels[x])]) for x in ['train', 'val', 'test']}
+        weight = {x: 1. / class_sample_count[x] for x in ['train', 'val', 'test']}
+        samples_weight = {x: np.array([weight[x][t] for t in labels[x]]) for x in ['train', 'val', 'test']}
+
+        samples_weight = {x: torch.from_numpy(samples_weight[x]) for x in ['train','val','test']}
+        samples_weight = {x: samples_weight[x].double() for x in ['train','val','test']}        
         for phase in data_split_dict:
             for patient in data_split_dict[phase]:
                 del patient['uid']
         persistent_cache = os.path.join(tempfile.mkdtemp(), 'persistent_cache')
-        if test_set:
-            test_dataset = monai.data.PersistentDataset(data=data_split_dict['test'], transform=self.apply_transformations('test'), cache_dir=persistent_cache)
-            test_sampler = monai.data.DistributedSampler(dataset=test_dataset, even_divisible=True, shuffle=True)
-            return {'test': monai.data.DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, sampler=test_sampler, pin_memory=True)}
+        datasets = {x: monai.data.PersistentDataset(data=data_split_dict[x], transform=self.apply_transformations(x), cache_dir=persistent_cache) for x in ['train','val','test']}
+        sampler = {x: [] for x in ['train','val','test']}
+        if weighted_sampler:
+            sampler['train'] = monai.data.DistributedWeightedRandomSampler(dataset=datasets['train'], weights=samples_weight['train'], even_divisible=True, shuffle=True)
+            sampler['val'] = monai.data.DistributedSampler(dataset=datasets['val'], even_divisible=True, shuffle=True)
+            sampler['test'] = monai.data.DistributedSampler(dataset=datasets['test'], even_divisible=True, shuffle=True)
+
         else:
-            datasets = {x: monai.data.PersistentDataset(data=data_split_dict[x], transform=self.apply_transformations(x), cache_dir=persistent_cache) for x in ['train', 'val']}
-            sampler = {x: monai.data.DistributedSampler(dataset=datasets[x], even_divisible=True, shuffle=True) for x in ['train', 'val']}
-            return {x: monai.data.DataLoader(datasets[x], batch_size=batch_size, shuffle=(sampler[x] is None), num_workers=num_workers, sampler=sampler[x], pin_memory=True) for x in ['train', 'val']}
+            sampler = {x: monai.data.DistributedSampler(dataset=datasets[x], even_divisible=True, shuffle=True) for x in ['train','val','test']}
+        return {x: monai.data.DataLoader(datasets[x], batch_size=batch_size, shuffle=(sampler[x] is None), num_workers=num_workers, sampler=sampler[x], pin_memory=True) for x in ['train','val','test']}
             
 
 if __name__ == '__main__':

@@ -3,6 +3,7 @@ import monai
 import os
 
 class ResNet(torch.nn.Module):
+
     def __init__(self, version: str, num_out_classes: int, num_in_channels: int, pretrained: bool, feature_extraction: bool, weights_path: str) -> None:
         super().__init__()
 
@@ -133,8 +134,52 @@ class ResNet(torch.nn.Module):
 
         print("Parameters to be updated:")
         for name, param in self.model.named_parameters():
-            if param.requires_grad == True:
+            if param.requires_grad:
                 print(name)
+
+class EnsembleModel(torch.nn.Module):
+
+    def __init__(self, model1, model2, model3, model4, versions: list, num_out_classes: int, output_dir: str) -> None:
+        super().__init__()
+
+        self.model1 = model1
+        self.model2 = model2
+        self.model3 = model3
+        self.model4 = model4
+        self.versions = versions
+        self.classifier = torch.nn.Linear(num_out_classes * 4, num_out_classes)
+
+        self.freeze_model_parameters()
+
+    def forward(self, x):
+
+        x1 = self.model1(x)
+        x2 = self.model2(x)
+        x3 = self.model3(x)
+        x4 = self.model4(x)
+        x = torch.cat((x1, x2, x3, x4), dim=1)
+        out = self.classifier(x)
+        return out
+
+    def freeze_model_parameters(self) -> None:
+
+        for param in self.model1.parameters():
+            param.requires_grad = False
+        
+        for param in self.model2.parameters():
+            param.requires_grad = False
+        
+        for param in self.model3.parameters():
+            param.requires_grad = False
+        
+        for param in self.model4.parameters():
+            param.requires_grad = False
+
+        for param in self.classifier.parameters():
+            param.requires_grad = True    
+            
+
+
 
 if __name__ == '__main__':
     WEIGHTS_PATH = '/Users/noltinho/MedicalNet/pytorch_files/pretrain'
