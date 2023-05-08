@@ -12,9 +12,6 @@ import dicom2nifti
 from utils import ReproducibilityUtils
 import pandas as pd
 from sklearn.model_selection import train_test_split, GroupShuffleSplit
-from torch.utils.data.distributed import DistributedSampler
-from catalyst.data.dataset import DatasetFromSampler
-from catalyst.data.sampler import DistributedSamplerWrapper
 
 class DicomToNifti:
 
@@ -139,6 +136,9 @@ class PreprocessingUtils:
 
     #     Args:
     #         label_path (str): Path to the label file.
+
+    #     Returns:
+    #         label_list (list): List of labels.
     #     '''
     #     path_root, _ = os.path.split(df_path)
     #     labels_df = pd.read_csv(df_path, sep=';')
@@ -191,7 +191,7 @@ class DataLoader:
             monai.transforms.LoadImaged(keys=self.modality_list),
             monai.transforms.EnsureChannelFirstd(keys=self.modality_list),
             monai.transforms.Orientationd(keys=self.modality_list, axcodes='PLI'),
-            monai.transforms.Resized(keys=self.modality_list, spatial_size=(176, 176, 176)),
+            monai.transforms.Resized(keys=self.modality_list, spatial_size=(96, 96, 96)),
             monai.transforms.ConcatItemsd(keys=self.modality_list, name='image', dim=0),
             monai.transforms.ScaleIntensityRangePercentilesd(keys='image', lower=5, upper=95, b_min=0, b_max=1, clip=True, channel_wise=True),
             monai.transforms.NormalizeIntensityd(keys='image', channel_wise=True)
@@ -364,6 +364,25 @@ class DataLoader:
                 print('{} total observations in {} set with {} positive cases ({} %).'.format(len(df), name, df['label'].sum(), round(df['label'].mean(), ndigits=3)))
             return {'train': train[['uid']].values, 'val': val[['uid']].values, 'test': test[['uid']].values}
         
+    @staticmethod
+    def get_class_weights(data_split_dict: dict) -> dict:
+
+        '''
+        Calculate the sample class weights per dataset.
+
+        Args:
+            data_split_dict (dict): Dictionary containing the dataframes split according to the train ratio.
+        
+        Returns:
+            class_weights (dict): Dictionary containing the class weights for each set.
+        '''
+        labels = {x: [patient['label'] for patient in data_split_dict[x]] for x in ['train', 'val', 'test']}
+        class_sample_count = {x: np.array([len(np.where(labels[x] == t)[0]) for t in np.unique(labels[x])]) for x in ['train', 'val', 'test']}
+        weights = {x: 1. / class_sample_count[x] for x in ['train', 'val', 'test']}
+        sample_weights = {x: np.array([weights[x][t] for t in labels[x]]) for x in ['train', 'val', 'test']}
+        sample_weights = {x: torch.from_numpy(sample_weights[x]) for x in ['train','val','test']}
+        return {x: sample_weights[x].double() for x in ['train','val','test']}  
+        
     def load_data(self, data_dict: dict, train_ratio: float, batch_size: int, num_workers: int, weighted_sampler: bool, quant_images: bool) -> dict:
 
         '''
@@ -374,20 +393,15 @@ class DataLoader:
             train_ratio (float): Ratio of the data to be used for training.
             batch_size (int): Batch size to use.
             num_workers (int): Number of workers to use.
-            test_set (bool): Whether to load the test set.
+            weighted_sampler (bool): Whether to use a weighted sampler.
+            quant_images (bool): Whether to only use observations including quant images.
 
         Returns:
             data_loaders (dict): Dictionary containing the data loaders.
         '''
         split_dict = self.split_dataset(train_ratio, quant_images)
-        data_split_dict = {x: [patient for patient in data_dict if patient['uid'] in split_dict[x]] for x in ['train', 'val', 'test']}
-        labels = {x: [patient['label'] for patient in data_split_dict[x]] for x in ['train', 'val', 'test']}
-        class_sample_count = {x: np.array([len(np.where(labels[x] == t)[0]) for t in np.unique(labels[x])]) for x in ['train', 'val', 'test']}
-        weight = {x: 1. / class_sample_count[x] for x in ['train', 'val', 'test']}
-        samples_weight = {x: np.array([weight[x][t] for t in labels[x]]) for x in ['train', 'val', 'test']}
-
-        samples_weight = {x: torch.from_numpy(samples_weight[x]) for x in ['train','val','test']}
-        samples_weight = {x: samples_weight[x].double() for x in ['train','val','test']}        
+        data_split_dict = {x: [patient for patient in data_dict if patient['uid'] in split_dict[x]] for x in ['train', 'val', 'test']} 
+        sample_weights = self.get_class_weights(data_split_dict)     
         for phase in data_split_dict:
             for patient in data_split_dict[phase]:
                 del patient['uid']
@@ -395,7 +409,7 @@ class DataLoader:
         datasets = {x: monai.data.PersistentDataset(data=data_split_dict[x], transform=self.apply_transformations(x), cache_dir=persistent_cache) for x in ['train','val','test']}
         sampler = {x: [] for x in ['train','val','test']}
         if weighted_sampler:
-            sampler['train'] = monai.data.DistributedWeightedRandomSampler(dataset=datasets['train'], weights=samples_weight['train'], even_divisible=True, shuffle=True)
+            sampler['train'] = monai.data.DistributedWeightedRandomSampler(dataset=datasets['train'], weights=sample_weights['train'], even_divisible=True, shuffle=True)
             sampler['val'] = monai.data.DistributedSampler(dataset=datasets['val'], even_divisible=True, shuffle=True)
             sampler['test'] = monai.data.DistributedSampler(dataset=datasets['test'], even_divisible=True, shuffle=True)
 
@@ -409,10 +423,7 @@ if __name__ == '__main__':
     QUANT_LIST = ['T1W_QNT']
     MODALITY_LIST = ['T1W_OOP','T1W_IP','T1W_DYN','T2W_TES','T2W_TEL','DWI_b150','DWI_b400','DWI_b800']
     IMAGES_TO_KEEP = ['T1W_OOP','T1W_IP','T1W_DYN','T1W_QNT','T2W_TES','T2W_TEL','DWI_b0','DWI_b150','DWI_b400','DWI_b800']
-    # dicom2nifti.settings.disable_validate_slice_increment()
-    # DicomToNifti(DATA_DIR).convert_dicom_to_nifti(os.path.join(DATA_DIR, 'labels/labels.csv'))
-    # prep = PreprocessingUtils(DATA_DIR)
-    # prep.clean_directory(IMAGES_TO_KEEP)
-    ReproducibilityUtils.seed_everything(123)
-    data_dict = dataloader.create_data_dict()
-    dataloader_dict = dataloader.load_data(data_dict, 0.8, 16, 4, False, True)
+    dicom2nifti.settings.disable_validate_slice_increment()
+    DicomToNifti(DATA_DIR).convert_dicom_to_nifti(os.path.join(DATA_DIR, 'labels/labels.csv'))
+    prep = PreprocessingUtils(DATA_DIR)
+    prep.clean_directory(IMAGES_TO_KEEP)

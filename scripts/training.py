@@ -5,12 +5,10 @@ import time
 import copy
 import numpy as np
 import matplotlib.pyplot as plt
-from sklearn import metrics
 from preprocessing import DataLoader
 from models import ResNet
 from models import EnsembleModel
 from utils import ReproducibilityUtils
-from tqdm import tqdm
 import argparse
 import torchmetrics
 
@@ -32,16 +30,16 @@ class Trainer:
         Args:
             model (torch.nn): Model to train.
             version (str): Model version. Can be 'resnet10', 'resnet18', 'resnet34', 'resnet50',
-                'resnet101', 'resnet152', or 'resnet200'.
+                'resnet101', 'resnet152', 'resnet200', or 'ensemble'.
             dataloaders (dict): Dataloader objects.
-            optimizer (torch.optim): Optimizer.
-            criterion (torch.nn): Loss function.
+            learning_rate (float): Learning rate.
+            weight_decay (float): Weight decay.
             output_dir (str): Output directory.
         '''
         try: 
             assert any(version == version_item for version_item in ['resnet10','resnet18','resnet34','resnet50','resnet101','resnet152','resnet200','ensemble'])
         except AssertionError:
-            print('Invalid version. Please choose from: resnet10, resnet18, resnet34, resnet50, resnet101, resnet152, resnet200')
+            print('Invalid version. Please choose from: resnet10, resnet18, resnet34, resnet50, resnet101, resnet152, resnet200, ensemble')
             exit(1)
 
         self.gpu_id = int(os.environ['LOCAL_RANK'])
@@ -56,9 +54,8 @@ class Trainer:
             self.load_snapshot(self.snapshot_path)
         self.model = torch.nn.parallel.DistributedDataParallel(self.model, device_ids=[self.gpu_id])
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-        weights = 759 / (2 * torch.Tensor([679, 80])).to(self.gpu_id)
-        pos_weight = 1 / (80 / torch.Tensor([759]))
-        # self.criterion = FocalLoss(gamma=5, alpha=0.25).to(self.gpu_id)
+        # weights = 759 / (2 * torch.Tensor([679, 80])).to(self.gpu_id)
+        # self.criterion = FocalLoss(gamma=2, weight=weights).to(self.gpu_id)
         self.criterion = torch.nn.CrossEntropyLoss().to(self.gpu_id)
     
     def load_snapshot(self, snapshot_path: str) -> dict:
@@ -131,10 +128,11 @@ class Trainer:
 
         Args:
             epoch (int): Current epoch.
+
+        Returns:
+            tuple: Tuple containing the loss and f1 score.
         '''
         running_loss = 0.0
-        targets = []
-        predictions = []
         epoch_loss_values = []
         self.model.train()
         self.dataloaders['train'].sampler.set_epoch(epoch)
@@ -147,7 +145,6 @@ class Trainer:
 
         for step, batch_data in enumerate(self.dataloaders['train']):
             inputs, labels = batch_data['image'].to(self.gpu_id), batch_data['label'].to(self.gpu_id)
-            labels_one_hot = torch.nn.functional.one_hot(labels, num_classes=2).float()
             outputs = self.model(inputs.as_tensor())
             preds = torch.argmax(outputs, 1)
             loss = self.criterion(outputs, labels)
@@ -179,6 +176,9 @@ class Trainer:
             criterion (torch.nn): Loss function.
             epoch (int): Current epoch.
             args (argparse.Namespace): Arguments.
+        
+        Returns:
+            tuple: Tuple containing the loss and f1 score.
         '''
         running_loss = 0.0
         epoch_loss_values = []
@@ -186,7 +186,6 @@ class Trainer:
         with torch.no_grad():
             for step, batch_data in enumerate(self.dataloaders['val']):
                 inputs, labels = batch_data['image'].to(self.gpu_id), batch_data['label'].to(self.gpu_id)
-                labels_one_hot = torch.nn.functional.one_hot(labels, num_classes=2).float()
                 outputs = self.model(inputs.as_tensor())
                 preds = torch.argmax(outputs, 1)
                 loss = self.criterion(outputs, labels)
@@ -291,54 +290,41 @@ class Trainer:
         plt.savefig(file_path, dpi=300, bbox_inches="tight")
         plt.close()
 
-# class FocalLoss(torch.nn.Module):
-#     "Focal loss implemented using F.cross_entropy"
-#     def __init__(self, gamma: float = 2.0, weight=None, reduction: str = 'mean') -> None:
-#         super(FocalLoss, self).__init__()
-#         self.gamma = gamma
-#         self.weight = weight
-#         self.reduction = reduction
-
-#     def forward(self, inp: torch.Tensor, targ: torch.Tensor):
-#         ce_loss = torch.nn.functional.cross_entropy(inp, targ, weight=self.weight, reduction="none")
-#         p_t = torch.exp(-ce_loss)
-#         loss = (1 - p_t)**self.gamma * ce_loss
-#         if self.reduction == "mean":
-#             loss = loss.mean()
-#         elif self.reduction == "sum":
-#             loss = loss.sum()
-#         return loss
-
-
 class FocalLoss(torch.nn.Module):
-    #WC: alpha is weighting factor. gamma is focusing parameter
-    def __init__(self, gamma=0, alpha=None, reduction='mean'):
+
+    '''
+    Focal loss implementation using cross entropy loss.
+    '''
+
+    def __init__(self, gamma: float = 2.0, weight=None, reduction: str = 'mean') -> None:
         super(FocalLoss, self).__init__()
+
+        '''
+        Args:
+            gamma (float): Focal loss gamma parameter.
+            weight (torch.Tensor): Class weights.
+            reduction (str): Loss reduction method.
+        '''
         self.gamma = gamma
-        self.alpha = alpha
+        self.weight = weight
         self.reduction = reduction
 
-    def forward(self, inputs, targets):
-        p = torch.sigmoid(inputs)
-        ce_loss = torch.nn.functional.binary_cross_entropy_with_logits(inputs, targets, reduction=self.reduction)
-        p_t = p * targets + (1 - p) * (1 - targets)
-        loss = ce_loss * ((1 - p_t) ** self.gamma)
+    def forward(self, input: torch.Tensor, target: torch.Tensor):
 
-        if self.alpha >= 0:
-            alpha_t = self.alpha * targets + (1 - self.alpha) * (1 - targets)
-            loss = alpha_t * loss
+        '''
+        Forward pass.
 
-        # Check reduction option and return loss accordingly
-        if self.reduction == "none":
-            pass
-        elif self.reduction == "mean":
+        Args:
+            input (torch.Tensor): Input tensor.
+            target (torch.Tensor): Target tensor.
+        '''
+        ce_loss = torch.nn.functional.cross_entropy(input, target, weight=self.weight, reduction="none")
+        p_t = torch.exp(-ce_loss)
+        loss = (1 - p_t)**self.gamma * ce_loss
+        if self.reduction == "mean":
             loss = loss.mean()
         elif self.reduction == "sum":
             loss = loss.sum()
-        else:
-            raise ValueError(
-                f"Invalid Value for arg 'reduction': '{self.reduction} \n Supported reduction modes: 'none', 'mean', 'sum'"
-            )
         return loss
 
 def parse_args() -> argparse.Namespace:
@@ -394,7 +380,7 @@ def load_train_objs(args: argparse.Namespace) -> tuple:
     Load training objects.
 
     Returns:
-        tuple: Training objects.
+        tuple: Training objects consisting of the data loader, the model, and the performance metric.
     '''
     dataloader = DataLoader(args.data_dir, args.modality_list)
     data_dict = dataloader.create_data_dict()
@@ -425,16 +411,12 @@ def load_train_objs(args: argparse.Namespace) -> tuple:
         model = EnsembleModel(resnet10, resnet18, resnet34, resnet50, versions, 2, args.results_dir)
     else:
         model = ResNet(args.version, 2, len(args.modality_list), args.pretrained, args.feature_extraction, args.weights_dir)
-    
     model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
 
     if args.weighted_sampler:
         print('Model is trained using weighted random sampling')
-        # criterion = torch.nn.CrossEntropyLoss()
     else:
         print('Model is trained using focal loss')
-        # criterion = FocalLoss(gamma=2, weight=weights)
-        # criterion = torch.nn.CrossEntropyLoss(weight=weights)
 
     metric = torchmetrics.F1Score(task='binary')
     model.metric = metric
@@ -468,7 +450,6 @@ def main(args: argparse.Namespace) -> None:
     trainer = Trainer(model, args.version, dataloader_dict, args.learning_rate, args.weight_decay, args.results_dir)
     trainer.training_loop(metric, args.epochs, args.accum_steps, args.early_stopping, args.patience)
     cleanup()
-    time.sleep(60)
     trainer.visualize_training('loss')
     trainer.visualize_training('f1score')
     print('Script finished')

@@ -7,8 +7,6 @@ from sklearn import metrics
 from preprocessing import DataLoader
 from models import ResNet, EnsembleModel
 from utils import ReproducibilityUtils
-from training import Trainer
-from tqdm import tqdm
 import argparse
 import seaborn as sns
 
@@ -30,7 +28,7 @@ class Diagnostics():
         try: 
             assert any(version == version_item for version_item in ['resnet10','resnet18','resnet34','resnet50','resnet101','resnet152','resnet200','ensemble'])
         except AssertionError:
-            print('Invalid version. Please choose from: resnet10, resnet18, resnet34, resnet50, resnet101, resnet152, resnet200')
+            print('Invalid version. Please choose from: resnet10, resnet18, resnet34, resnet50, resnet101, resnet152, resnet200, ensemble')
             exit(1)
         
         self.gpu_id = int(os.environ['LOCAL_RANK'])
@@ -94,13 +92,14 @@ class Diagnostics():
         plt.savefig(file_path, dpi=300, bbox_inches="tight")
         plt.close()
 
-    def get_random_image(self, phase: str) -> torch.tensor:
+    def get_random_image(self, phase: str, positive: bool) -> torch.tensor:
 
         '''
         Get a random image from the test set.
 
         Args:
             phase (str): 'train' or 'val'.
+            positive (bool): Whether to get a positive or negative image.
 
         Returns:
             image (torch.tensor): The image.
@@ -108,18 +107,33 @@ class Diagnostics():
         '''
         for batch_data in self.dataloaders[phase]:
             inputs, labels = batch_data['image'], batch_data['label']
-            if labels.unsqueeze(0) == 0:
-                break
+            if positive:
+                if labels.unsqueeze(0) == 1:
+                    break
+                else:
+                    continue
             else:
-                continue
+                if labels.unsqueeze(0) == 0:
+                    break
+                else:
+                    continue
         return inputs.to(self.gpu_id), labels.unsqueeze(0).to(self.gpu_id)
     
-    def visualize_activations(self) -> None:
+    def visualize_activations(self, positive: bool) -> None:
 
         '''
         Get the occlusion sensitivity map for a given image.
+
+        Args:
+            positive (bool): Whether to get a positive or negative image.
         '''
-        image, label = self.get_random_image('test')
+        if positive:
+            print('Getting positive image...')
+            file_suffix = '_hcc'
+        else:
+            print('Getting negative image...')
+            file_suffix = '_nohcc'
+        image, label = self.get_random_image('test', positive)
         print('Image loaded')
         self.model.eval()
 
@@ -133,7 +147,7 @@ class Diagnostics():
             plt.imshow(np.squeeze(im[0][0].detach().cpu()), cmap='jet')
             plt.axis('off')
         
-        file_path = os.path.join(self.output_dir, 'model_history/diagnostics', self.version + '_occ_sens_nohcc')
+        file_path = os.path.join(self.output_dir, 'model_history/diagnostics', self.version + '_occ_sens' + file_suffix)
         file_path_root, _ = os.path.split(file_path)
         if os.path.exists(file_path):
             os.remove(file_path)
@@ -145,7 +159,7 @@ class Diagnostics():
         image = np.squeeze(image[0][0].detach().cpu())
         plt.imshow(image[:, :, depth_slice], cmap='gray')
         plt.axis('off')
-        file_path = os.path.join(self.output_dir, 'model_history/diagnostics', self.version + '_orig_img_nohcc')
+        file_path = os.path.join(self.output_dir, 'model_history/diagnostics', self.version + '_orig_img' + file_suffix)
         file_path_root, _ = os.path.split(file_path)
         if os.path.exists(file_path):
             os.remove(file_path)
@@ -171,6 +185,8 @@ def parse_args() -> argparse.Namespace:
                         help="Flag to use feature extraction")
     parser.add_argument("--occ-sens", action='store_true',
                         help="Flag to use occlusion sensitivity")
+    parser.add_argument("--positive", action='store_true',
+                        help="Flag to use positive images")
     parser.add_argument("--epochs", type=int, 
                         help="Number of epochs to train for")
     parser.add_argument("--batch-size", default=4, type=int, 
@@ -241,7 +257,7 @@ def main(args: argparse.Namespace) -> None:
         model = ResNet(args.version, 2, len(args.modality_list), args.pretrained, args.feature_extraction, args.weights_dir)
     inference = Diagnostics(model, args.version, dataloader_dict, args.results_dir)
     if args.occ_sens:
-        inference.visualize_activations()
+        inference.visualize_activations(args.positive)
     else:
         inference.plot_test_metrics('auc')
         inference.plot_test_metrics('ap')
