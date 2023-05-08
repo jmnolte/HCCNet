@@ -10,7 +10,7 @@ import argparse
 
 class Inference():
     
-    def __init__(self, model: torch.nn.Module, version: str, dataloaders: dict, learning_rate, weight_decay, output_dir: str) -> None:
+    def __init__(self, model: torch.nn.Module, version: str, dataloaders: dict, output_dir: str) -> None:
 
         '''
         Initialize the training class.
@@ -34,14 +34,26 @@ class Inference():
         self.version = version
         self.dataloaders = dataloaders
         self.output_dir = output_dir
-        model_dict = self.model.state_dict()
-        weights_dict = torch.load(os.path.join(self.output_dir, 'model_weights', self.version + '_weights.pth'))
-        weights_dict = {k.replace('module.', ''): v for k, v in weights_dict.items()}
-        model_dict.update(weights_dict)
+        model_dict = self.update_model_dict()
         self.model.load_state_dict(model_dict)
         print('Model weights are updated.')
         self.model = self.model.to(self.gpu_id)
         self.model = torch.nn.parallel.DistributedDataParallel(self.model, device_ids=[self.gpu_id])
+
+    def update_model_dict(self) -> dict:
+
+        '''
+        Update the model dictionary with the weights from the best epoch.
+
+        Returns:
+            dict: Updated model dictionary.
+        '''
+
+        model_dict = self.model.state_dict()
+        weights_dict = torch.load(os.path.join(self.output_dir, 'model_weights', self.version + '_weights.pth'))
+        weights_dict = {k.replace('module.', ''): v for k, v in weights_dict.items()}
+        model_dict.update(weights_dict)
+        return model_dict
 
     def run_inference(self) -> None:
 

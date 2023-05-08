@@ -16,8 +16,10 @@ class ReproducibilityUtils:
 
         '''
         Seed everything for reproducibility.
-        '''
 
+        Args:
+            seed (int): Seed value.
+        '''
         random.seed(seed)
         os.environ['PYTHONHASHSEED'] = str(seed)
         np.random.seed(seed)
@@ -37,7 +39,6 @@ class EnvironmentUtils:
         Args:
             path (str): Path to the data.
         '''
-
         self.path = path
         self.folders = glob(os.path.join(self.path, '*/DICOM/*'), recursive = True)
 
@@ -49,7 +50,6 @@ class EnvironmentUtils:
         Args:
             subfolders (list): List of subfolders to create.
         '''
-
         for folder_path in tqdm(self.folders):
             for subfolder_path in subfolders:
                 new_subfolder = os.path.join(folder_path, subfolder_path)
@@ -101,7 +101,6 @@ class EnvironmentUtils:
         '''
         Move subfolders in the data directory.
         '''
-
         for folder_path in tqdm(self.folders):
             t1_path = os.path.join(folder_path, 'T1')
             t2_path = os.path.join(folder_path, 'T2')
@@ -133,7 +132,6 @@ class EnvironmentUtils:
         '''
         Rename subfolders in the data directory.
         '''
-
         for folder_path in tqdm(self.folders):
             path_root, _ = os.path.split(folder_path)
             old_path = folder_path
@@ -154,8 +152,10 @@ class MetadataUtils:
 
         '''
         Initialize the sequence utils class.
-        '''
 
+        Args:
+            path (str): Path to the data directory.
+        '''
         self.path = path
         self.folders = glob(os.path.join(self.path, '*/DICOM/*'), recursive = True)
 
@@ -168,8 +168,10 @@ class MetadataUtils:
             contrast_type (str): Contrast type of the image.
             metadata_list (list): List of metadata to extract.
             all_sequences (bool): Whether to extract metadata from all or just the first sequence.
+        
+        Returns:
+            metadata_list (list): List of metadata.
         '''    
-
         metadata_dict = {key: [] for key in metadata_list}
         for folder_path in tqdm(self.folders):
             series = glob(os.path.join(folder_path, contrast_type, '*'), recursive = True)
@@ -219,7 +221,6 @@ class MetadataUtils:
         Args:
             sequence_list (list): List of sequences to count.
         '''
-
         sequence_set = Counter(sequence_list).keys()
         sequence_counts = Counter(sequence_list).values()
         sequence_dict = dict(zip(sequence_set, sequence_counts))
@@ -237,8 +238,10 @@ class MetadataUtils:
         Args:
             series_feature (str): Feature of the series to extract.
             feature_label (str): Label of the feature to extract.
+        
+        Returns:
+            series_list (list): List of series.
         '''
-
         series_list = []
         for folder_path in tqdm(self.folders):
             series = glob(os.path.join(folder_path, '*/*'), recursive = True)
@@ -256,7 +259,6 @@ class MetadataUtils:
                             series_list.append(dicom_series)
                 except:
                     print('Error reading metadata from: ', series_path)
-
         return series_list
     
     def rename_series(self, old_name: list, new_name: str, dynamic_scan: str) -> None:
@@ -267,8 +269,8 @@ class MetadataUtils:
         Args:
             old_name (str): Old name of the series.
             new_name (str): New name of the series.
+            dynamic_scan (str): Dynamic scan of the series.
         '''
-    
         for folder_path in tqdm(self.folders):
             series = glob(os.path.join(folder_path, '*/*'), recursive = True)
             for series_path in series:
@@ -299,7 +301,6 @@ class MetadataUtils:
         Args:
             series_type (str): Type of series to be separated.
         '''
-            
         for folder_path in tqdm(self.folders):
             if series_type == 'T1W':
                 sequences = natsorted(glob(os.path.join(folder_path, 'T1/T1W_IOP/*'), recursive = True))
