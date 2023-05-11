@@ -10,7 +10,13 @@ import argparse
 
 class Inference():
     
-    def __init__(self, model: torch.nn.Module, version: str, dataloaders: dict, output_dir: str) -> None:
+    def __init__(
+            self, 
+            model: torch.nn.Module, 
+            version: str, 
+            dataloaders: dict, 
+            output_dir: str
+            ) -> None:
 
         '''
         Initialize the training class.
@@ -40,7 +46,9 @@ class Inference():
         self.model = self.model.to(self.gpu_id)
         self.model = torch.nn.parallel.DistributedDataParallel(self.model, device_ids=[self.gpu_id])
 
-    def update_model_dict(self) -> dict:
+    def update_model_dict(
+            self
+            ) -> dict:
 
         '''
         Update the model dictionary with the weights from the best epoch.
@@ -55,7 +63,9 @@ class Inference():
         model_dict.update(weights_dict)
         return model_dict
 
-    def run_inference(self) -> None:
+    def run_inference(
+            self
+            ) -> None:
 
         '''
         Run inference on the test set.
@@ -77,7 +87,11 @@ class Inference():
         results['labels'] = np.concatenate(results['labels'])
         self.save_output(results, 'preds')
 
-    def save_output(self, output_dict: dict, output_type: str) -> None:
+    def save_output(
+            self, 
+            output_dict: dict, 
+            output_type: str
+            ) -> None:
 
         '''
         Save the model's output.
@@ -111,7 +125,9 @@ class Inference():
         else:
             np.save(folder_path, output_dict)
 
-    def calculate_test_metrics(self) -> None:
+    def calculate_test_metrics(
+            self
+            ) -> None:
 
         '''
         Calculate performance metrics on the test set.
@@ -195,7 +211,9 @@ def cleanup() -> None:
     '''
     torch.distributed.destroy_process_group()
 
-def main(args: argparse.Namespace) -> None:
+def main(
+        args: argparse.Namespace
+        ) -> None:
 
     '''
     Main function.

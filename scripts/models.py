@@ -4,7 +4,15 @@ import os
 
 class ResNet(torch.nn.Module):
 
-    def __init__(self, version: str, num_out_classes: int, num_in_channels: int, pretrained: bool, feature_extraction: bool, weights_path: str) -> None:
+    def __init__(
+            self, 
+            version: str, 
+            num_out_classes: int, 
+            num_in_channels: int, 
+            pretrained: bool, 
+            feature_extraction: bool, 
+            weights_path: str
+            ) -> None:
         super().__init__()
 
         '''
@@ -51,7 +59,10 @@ class ResNet(torch.nn.Module):
             print('Pretrained weights are loaded.')
         self.extract_features(feature_extraction)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+            self, 
+            input: torch.Tensor
+            ) -> torch.Tensor:
 
         '''
         Forward pass through the model.
@@ -60,12 +71,15 @@ class ResNet(torch.nn.Module):
             input (torch.Tensor): Input tensor.
 
         Returns:
-            torch.Tensor: Output tensor.
+            output (torch.Tensor): Output tensor.
         '''
-        x = self.model(x)
-        return x
+        output = self.model(input)
+        return output
     
-    def define_output_layer(self, num_classes: int) -> torch.nn.Linear:
+    def define_output_layer(
+            self, 
+            num_classes: int
+            ) -> torch.nn.Linear:
 
         '''
         Define the model's number of output classes.
@@ -79,7 +93,10 @@ class ResNet(torch.nn.Module):
         num_ftrs = self.model.fc.in_features
         return torch.nn.Linear(num_ftrs, num_classes)
 
-    def intialize_model(self, weights_path: str) -> dict:
+    def intialize_model(
+            self, 
+            weights_path: str
+            ) -> dict:
 
         '''
         Initialize the networks weights. If pretrained weights are used, 
@@ -104,7 +121,10 @@ class ResNet(torch.nn.Module):
             channel += 1
         return model_dict
 
-    def extract_features(self, feature_extraction: bool) -> None:
+    def extract_features(
+            self, 
+            feature_extraction: bool
+            ) -> None:
 
         '''
         Freeze the model's weights. If feature_extraction is set to True, only the last layer
@@ -123,7 +143,9 @@ class ResNet(torch.nn.Module):
             for param in self.model.parameters():
                 param.requires_grad = True
 
-    def assert_unfrozen_parameters(self) -> None:
+    def assert_unfrozen_parameters(
+            self
+            ) -> None:
 
         '''
         Assert which parameters will be updated during the training run.
@@ -135,7 +157,16 @@ class ResNet(torch.nn.Module):
 
 class EnsembleModel(torch.nn.Module):
 
-    def __init__(self, model1, model2, model3, model4, versions: list, num_out_classes: int, output_dir: str) -> None:
+    def __init__(
+            self, 
+            model1: torch.nn.Module, 
+            model2: torch.nn.Module, 
+            model3: torch.nn.Module, 
+            model4: torch.nn.Module, 
+            versions: list, 
+            num_out_classes: int, 
+            output_dir: str
+            ) -> None:
         super().__init__()
 
         '''
@@ -159,26 +190,31 @@ class EnsembleModel(torch.nn.Module):
         self.classifier = torch.nn.Linear(num_out_classes * 4, num_out_classes)
         self.freeze_model_parameters()
 
-    def forward(self, x) -> torch.Tensor:
+    def forward(
+            self, 
+            input: torch.Tensor
+            ) -> torch.Tensor:
 
         '''
         Forward pass through the model.
 
         Args:
-            x (torch.Tensor): Input tensor.
+            input (torch.Tensor): Input tensor.
         
         Returns:
-            torch.Tensor: Output tensor.
+            output (torch.Tensor): Output tensor.
         '''
-        x1 = self.model1(x)
-        x2 = self.model2(x)
-        x3 = self.model3(x)
-        x4 = self.model4(x)
+        x1 = self.model1(input)
+        x2 = self.model2(input)
+        x3 = self.model3(input)
+        x4 = self.model4(input)
         x = torch.cat((x1, x2, x3, x4), dim=1)
-        out = self.classifier(x)
-        return out
+        output = self.classifier(x)
+        return output
 
-    def freeze_model_parameters(self) -> None:
+    def freeze_model_parameters(
+            self
+            ) -> None:
 
         '''
         Freeze the model's weights.

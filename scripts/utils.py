@@ -31,7 +31,10 @@ class ReproducibilityUtils:
 
 class EnvironmentUtils:
 
-    def __init__(self, path: str) -> None:
+    def __init__(
+            self, 
+            path: str
+            ) -> None:
 
         '''
         Initialize the environment utils class.
@@ -42,7 +45,10 @@ class EnvironmentUtils:
         self.path = path
         self.folders = glob(os.path.join(self.path, '*/DICOM/*'), recursive = True)
 
-    def create_subfolders(self, subfolders: list) -> None:
+    def create_subfolders(
+            self, 
+            subfolders: list
+            ) -> None:
 
         '''
         Create subfolders in the data directory.
@@ -57,7 +63,10 @@ class EnvironmentUtils:
                     os.makedirs(new_subfolder)
                     print('Creating {}.'.format(new_subfolder))
 
-    def delete_subfolders_by_path(self, subfolder_paths: list) -> None:
+    def delete_subfolders_by_path(
+            self, 
+            subfolder_paths: list
+            ) -> None:
 
         '''
         Delete subfolders in the data directory.
@@ -70,7 +79,11 @@ class EnvironmentUtils:
                 shutil.rmtree(subfolder_path)
                 print('Deleting {}.'.format(subfolder_path))
 
-    def delete_subfolders_by_name(self, subfolder_list: list, new_folder_structure: bool) -> None:
+    def delete_subfolders_by_name(
+            self, 
+            subfolder_list: list, 
+            new_folder_structure: bool
+            ) -> None:
 
         '''
         Delete subfolders in the data directory.
@@ -96,7 +109,9 @@ class EnvironmentUtils:
                         shutil.rmtree(subfolder_path)
                         print('Deleting {}.'.format(subfolder_path))
 
-    def move_subfolders(self) -> None:
+    def move_subfolders(
+            self
+            ) -> None:
 
         '''
         Move subfolders in the data directory.
@@ -127,7 +142,9 @@ class EnvironmentUtils:
                     except:
                         print('Extracting metadata for file {} failed.'.format(series_path))
 
-    def rename_subfolders(self) -> None:
+    def rename_subfolders(
+            self
+            ) -> None:
 
         '''
         Rename subfolders in the data directory.
@@ -148,7 +165,10 @@ class EnvironmentUtils:
                 print('Folder {} matches dicom metadata.'.format(old_path))
 
 class MetadataUtils:
-    def __init__(self, path: str) -> None:
+    def __init__(
+            self, 
+            path: str
+            ) -> None:
 
         '''
         Initialize the sequence utils class.
@@ -159,7 +179,12 @@ class MetadataUtils:
         self.path = path
         self.folders = glob(os.path.join(self.path, '*/DICOM/*'), recursive = True)
 
-    def extract_metadata(self, contrast_type: str, metadata_list: list, all_sequences: bool) -> list:
+    def extract_metadata(
+            self, 
+            contrast_type: str, 
+            metadata_list: list, 
+            all_sequences: bool
+            ) -> list:
 
         '''
         Get the metadata of the sequences.
@@ -213,7 +238,10 @@ class MetadataUtils:
         
         return zip(*list(metadata_dict.values()))
                     
-    def count_series_freq(self, sequence_list: list) -> None:
+    def count_series_freq(
+            self, 
+            sequence_list: list
+            ) -> None:
 
         '''
         Count the frequency of each sequence in a list
@@ -230,7 +258,11 @@ class MetadataUtils:
             sequence, freq = keys
             print(sequence, freq)
 
-    def extract_list_of_series(self, series_feature: str, feature_label: list) -> list:
+    def extract_list_of_series(
+            self, 
+            series_feature: str, 
+            feature_label: list
+            ) -> list:
 
         '''
         Extract list of series.
@@ -261,7 +293,12 @@ class MetadataUtils:
                     print('Error reading metadata from: ', series_path)
         return series_list
     
-    def rename_series(self, old_name: list, new_name: str, dynamic_scan: str) -> None:
+    def rename_series(
+            self, 
+            old_name: list, 
+            new_name: str, 
+            dynamic_scan: str
+            ) -> None:
             
         '''
         Rename series in the data directory.
@@ -293,7 +330,10 @@ class MetadataUtils:
                     except:
                         print('Folder {} could not be renamed.'.format(series_path))
         
-    def separate_dicom_series(self, series_type: str) -> None:
+    def separate_dicom_series(
+            self, 
+            series_type: str
+            ) -> None:
 
         '''
         Separate T1-weighted images in the data directory by echo time and DWI by b-value.
