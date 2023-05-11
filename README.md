@@ -25,7 +25,7 @@ Data was retroactivelly collected from a cohort of liver cirrhosis patients who 
 ## Directions for Future Work
 
 - Considering the limitations in computing ressources, future work should consider a two-stage segmentation classification pipeline, where the patient's liver is first segmented and the resulting cropped image is then classified.
-- Additionally, the procedure could be further enhanced by feeding image patches to the models.
+- Additionally, the procedure could be further enhanced by dividing the images into smaller patches and feeding image patches as inputs to the models.
 
 ## Reproducing the Results
 
