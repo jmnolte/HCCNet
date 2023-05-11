@@ -15,14 +15,14 @@ import torchmetrics
 class Trainer:
     
     def __init__(
-        self, 
-        model: torch.nn.Module, 
-        version: str, 
-        dataloaders: dict, 
-        learning_rate: float,
-        weight_decay: float,
-        output_dir: str,
-    ) -> None:
+            self, 
+            model: torch.nn.Module, 
+            version: str, 
+            dataloaders: dict, 
+            learning_rate: float, 
+            weight_decay: float,
+            output_dir: str,
+            ) -> None:
 
         '''
         Initialize the training class.
@@ -58,7 +58,10 @@ class Trainer:
         # self.criterion = FocalLoss(gamma=2, weight=weights).to(self.gpu_id)
         self.criterion = torch.nn.CrossEntropyLoss().to(self.gpu_id)
     
-    def load_snapshot(self, snapshot_path: str) -> dict:
+    def load_snapshot(
+            self, 
+            snapshot_path: str
+            ) -> dict:
 
         '''
         Load a snapshot of the model.
@@ -68,7 +71,10 @@ class Trainer:
         self.epochs_run = snapshot['EPOCHS_RUN']
         print('Resuming training from epoch:'.format(self.epochs_run))
 
-    def save_snapshot(self, epoch: int) -> None:
+    def save_snapshot(
+            self, 
+            epoch: int
+            ) -> None:
         
         '''
         Save a snapshot of the model.
@@ -87,7 +93,11 @@ class Trainer:
         torch.save(snapshot, folder_path)
         print('Epoch {}: Training snapshot saved at snapshot.pth'.format(epoch))
 
-    def save_output(self, output_dict: dict, output_type: str) -> None:
+    def save_output(
+            self, 
+            output_dict: dict, 
+            output_type: str
+            ) -> None:
 
         '''
         Save the model's output.
@@ -121,7 +131,12 @@ class Trainer:
         else:
             np.save(folder_path, output_dict)
 
-    def train(self, metric: torchmetrics, epoch: int, accum_steps: int) -> tuple:
+    def train(
+            self, 
+            metric: torchmetrics, 
+            epoch: int, 
+            accum_steps: int
+            ) -> tuple:
 
         '''
         Train the model.
@@ -167,7 +182,11 @@ class Trainer:
             print(f"[GPU {self.gpu_id}] Epoch {epoch}, Training Loss: {epoch_loss:.4f}, Training F1-Score: {epoch_f1score.item():.4f}")
         return epoch_loss, epoch_f1score
 
-    def validate(self, metric: torchmetrics, epoch: int) -> tuple:
+    def validate(
+            self, 
+            metric: torchmetrics, 
+            epoch: int
+            ) -> tuple:
 
         '''
         Validate the model.
@@ -200,7 +219,14 @@ class Trainer:
                 print(f"[GPU {self.gpu_id}] Epoch {epoch}, Validation Loss: {epoch_loss:.4f}, Validation F1-Score: {epoch_f1score.item():.4f}")
         return epoch_loss, epoch_f1score
     
-    def training_loop(self, metric: torchmetrics, min_epochs: int, accum_steps: int, early_stopping: bool, patience: int) -> None:
+    def training_loop(
+            self, 
+            metric: torchmetrics, 
+            min_epochs: int, 
+            accum_steps: int, 
+            early_stopping: bool, 
+            patience: int
+            ) -> None:
 
         '''
         Training loop.
@@ -254,7 +280,10 @@ class Trainer:
             self.save_output(best_weights, 'weights')
             self.save_output(history, 'history')
 
-    def visualize_training(self, metric: str) -> None:
+    def visualize_training(
+            self, 
+            metric: str
+            ) -> None:
 
         '''
         Visualize the training and validation history.
@@ -296,7 +325,12 @@ class FocalLoss(torch.nn.Module):
     Focal loss implementation using cross entropy loss.
     '''
 
-    def __init__(self, gamma: float = 2.0, weight=None, reduction: str = 'mean') -> None:
+    def __init__(
+            self, 
+            gamma: float, 
+            weight: torch.Tensor, 
+            reduction: str
+            ) -> None:
         super(FocalLoss, self).__init__()
 
         '''
@@ -309,7 +343,11 @@ class FocalLoss(torch.nn.Module):
         self.weight = weight
         self.reduction = reduction
 
-    def forward(self, input: torch.Tensor, target: torch.Tensor):
+    def forward(
+            self, 
+            input: torch.Tensor, 
+            target: torch.Tensor
+            ) -> torch.Tensor:
 
         '''
         Forward pass.
@@ -374,7 +412,9 @@ def parse_args() -> argparse.Namespace:
                         help="Path to pretrained weights")
     return parser.parse_args()
 
-def load_train_objs(args: argparse.Namespace) -> tuple:
+def load_train_objs(
+        args: argparse.Namespace
+        ) -> tuple:
 
     '''
     Load training objects.
@@ -436,7 +476,9 @@ def cleanup() -> None:
     '''
     torch.distributed.destroy_process_group()
 
-def main(args: argparse.Namespace) -> None:
+def main(
+        args: argparse.Namespace
+        ) -> None:
 
     '''
     Main function.

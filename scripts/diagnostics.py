@@ -12,7 +12,13 @@ import seaborn as sns
 
 class Diagnostics():
     
-    def __init__(self, model: torch.nn.Module, version: str, dataloaders: dict, output_dir: str) -> None:
+    def __init__(
+            self, 
+            model: torch.nn.Module, 
+            version: str, 
+            dataloaders: dict, 
+            output_dir: str
+            ) -> None:
 
         '''
         Initialize the diagnostics class.
@@ -45,7 +51,10 @@ class Diagnostics():
         self.model = self.model.to(self.gpu_id)
         self.model = torch.nn.parallel.DistributedDataParallel(self.model, device_ids=[self.gpu_id])
     
-    def plot_test_metrics(self, metric: str) -> None:
+    def plot_test_metrics(
+            self, 
+            metric: str
+            ) -> None:
 
         '''
         Plot the ROC or PR curve on the test set.
@@ -92,7 +101,11 @@ class Diagnostics():
         plt.savefig(file_path, dpi=300, bbox_inches="tight")
         plt.close()
 
-    def get_random_image(self, phase: str, positive: bool) -> torch.tensor:
+    def get_random_image(
+            self, 
+            phase: str, 
+            positive: bool
+            ) -> torch.tensor:
 
         '''
         Get a random image from the test set.
@@ -119,7 +132,10 @@ class Diagnostics():
                     continue
         return inputs.to(self.gpu_id), labels.unsqueeze(0).to(self.gpu_id)
     
-    def visualize_activations(self, positive: bool) -> None:
+    def visualize_activations(
+            self, 
+            positive: bool
+            ) -> None:
 
         '''
         Get the occlusion sensitivity map for a given image.
@@ -233,7 +249,9 @@ def cleanup() -> None:
     '''
     torch.distributed.destroy_process_group()
 
-def main(args: argparse.Namespace) -> None:
+def main(
+        args: argparse.Namespace
+        ) -> None:
 
     '''
     Main function.
@@ -243,9 +261,13 @@ def main(args: argparse.Namespace) -> None:
     '''
     ReproducibilityUtils.seed_everything(args.seed)
     setup()
+    if args.occ_sens:
+        batch_size = 1
+    else:
+        batch_size = args.batch_size
     dataloader = DataLoader(args.data_dir, args.modality_list)
     data_dict = dataloader.create_data_dict()
-    dataloader_dict = dataloader.load_data(data_dict, args.train_ratio, args.batch_size, 2, args.weighted_sampler, args.quant_images)
+    dataloader_dict = dataloader.load_data(data_dict, args.train_ratio, batch_size, 2, args.weighted_sampler, args.quant_images)
     if args.version == 'ensemble':
         versions = ['resnet10','resnet18','resnet34','resnet50']
         resnet10 = ResNet('resnet10', 2, len(args.modality_list), args.pretrained, args.feature_extraction, args.weights_dir)
@@ -256,11 +278,10 @@ def main(args: argparse.Namespace) -> None:
     else:
         model = ResNet(args.version, 2, len(args.modality_list), args.pretrained, args.feature_extraction, args.weights_dir)
     inference = Diagnostics(model, args.version, dataloader_dict, args.results_dir)
-    if args.occ_sens:
-        inference.visualize_activations(args.positive)
-    else:
-        inference.plot_test_metrics('auc')
-        inference.plot_test_metrics('ap')
+    inference.visualize_activations(True)
+    inference.visualize_activations(False)
+    inference.plot_test_metrics('auc')
+    inference.plot_test_metrics('ap')
     cleanup()
     print('Script finished')
 

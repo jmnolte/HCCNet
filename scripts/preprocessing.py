@@ -9,13 +9,15 @@ from tqdm import tqdm
 from natsort import natsorted
 from glob import glob
 import dicom2nifti
-from utils import ReproducibilityUtils
 import pandas as pd
 from sklearn.model_selection import train_test_split, GroupShuffleSplit
 
 class DicomToNifti:
 
-    def __init__(self, path: str) -> None:
+    def __init__(
+            self, 
+            path: str
+            ) -> None:
 
         '''
         Initialize the data utils class.
@@ -29,7 +31,9 @@ class DicomToNifti:
         self.dicom_patients = glob(os.path.join(self.dicom_dir, '*'), recursive = True)
         self.nifti_patients = glob(os.path.join(self.nifti_dir, '*'), recursive = True)
 
-    def get_dicom_observations(self) -> list:
+    def get_dicom_observations(
+            self
+            ) -> list:
 
         '''
         Get list of existing observations.
@@ -46,7 +50,10 @@ class DicomToNifti:
                 observation_list.append(entry)
         return observation_list
     
-    def convert_dicom_to_nifti(self, df_path: str) -> None:
+    def convert_dicom_to_nifti(
+            self, 
+            df_path: str
+            ) -> None:
 
         '''
         Convert dicom files into nifti file format.
@@ -81,7 +88,10 @@ class DicomToNifti:
 
 class PreprocessingUtils:
 
-    def __init__(self, path: str) -> None:
+    def __init__(
+            self, 
+            path: str
+            ) -> None:
 
         '''
         Initialize the preprocessing utils class.
@@ -95,7 +105,9 @@ class PreprocessingUtils:
         self.nifti_patients = glob(os.path.join(self.nifti_dir, '*'), recursive = True)
         self.dicom_patients = glob(os.path.join(self.dicom_dir, '*'), recursive = True)
 
-    def extract_image_names(self) -> list:
+    def extract_image_names(
+            self
+            ) -> list:
 
         '''
         Extract image names from the nifti files.
@@ -112,7 +124,10 @@ class PreprocessingUtils:
                 image_list.append(image_head)
         return image_list
 
-    def clean_directory(self, image_list: list) -> None:
+    def clean_directory(
+            self, 
+            image_list: list
+            ) -> None:
 
         '''
         Clean the directory.
@@ -129,13 +144,16 @@ class PreprocessingUtils:
                     os.remove(image)
                     print('Deleting {}.'.format(image))
 
-    # def create_label_list(self, df_path: str) -> list:
+    # def create_label_list(
+    #         self, 
+    #         df_path: str
+    #         ) -> list:
 
     #     '''
     #     Create a list of labels.
 
     #     Args:
-    #         label_path (str): Path to the label file.
+    #         df_path (str): Path to the dataframe of labels.
 
     #     Returns:
     #         label_list (list): List of labels.
@@ -161,7 +179,11 @@ class PreprocessingUtils:
 
 class DataLoader:
 
-    def __init__(self, path: str, modality_list) -> None:
+    def __init__(
+            self, 
+            path: str, 
+            modality_list
+            ) -> None:
 
         '''
         Initialize the data loader class.
@@ -175,7 +197,10 @@ class DataLoader:
         self.nifti_patients = glob(os.path.join(self.nifti_dir, '*'), recursive = True)
         self.label_dir = os.path.join(path, 'labels')
 
-    def apply_transformations(self, dataset_indicator: str) -> monai.transforms:
+    def apply_transformations(
+            self, 
+            dataset_indicator: str
+            ) -> monai.transforms:
 
         '''
         Perform data transformations on image and image labels.
@@ -214,7 +239,11 @@ class DataLoader:
         else:
             return monai.transforms.Compose([preprocessing, postprocessing])
         
-    def assert_observation_completeness(self, modality_list: list, print_statement: bool) -> list:
+    def assert_observation_completeness(
+            self, 
+            modality_list: list, 
+            print_statement: bool
+            ) -> list:
 
         '''
         Assert that all observations include all required images.
@@ -240,7 +269,10 @@ class DataLoader:
         return observation_list
     
     @staticmethod
-    def split_observations_by_modality(observation_list: list, modality: str) -> list:
+    def split_observations_by_modality(
+            observation_list: list, 
+            modality: str
+            ) -> list:
 
         '''
         Split the observation paths by modality.
@@ -255,7 +287,10 @@ class DataLoader:
         return [glob(os.path.join(observation, modality + '.nii.gz')) for observation in observation_list]
     
     @staticmethod
-    def create_label_dict(observation_list: list, df_path: str) -> dict:
+    def create_label_dict(
+            observation_list: list, 
+            df_path: str
+            ) -> dict:
 
         '''
         Create a list of labels.
@@ -284,7 +319,9 @@ class DataLoader:
             label_dict['uid'].append(observation_id)
         return label_dict
             
-    def create_data_dict(self) -> dict:
+    def create_data_dict(
+            self
+            ) -> dict:
 
         '''
         Create a dictionary containing the data.
@@ -306,7 +343,11 @@ class DataLoader:
         return [patient for patient in path_dict if not (patient['label'] == None)]
     
     @staticmethod
-    def stratified_data_split(df: pd.DataFrame, test_ratio: float, n_splits: int = 100) -> pd.DataFrame:
+    def stratified_data_split(
+            df: pd.DataFrame, 
+            test_ratio: float, 
+            n_splits: int = 100
+            ) -> pd.DataFrame:
 
         '''
         Split the data into training, validation and test sets.
@@ -319,17 +360,21 @@ class DataLoader:
         Returns:
             dataframes (pd.DataFrame): Dataframes split according to the test ratio.
         '''
-        # label_ratio = 1
-        # splits = GroupShuffleSplit(test_size=test_ratio, n_splits=n_splits).split(df, groups=df['patient_id'])
-        # for split in splits:
-        #     set1, set2 = df.iloc[split[0]], df.iloc[split[1]]
-        #     if abs(set1['label'].mean() - set2['label'].mean()) < label_ratio:
-        #         if len(set1) / (1 - test_ratio) > len(set2) / test_ratio * 0.95 and len(set1) / (1 - test_ratio) < len(set1) / test_ratio * 1.05:
-        #             label_ratio = abs(set1['label'].mean() - set2['label'].mean())
-        #             best_split = split
-        return train_test_split(df, test_size=test_ratio, stratify=df['label'])
+        label_ratio = 1
+        splits = GroupShuffleSplit(test_size=test_ratio, n_splits=n_splits).split(df, groups=df['patient_id'])
+        for split in splits:
+            set1, set2 = df.iloc[split[0]], df.iloc[split[1]]
+            if abs(set1['label'].mean() - set2['label'].mean()) < label_ratio:
+                if len(set1) / (1 - test_ratio) > len(set2) / test_ratio * 0.95 and len(set1) / (1 - test_ratio) < len(set1) / test_ratio * 1.05:
+                    label_ratio = abs(set1['label'].mean() - set2['label'].mean())
+                    best_split = split
+        return best_split
 
-    def split_dataset(self, train_ratio: float, quant: bool) -> dict:
+    def split_dataset(
+            self, 
+            train_ratio: float, 
+            quant: bool
+            ) -> dict:
 
         '''
         Split the dataset into training, validation and test sets.
@@ -349,8 +394,8 @@ class DataLoader:
         label_df = pd.DataFrame.from_dict(label_dict)
         df = pd.merge(label_df, quant_df, on='uid', how='left').fillna(0)
         df['patient_id'] = df['uid'].str.split('_').str[1]
-        train, val_test = self.stratified_data_split(df, 1 - train_ratio)
-        val, test = self.stratified_data_split(val_test, 0.5)
+        train, val_test = train_test_split(df, test_size=1-train_ratio, stratify=df['label'])
+        val, test = train_test_split(val_test, test_size=0.5, stratify=df['label'])
         if quant:
             for idx, df in enumerate([train, val, test]):
                 df = df.drop(df[df['quant'] == 0].index)
@@ -365,7 +410,9 @@ class DataLoader:
             return {'train': train[['uid']].values, 'val': val[['uid']].values, 'test': test[['uid']].values}
         
     @staticmethod
-    def get_class_weights(data_split_dict: dict) -> dict:
+    def get_class_weights(
+            data_split_dict: dict
+            ) -> dict:
 
         '''
         Calculate the sample class weights per dataset.
@@ -383,7 +430,15 @@ class DataLoader:
         sample_weights = {x: torch.from_numpy(sample_weights[x]) for x in ['train','val','test']}
         return {x: sample_weights[x].double() for x in ['train','val','test']}  
         
-    def load_data(self, data_dict: dict, train_ratio: float, batch_size: int, num_workers: int, weighted_sampler: bool, quant_images: bool) -> dict:
+    def load_data(
+            self, 
+            data_dict: dict, 
+            train_ratio: float, 
+            batch_size: int, 
+            num_workers: int, 
+            weighted_sampler: bool, 
+            quant_images: bool
+            ) -> dict:
 
         '''
         Load the data.
