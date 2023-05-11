@@ -6,6 +6,10 @@ This repository contains the [scripts](https://github.com/jmnolte/thesis/tree/ma
 
 For hepatocellular carcinoma (HCC) patients, early-stage diagnosis continues to be the most important predictor of survival. However, lesion detection typically only occurs at an advanced stage and continues to be largely affected by radiologists' experience. To facilitate patient survival, this study proposed a novel computer-aided diagnosis (CAD) system using data on 243 patients (759 observations) with compensated liver cirrhosis. Particularly, four individual 3-dimensional convolutional neural networks were trained, and their predictions aggregated in an ensemble to further enhance accurate tumor diagnosis. The models were validated on an independent internal test set, and their performance was evaluated with respect to a number of standard evaluation metrics. Despite the promising findings attained in our preliminary investigation, the results showed that all four individual models displayed limited diagnostic capabilities, with their predictions remaining largely inferior to the naive prediction of the study's majority class. Meanwhile, the ensemble of the four models displayed greater discriminatory power between HCC and common liver cirrhosis but still failed to accurately infer cancer prevalence. While the proposed CAD thus yielded limited diagnostic value of HCC, its accurate evaluation may have been severely constrained by the study's limitations in computing resources, thus highlighting the need for future research to reevaluate the CAD’s viability.
 
+## Data
+
+Data was retroactivelly collected from a cohort of liver cirrhosis patients who underwent MRI screening for HCC surveillance between March 2011 and September 2022 at Medisch Spectrum Twente in Enschede, the Netherlands. In total, the study comprised 759 observations from 243 patients of which 80 observations comprised diagnosed HCC.
+
 ## Results
 
 <p align="center">
@@ -14,9 +18,14 @@ For hepatocellular carcinoma (HCC) patients, early-stage diagnosis continues to 
   <img alt="Dark" title="Precision-Recall Curves" src="https://github.com/jmnolte/thesis/blob/master/results/model_diagnostics/roc_pr_curves/prec_recall_curves.png" width="45%">
 </p>
 
-## Future Work
+- The models' deduced feature representations failed to capture the tumor's heterogeneous phenotype (see above figures).
+- The proposed CAD thus provided limited diagnostic viability.
+- However, study was severely limited by the available computing resources. For the analysis, all images had to be downsampled to less than 1% of the original image's resolution to fit them into the GPUs' memory.
 
-The study's computing resources greatly limited its viability. In fact, all images had to be downsampled to less than 1% of the original image's resolution. Therefore, future work needs to consider a two-stage segmentation classification pipeline, where the patient's liver is first segmented and the resulting cropped image is then classified. The procedure could be further enhanced by feeding image patches to the models.
+## Directions for Future Work
+
+- Considering the limitations in computing ressources, future work should consider a two-stage segmentation classification pipeline, where the patient's liver is first segmented and the resulting cropped image is then classified.
+- Additionally, the procedure could be further enhanced by feeding image patches to the models.
 
 ## Reproducing the Results
 
