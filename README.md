@@ -30,12 +30,11 @@ All scripts are self contained and should be executed from the command line or u
 
 1. Training: `training10.sh`, `training18.sh`, `training34.sh`, `training50.sh`, `trainingEns.sh`
 2. Inference: `inference10.sh`, `inference18.sh`, `inference34.sh`, `inference50.sh`, `inferenceEns.sh`
-3. Visualization: `visual10.sh`, `visual18.sh`, `visual34.sh`, `visual50.sh`, `visualEns.sh`
-4. Occlusion Sensitivity: `occ_sens10.sh`, `occ_sens18.sh`, `occ_sens34.sh`, `occ_sens50.sh`, `occ_sensEns.sh` 
+3. Diagnostics: `diagnostics10.sh`, `diagnostics18.sh`, `diagnostics34.sh`, `diagnostics50.sh`, `diagnosticsEns.sh`
 
-If access to a high performance cluster is not provided, please execute the aforementioned scripts using `torchrun --standalone` directly from your command line, utilizing the maximum possible number of GPUs by setting `nproc_per_node=gpu` and following the above order. 
+If access to a high performance cluster is not provided, please execute the aforementioned scripts using `torchrun` directly from your command line, omitting the `--standalone` flag and the `--nproc_per_node` indicator.
 
-Note that according to the number of accessiable GPUs and the total amount of accessiable VRAM per GPU, the batch size (i.e., per GPU) and the number of accumulation steps may need to be adjusted. For an overview of the hyperparameter settings used in this study, please refer to Appendix A in the study's [report](https://github.com/jmnolte/thesis/tree/master/report). 
+Note that according to the number of accessiable GPUs and the total amount of accessiable VRAM per GPU, the batch size (i.e., per GPU) and the number of accumulation steps may need to be adjusted. For an overview of the hyperparameter settings used in this study, please refer to Appendix A in the study's [report](https://github.com/jmnolte/thesis/tree/master/report).
 
 ## License
 
