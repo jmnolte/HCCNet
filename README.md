@@ -9,9 +9,9 @@ For hepatocellular carcinoma (HCC) patients, early-stage diagnosis continues to 
 ## Results
 
 <p align="center">
-  <img alt="Light" title="Receiver Operating Characteristic Curves" src="[Receiver Operating Characteristic Curves](https://github.com/jmnolte/thesis/blob/master/results/model_diagnostics/roc_pr_curves/roc_curves.png)" width="45%">
+  <img alt="Light" title="Receiver Operating Characteristic Curves" src="https://github.com/jmnolte/thesis/blob/master/results/model_diagnostics/roc_pr_curves/roc_curves.png" width="45%">
 &nbsp; &nbsp; &nbsp; &nbsp;
-  <img alt="Dark" title="Precision-Recall Curves" src="[Precision-Recall Curves](https://github.com/jmnolte/thesis/blob/master/results/model_diagnostics/roc_pr_curves/prec_recall_curves.png)" width="45%">
+  <img alt="Dark" title="Precision-Recall Curves" src="https://github.com/jmnolte/thesis/blob/master/results/model_diagnostics/roc_pr_curves/prec_recall_curves.png" width="45%">
 </p>
 
 ## Future Work
