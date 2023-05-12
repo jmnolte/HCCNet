@@ -4,13 +4,15 @@ import glob
 import os
 import tempfile
 import torch
-import math
 from tqdm import tqdm
 from natsort import natsorted
 from glob import glob
 import dicom2nifti
 import pandas as pd
 from sklearn.model_selection import train_test_split, GroupShuffleSplit
+from utils import ReproducibilityUtils
+import argparse
+
 
 class DicomToNifti:
 
@@ -395,7 +397,7 @@ class DataLoader:
         df = pd.merge(label_df, quant_df, on='uid', how='left').fillna(0)
         df['patient_id'] = df['uid'].str.split('_').str[1]
         train, val_test = train_test_split(df, test_size=1-train_ratio, stratify=df['label'])
-        val, test = train_test_split(val_test, test_size=0.5, stratify=df['label'])
+        val, test = train_test_split(val_test, test_size=0.5, stratify=val_test['label'])
         if quant:
             for idx, df in enumerate([train, val, test]):
                 df = df.drop(df[df['quant'] == 0].index)
@@ -471,14 +473,75 @@ class DataLoader:
         else:
             sampler = {x: monai.data.DistributedSampler(dataset=datasets[x], even_divisible=True, shuffle=True) for x in ['train','val','test']}
         return {x: monai.data.DataLoader(datasets[x], batch_size=batch_size, shuffle=(sampler[x] is None), num_workers=num_workers, sampler=sampler[x], pin_memory=True) for x in ['train','val','test']}
-            
+        
+    
+def parse_args() -> argparse.Namespace:
+
+    '''
+    Parse command line arguments.
+
+    Returns:
+        argparse.Namespace: Arguments.
+    '''
+    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument("--summ-stats", action='store_true',
+                        help="Flag to return summary statistics")
+    parser.add_argument("--dicom2nifti", action='store_true',
+                        help="Flag to convert dicom images to nifti")
+    parser.add_argument("--dataset", type=str, 
+                        help="Dataset to return summary statistics for")
+    parser.add_argument("--seed", type=int, default=123, 
+                        help="Seed for reproducibility")
+    parser.add_argument("--modality-list", type=str, default=MODALITY_LIST,
+                        help="Path to the data directory")
+    parser.add_argument("--data-dir", type=str, default=DATA_DIR,
+                        help="Path to the data directory")
+    return parser.parse_args()
+
+def main(
+        args: argparse.Namespace
+        ) -> None:
+
+    '''
+    Main function.
+
+    Args:
+        args (argparse.Namespace): Arguments.
+    '''
+    ReproducibilityUtils.seed_everything(args.seed)
+    if args.dicom2nifti:
+        dicom2nifti.settings.disable_validate_slice_increment()
+        DicomToNifti(args.data_dir).convert_dicom_to_nifti(os.path.join(args.data_dir, 'labels/labels.csv'))
+        prep = PreprocessingUtils(args.data_dir)
+        prep.clean_directory(args.modality_list)
+    if args.summ_stats:
+        dataloader = DataLoader(args.data_dir, args.modality_list)
+        data_dict = dataloader.create_data_dict()
+        split_dict = dataloader.split_dataset(0.8, False)
+        data_split_dict = {x: [patient for patient in data_dict if patient['uid'] in split_dict[x]] for x in ['train', 'val', 'test']} 
+        data_split_dict = {x: [patient['uid'][:-4] for patient in data_split_dict[x]] for x in ['train', 'val', 'test']}
+        preconditions_df = pd.read_csv(os.path.join(args.data_dir, 'preconditions.csv'), sep=';')
+        preconditions_df = preconditions_df[['Study_nr','NASH','HBV','HCV','Alcoholic_Cirrosis','Haemochromatosis','PBC','PSC','Cryptogenic','AIH','Other_Etiology']]
+        pt_info_df = pd.read_csv(os.path.join(args.data_dir, 'patient_info.csv'), sep=';')
+        pt_info_df = pt_info_df[['Study_nr','Age','Sex']]
+        summ_stats_df = preconditions_df.merge(pt_info_df, how='inner', on='Study_nr')
+        if args.dataset == 'train':
+            summ_stats_df = summ_stats_df[summ_stats_df['Study_nr'].isin(data_split_dict['train'])]
+        elif args.dataset == 'val':
+            summ_stats_df = summ_stats_df[summ_stats_df['Study_nr'].isin(data_split_dict['val'])]
+        elif args.dataset == 'test':
+            summ_stats_df = summ_stats_df[summ_stats_df['Study_nr'].isin(data_split_dict['test'])]
+        print('Summary Statistics for Dichotumous Variables (Abs. and Rel. Frequency):')
+        abs_freq = round(summ_stats_df.iloc[:,1:-2].mean() * summ_stats_df.iloc[:,1:-2].count())
+        rel_freq = round(summ_stats_df.iloc[:,1:-2].mean() * 100, 1)
+        print(pd.concat([abs_freq, rel_freq], axis=1))
+        print('Summary Statistics for Continuous Variables (Mean and Std.):')
+        print('Age',round(summ_stats_df.iloc[:,11].mean(), 1), round(summ_stats_df.iloc[:,11].std(), 1))
+
+DATA_DIR = '/Users/noltinho/thesis/sensitive_data'
+IMAGES_TO_KEEP = ['T1W_OOP','T1W_IP','T1W_DYN','T1W_QNT','T2W_TES','T2W_TEL','DWI_b0','DWI_b150','DWI_b400','DWI_b800']
+MODALITY_LIST = ['T1W_OOP','T1W_IP','T1W_DYN','T2W_TES','T2W_TEL','DWI_b150','DWI_b400','DWI_b800']
 
 if __name__ == '__main__':
-    DATA_DIR = '/deepstore/datasets/bms/hcc_study'
-    QUANT_LIST = ['T1W_QNT']
-    MODALITY_LIST = ['T1W_OOP','T1W_IP','T1W_DYN','T2W_TES','T2W_TEL','DWI_b150','DWI_b400','DWI_b800']
-    IMAGES_TO_KEEP = ['T1W_OOP','T1W_IP','T1W_DYN','T1W_QNT','T2W_TES','T2W_TEL','DWI_b0','DWI_b150','DWI_b400','DWI_b800']
-    dicom2nifti.settings.disable_validate_slice_increment()
-    DicomToNifti(DATA_DIR).convert_dicom_to_nifti(os.path.join(DATA_DIR, 'labels/labels.csv'))
-    prep = PreprocessingUtils(DATA_DIR)
-    prep.clean_directory(IMAGES_TO_KEEP)
+    args = parse_args()
+    main(args)
