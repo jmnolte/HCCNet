@@ -228,9 +228,4 @@ class EnsembleModel(torch.nn.Module):
         for param in self.model4.parameters():
             param.requires_grad = False
         for param in self.classifier.parameters():
-            param.requires_grad = True    
-            
-
-if __name__ == '__main__':
-    WEIGHTS_PATH = '/Users/noltinho/MedicalNet/pytorch_files/pretrain'
-    resnet50 = ResNet(version='resnet50', num_out_classes=2, num_in_channels=9, pretrained=True, feature_extraction=True, weights_path=WEIGHTS_PATH)
+            param.requires_grad = True 

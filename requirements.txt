@@ -1,3 +1,7 @@
+## This file includes the list of packages used in the project. The project was employed using
+## python3.7 and nivida cuda toolkit 11.6 on Ubuntu. The packages can be installed using the 
+## following command: pip install -r requirements.txt
+
 dicom2nifti==2.2.6
 matplotlib==3.7.0
 monai==1.1.0

@@ -27,7 +27,6 @@ class Diagnostics():
             model (torch.nn): Model to train.
             version (str): Model version. Can be 'resnet10', 'resnet18', 'resnet34', 'resnet50',
                 'resnet101', 'resnet152', or 'resnet200'.
-            device (torch.device): Device to use.
             dataloaders (dict): Dataloader objects.
             output_dir (str): Output directory.
         '''
@@ -254,20 +253,27 @@ def main(
         ) -> None:
 
     '''
-    Main function.
+    Main function. The function saves receiver operating characteristic (ROC) and precision-recall (PR) 
+    curves for the models to the results directorcy. Additionally, the function saves occlusion 
+    sensitivity maps of the respective model architectures for a positive and a negative image to the
+    results directory.
 
     Args:
         args (argparse.Namespace): Arguments.
     '''
+    # Set a seed for reproducibility.
     ReproducibilityUtils.seed_everything(args.seed)
+    # Setup distributed processing.
     setup()
     if args.occ_sens:
         batch_size = 1
     else:
         batch_size = args.batch_size
+    # Load the test data and create a data dictionary.
     dataloader = DataLoader(args.data_dir, args.modality_list)
     data_dict = dataloader.create_data_dict()
     dataloader_dict = dataloader.load_data(data_dict, args.train_ratio, batch_size, 2, args.weighted_sampler, args.quant_images)
+    # Load the model. If the model is an ensemble model, load the individual models and create an ensemble model.
     if args.version == 'ensemble':
         versions = ['resnet10','resnet18','resnet34','resnet50']
         resnet10 = ResNet('resnet10', 2, len(args.modality_list), args.pretrained, args.feature_extraction, args.weights_dir)
@@ -277,11 +283,13 @@ def main(
         model = EnsembleModel(resnet10, resnet18, resnet34, resnet50, versions, 2, args.results_dir)
     else:
         model = ResNet(args.version, 2, len(args.modality_list), args.pretrained, args.feature_extraction, args.weights_dir)
+    # Return occlusion sensitivity maps and save ROC and PR curves.
     inference = Diagnostics(model, args.version, dataloader_dict, args.results_dir)
     inference.visualize_activations(True)
     inference.visualize_activations(False)
     inference.plot_test_metrics('auc')
     inference.plot_test_metrics('ap')
+    # Cleanup distributed processing.
     cleanup()
     print('Script finished')
 

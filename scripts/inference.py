@@ -216,16 +216,21 @@ def main(
         ) -> None:
 
     '''
-    Main function.
+    Main function. The function loads the test data, loads the updated model weights, and runs inference 
+    on the test set. It saves the models' predicted labels and performance metrics to the results directory.
 
     Args:
         args (argparse.Namespace): Arguments.
     '''
+    # Set a seed for reproducibility.
     ReproducibilityUtils.seed_everything(args.seed)
+    # Setup distributed processing.
     setup()
+    # Load the test data.
     dataloader = DataLoader(args.data_dir, args.modality_list)
     data_dict = dataloader.create_data_dict()
     dataloader_dict = dataloader.load_data(data_dict, args.train_ratio, args.batch_size, 2, args.weighted_sampler, args.quant_images)
+    # Load the model. If the model is an ensemble, load the individual models and create an ensemble model.
     if args.version == 'ensemble':
         versions = ['resnet10','resnet18','resnet34','resnet50']
         resnet10 = ResNet('resnet10', 2, len(args.modality_list), args.pretrained, args.feature_extraction, args.weights_dir)
@@ -235,9 +240,11 @@ def main(
         model = EnsembleModel(resnet10, resnet18, resnet34, resnet50, versions, 2, args.results_dir)
     else:
         model = ResNet(args.version, 2, len(args.modality_list), args.pretrained, args.feature_extraction, args.weights_dir)
+    # Run inference on the test set and calculate performance metrics.
     inference = Inference(model, args.version, dataloader_dict, args.learning_rate, args.weight_decay, args.results_dir)
     inference.run_inference()
     inference.calculate_test_metrics()
+    # Cleanup distributed processing.
     cleanup()
     print('Script finished')
     
