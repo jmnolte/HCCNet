@@ -383,33 +383,52 @@ class MetadataUtils:
                             os.makedirs(new_folder)
                         shutil.move(sequence_path, new_folder)
 
-if __name__ == '__main__':
-    PATH = '/Users/noltinho/thesis/sensitive_data/dicom'
-    T1_IOP = ['mDIXON BH','DIXON','mDIXON','DIXON 4 reconstructies','mDIXON obese','4 reconstructies DIXON','mDIXON W 4s','mDIXON BH b-buik','mDIXON BH laat']
-    T1_DYN = ['mDIXON W DYN BH','DIXON 4 FASEN','DIXON','mDIXON_dyn','DIXON fast 4 FASEN']
-    T1_QUANT = ['mDIXON-Quant_BH','QUANT','QUANT T0','QUANT T1','QUANT T2','mDIXON-Quant_BH obese']
-    T2_SHORT_TE = ['T2 TSE NAV','T2W_TSE_nav_FB 5mm','T2W_TSE_nav','T2W_TSE','T2  TSE','T2  TSE NAV','T2 TSE NAV S1.5','T2 TSE','T2 TSE single shot']
-    T2_LONG_TE = ['T2 LANGE TE NAV','T2 LANGE TE BH']
-    DWI = ['DWI 3B','DWI 3B NAV','DWI_11b_free breath tijdelijk indiengoed geen 3Bwaarden maken','DWI 3bw getriggert','DWI 3B OUD','DWI_11b_free breath','DWI 3B standaard']
+def main() -> None:
+
+    '''
+    Main function. The function renames all series in the data directory and deletes unwanted series.
+    '''
+    # Define the path to the data directory.
     env = EnvironmentUtils(PATH)
+    # Create a set of subfolders in the data directory.
     env.create_subfolders(['T1', 'T2', 'DIFFUSION', 'UNKNOWN'])
+    # Move all series to the corresponding subfolder.
     env.move_subfolders()
+    # Rename all series in the data directory according to the series type.
     env.rename_subfolders()
+    # Delete all unwanted series in the data directory.
     env.delete_subfolders_by_name(['S00','S10'], True)
     metadata = MetadataUtils(PATH)
+    # Extract all series in coronal and sagittal orientation and delete them.
     series_paths = metadata.extract_list_of_series('orientation',['coronal','sagittal'])
     env.delete_subfolders_by_path(series_paths)
+    # Extract all series with the following description and delete them.
     series_paths = metadata.extract_list_of_series('description',['reg','thrive','gado','dual','spair','t2 tse bh','t2w bh','mrcp','doorademen','dadc','dwip','ddwi','ediff'])
     env.delete_subfolders_by_path(series_paths)
+    # Find all series with the following description and rename them.
     metadata.rename_series(T1_IOP, 'T1W_IOP', 'N')
     metadata.rename_series(T1_DYN, 'T1W_DYN', 'Y')
     metadata.rename_series(T1_QUANT, 'T1W_QNT', 'not relevant')
     metadata.rename_series(T2_SHORT_TE, 'T2W_TES', 'not relevant')
     metadata.rename_series(T2_LONG_TE, 'T2W_TEL', 'not relevant')
     metadata.rename_series(DWI, 'DWI', 'not relevant')
+    # Separate T1-weighted images in the data directory by echo time and DWI by b-value.
     metadata.separate_dicom_series('T1W')
     metadata.separate_dicom_series('DWI')
+    # Delete all empty subfolders in the data directory.
     env.delete_subfolders_by_name(['UNKNOWN'], False)
     env.delete_subfolders_by_name(['T1W_IOP','DWI'], True)
+
+PATH = '/Users/noltinho/thesis/sensitive_data/dicom'
+T1_IOP = ['mDIXON BH','DIXON','mDIXON','DIXON 4 reconstructies','mDIXON obese','4 reconstructies DIXON','mDIXON W 4s','mDIXON BH b-buik','mDIXON BH laat']
+T1_DYN = ['mDIXON W DYN BH','DIXON 4 FASEN','DIXON','mDIXON_dyn','DIXON fast 4 FASEN']
+T1_QUANT = ['mDIXON-Quant_BH','QUANT','QUANT T0','QUANT T1','QUANT T2','mDIXON-Quant_BH obese']
+T2_SHORT_TE = ['T2 TSE NAV','T2W_TSE_nav_FB 5mm','T2W_TSE_nav','T2W_TSE','T2  TSE','T2  TSE NAV','T2 TSE NAV S1.5','T2 TSE','T2 TSE single shot']
+T2_LONG_TE = ['T2 LANGE TE NAV','T2 LANGE TE BH']
+DWI = ['DWI 3B','DWI 3B NAV','DWI_11b_free breath tijdelijk indiengoed geen 3Bwaarden maken','DWI 3bw getriggert','DWI 3B OUD','DWI_11b_free breath','DWI 3B standaard']
+
+
+if __name__ == '__main__':
+    main()
 
 

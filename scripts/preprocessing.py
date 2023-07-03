@@ -503,34 +503,47 @@ def main(
         ) -> None:
 
     '''
-    Main function.
+    Main function. The function can be used to return summary statistics or to convert dicom images 
+    to nifti file format. To return the former set the --summ-stats flag to True and specify the
+    dataset to return summary statistics for using the --dataset flag. To convert dicom images to
+    nifti file format set the --dicom2nifti flag to True.
 
     Args:
         args (argparse.Namespace): Arguments.
     '''
+    # Set a seed for reproducibility.
     ReproducibilityUtils.seed_everything(args.seed)
+    # If args.dict2nifti is set to True convert dicom images to nifti file format.
     if args.dicom2nifti:
+        # Disable validation of slice increment.
         dicom2nifti.settings.disable_validate_slice_increment()
+        # Convert dicom images to nifti file format.
         DicomToNifti(args.data_dir).convert_dicom_to_nifti(os.path.join(args.data_dir, 'labels/labels.csv'))
+        # Only retain specified imaging modalities.
         prep = PreprocessingUtils(args.data_dir)
         prep.clean_directory(args.modality_list)
+    # If args.summ_stats is set to True return summary statistics.
     if args.summ_stats:
+        # Load the data and create a dictionary containing the data.
         dataloader = DataLoader(args.data_dir, args.modality_list)
         data_dict = dataloader.create_data_dict()
         split_dict = dataloader.split_dataset(0.8, False)
         data_split_dict = {x: [patient for patient in data_dict if patient['uid'] in split_dict[x]] for x in ['train', 'val', 'test']} 
         data_split_dict = {x: [patient['uid'][:-4] for patient in data_split_dict[x]] for x in ['train', 'val', 'test']}
+        # Load data on preconditions and general patient information.
         preconditions_df = pd.read_csv(os.path.join(args.data_dir, 'preconditions.csv'), sep=';')
         preconditions_df = preconditions_df[['Study_nr','NASH','HBV','HCV','Alcoholic_Cirrosis','Haemochromatosis','PBC','PSC','Cryptogenic','AIH','Other_Etiology']]
         pt_info_df = pd.read_csv(os.path.join(args.data_dir, 'patient_info.csv'), sep=';')
         pt_info_df = pt_info_df[['Study_nr','Age','Sex']]
         summ_stats_df = preconditions_df.merge(pt_info_df, how='inner', on='Study_nr')
+        # Specify which dataset to return summary statistics for.
         if args.dataset == 'train':
             summ_stats_df = summ_stats_df[summ_stats_df['Study_nr'].isin(data_split_dict['train'])]
         elif args.dataset == 'val':
             summ_stats_df = summ_stats_df[summ_stats_df['Study_nr'].isin(data_split_dict['val'])]
         elif args.dataset == 'test':
             summ_stats_df = summ_stats_df[summ_stats_df['Study_nr'].isin(data_split_dict['test'])]
+        # Print summary statistics.
         print('Summary Statistics for Dichotumous Variables (Abs. and Rel. Frequency):')
         abs_freq = round(summ_stats_df.iloc[:,1:-2].mean() * summ_stats_df.iloc[:,1:-2].count())
         rel_freq = round(summ_stats_df.iloc[:,1:-2].mean() * 100, 1)

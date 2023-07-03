@@ -65,6 +65,9 @@ class Trainer:
 
         '''
         Load a snapshot of the model.
+
+        Args:
+            snapshot_path (str): Path to snapshot.
         '''
         snapshot = torch.load(snapshot_path)
         self.model.load_state_dict(snapshot['MODEL_STATE'])
@@ -78,6 +81,9 @@ class Trainer:
         
         '''
         Save a snapshot of the model.
+
+        Args:
+            epoch (int): Current epoch.
         '''
         snapshot = {}
         snapshot['MODEL_STATE'] = self.model.module.state_dict()
@@ -142,7 +148,9 @@ class Trainer:
         Train the model.
 
         Args:
+            metric (torchmetrics): Metric to use for training.
             epoch (int): Current epoch.
+            accum_steps (int): Number of steps to accumulate gradients over.
 
         Returns:
             tuple: Tuple containing the loss and f1 score.
@@ -192,9 +200,8 @@ class Trainer:
         Validate the model.
 
         Args:
-            criterion (torch.nn): Loss function.
+            metric (torchmetrics): Metric to use for validation.
             epoch (int): Current epoch.
-            args (argparse.Namespace): Arguments.
         
         Returns:
             tuple: Tuple containing the loss and f1 score.
@@ -234,6 +241,7 @@ class Trainer:
         Args:
             metric (torch.nn): Metric to optimize.
             min_epochs (int): Minimum number of epochs to train.
+            accum_steps (int): Number of steps to accumulate gradients.
             patience (int): Number of epochs to wait before early stopping.
             early_stopping (bool): Whether to use early stopping.
         '''
@@ -329,11 +337,12 @@ class FocalLoss(torch.nn.Module):
             self, 
             gamma: float, 
             weight: torch.Tensor, 
-            reduction: str
+            reduction: str = 'mean'
             ) -> None:
         super(FocalLoss, self).__init__()
-
         '''
+        Initialize focal loss.
+
         Args:
             gamma (float): Focal loss gamma parameter.
             weight (torch.Tensor): Class weights.
@@ -419,6 +428,9 @@ def load_train_objs(
     '''
     Load training objects.
 
+    Args:
+        args (argparse.Namespace): Arguments.
+
     Returns:
         tuple: Training objects consisting of the data loader, the model, and the performance metric.
     '''
@@ -481,17 +493,26 @@ def main(
         ) -> None:
 
     '''
-    Main function.
+    Main function. The function loads the dataloader, model, and metric, and trains the model. After
+    training, the function plots the training and validation loss and F1 score. It saves the updated
+    model weights, the training and validation history (i.e., loss and F1 score), and the corresponding
+    plots.
 
     Args:
         args (argparse.Namespace): Arguments.
     '''
+    # Set a seed for reproducibility.
     ReproducibilityUtils.seed_everything(args.seed)
+    # Setup distributed training.
     setup()
+    # Load the dataloaders, model, and model metric.
     dataloader_dict, model, metric = load_train_objs(args)
+    # Train the model using the training data and validate the model on the validation data following each epoch.
     trainer = Trainer(model, args.version, dataloader_dict, args.learning_rate, args.weight_decay, args.results_dir)
     trainer.training_loop(metric, args.epochs, args.accum_steps, args.early_stopping, args.patience)
+    # Cleanup distributed training.
     cleanup()
+    # Plot the training and validation loss and F1 score.
     trainer.visualize_training('loss')
     trainer.visualize_training('f1score')
     print('Script finished')
