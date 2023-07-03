@@ -24,14 +24,14 @@ Data was retroactivelly collected from a cohort of liver cirrhosis patients who 
 
 ## Directions for Future Work
 
-- Considering the limitations in computing ressources, future work should consider a two-stage segmentation classification pipeline, where the patient's liver is first segmented and the resulting cropped image is then classified.
+- Considering the limitations in computing ressources, future work should consider a two-stage segmentation classification pipeline, where the patient's liver is first segmented and the resulting cropped image is subsequently classified.
 - Additionally, the procedure could be further enhanced by dividing the images into smaller patches and feeding image patches as inputs to the models.
 
 ## Reproducing the Results
 
 ### Requirements
 
-To reproduce the results presented in the project's [report](https://github.com/jmnolte/thesis/tree/master/report), access to a Nvidia GPU with a minimum of 8GB VRAM is required. However, training on a single GPU significantly increases processing time. To enhance training, the authors thus recommend the use of four Nvidia GPUs with 12GB VRAM each. All required package versions are listed in [requirements.txt](https://github.com/jmnolte/thesis/blob/master/requirements.txt). To ensure a fully reproducible workflow, install them by running `pip install -r requirements.txt` in your command line.
+To reproduce the results presented in the project's [report](https://github.com/jmnolte/thesis/tree/master/report), access to a Nvidia GPU with a minimum of 8GB VRAM is required. Evaluating the studys' results using a single GPU may significantly increases processing time. To enhance training, the authors thus strongly recommend the use of four Nvidia GPUs with at minimum 12GB VRAM each. All required packages and corresponding package versions are listed in [requirements.txt](https://github.com/jmnolte/thesis/blob/master/requirements.txt). To ensure a fully reproducible workflow, please install them by running `pip install -r requirements.txt` in your command line.
 
 ### Workflow
 
@@ -43,7 +43,7 @@ All scripts are self contained and should be executed from the command line or u
 
 If access to a high performance cluster is not provided, please execute the aforementioned scripts using `torchrun` directly from your command line, omitting the `--standalone` flag and the `--nproc_per_node` indicator.
 
-Note that according to the number of accessiable GPUs and the total amount of accessiable VRAM per GPU, the batch size (i.e., per GPU) and the number of accumulation steps may need to be adjusted. For an overview of the hyperparameter settings used in this study, please refer to Appendix A in the study's [report](https://github.com/jmnolte/thesis/tree/master/report).
+Note that according to the number of accessiable GPUs and the total amount of accessiable VRAM per GPU, the batch size (i.e., per GPU) and the number of accumulation steps may need to be adjusted correspondingly. For an overview of the hyperparameter settings used in this study, please refer to Appendix A in the study's [report](https://github.com/jmnolte/thesis/tree/master/report).
 
 ## License
 
