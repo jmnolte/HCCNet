@@ -1,14 +1,38 @@
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
 from torch.autograd import Variable
 import os
 import time
 import copy
 import numpy as np
 import matplotlib.pyplot as plt
-from preprocessing import DataLoader
-from models import ResNet
-from models import EnsembleModel
+from preprocessing import (
+    DatasetPreprocessor, 
+    GroupStratifiedSplit
+)
 from utils import ReproducibilityUtils
+from monai.transforms import (
+    Compose,
+    LoadImaged,
+    EnsureChannelFirstd,
+    Orientationd,
+    Resized,
+    ConcatItemsd,
+    ScaleIntensityRangePercentilesd,
+    NormalizeIntensityd,
+    GridPatchd,
+    SqueezeDimd,
+    CenterSpatialCropd,
+    ToTensord
+)
+from monai.data import (
+    DataLoader,
+    CacheDataset,
+    DistributedSampler
+)
+from monai.networks.nets import milmodel
 import argparse
 import torchmetrics
 
@@ -16,11 +40,13 @@ class Trainer:
     
     def __init__(
             self, 
-            model: torch.nn.Module, 
-            version: str, 
+            net: torch.nn.Module, 
+            backbone: str, 
+            distributed: bool,
             dataloaders: dict, 
             learning_rate: float, 
             weight_decay: float,
+            weights: torch.Tensor,
             output_dir: str,
             ) -> None:
 
@@ -36,68 +62,66 @@ class Trainer:
             weight_decay (float): Weight decay.
             output_dir (str): Output directory.
         '''
-        try: 
-            assert any(version == version_item for version_item in ['resnet10','resnet18','resnet34','resnet50','resnet101','resnet152','resnet200','ensemble'])
-        except AssertionError:
-            print('Invalid version. Please choose from: resnet10, resnet18, resnet34, resnet50, resnet101, resnet152, resnet200, ensemble')
-            exit(1)
-
-        self.gpu_id = int(os.environ['LOCAL_RANK'])
-        self.model = model.to(self.gpu_id)
-        self.version = version
+        if distributed:
+            self.gpu_id = int(os.environ['LOCAL_RANK'])
+            self.model = net.to(self.gpu_id)
+            self.model = nn.parallel.DistributedDataParallel(self.model, device_ids=[self.gpu_id])
+        else:
+            self.gpu_id = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            self.model = net.to(self.gpu_id)
+        self.backbone = backbone
         self.dataloaders = dataloaders
         self.output_dir = output_dir
-        self.epochs_run = 0
-        self.snapshot_path = os.path.join(output_dir, 'snapshots' + version + '_' + 'snapshot.pth')
-        if self.epochs_run != 0 and os.path.exists(self.snapshot_path):
-            print('Loading snapshot')
-            self.load_snapshot(self.snapshot_path)
-        self.model = torch.nn.parallel.DistributedDataParallel(self.model, device_ids=[self.gpu_id])
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+        # self.epochs_run = 0
+        # self.snapshot_path = os.path.join(output_dir, 'snapshots' + version + '_' + 'snapshot.pth')
+        # if self.epochs_run != 0 and os.path.exists(self.snapshot_path):
+        #     print('Loading snapshot')
+        #     self.load_snapshot(self.snapshot_path)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=learning_rate, weight_decay=weight_decay)
         # weights = 759 / (2 * torch.Tensor([679, 80])).to(self.gpu_id)
         # self.criterion = FocalLoss(gamma=2, weight=weights).to(self.gpu_id)
-        self.criterion = torch.nn.CrossEntropyLoss().to(self.gpu_id)
+        self.criterion = nn.CrossEntropyLoss(weight=weights.to(self.gpu_id)).to(self.gpu_id)
     
-    def load_snapshot(
-            self, 
-            snapshot_path: str
-            ) -> dict:
+    # def load_snapshot(
+    #         self, 
+    #         snapshot_path: str
+    #         ) -> dict:
 
-        '''
-        Load a snapshot of the model.
+    #     '''
+    #     Load a snapshot of the model.
 
-        Args:
-            snapshot_path (str): Path to snapshot.
-        '''
-        snapshot = torch.load(snapshot_path)
-        self.model.load_state_dict(snapshot['MODEL_STATE'])
-        self.epochs_run = snapshot['EPOCHS_RUN']
-        print('Resuming training from epoch:'.format(self.epochs_run))
+    #     Args:
+    #         snapshot_path (str): Path to snapshot.
+    #     '''
+    #     snapshot = torch.load(snapshot_path)
+    #     self.model.load_state_dict(snapshot['MODEL_STATE'])
+    #     self.epochs_run = snapshot['EPOCHS_RUN']
+    #     print('Resuming training from epoch:'.format(self.epochs_run))
 
-    def save_snapshot(
-            self, 
-            epoch: int
-            ) -> None:
+    # def save_snapshot(
+    #         self, 
+    #         epoch: int
+    #         ) -> None:
         
-        '''
-        Save a snapshot of the model.
+    #     '''
+    #     Save a snapshot of the model.
 
-        Args:
-            epoch (int): Current epoch.
-        '''
-        snapshot = {}
-        snapshot['MODEL_STATE'] = self.model.module.state_dict()
-        snapshot['EPOCHS_RUN'] = epoch
-        folder_name = self.version + '_' + 'snapshot.pth'
-        folder_path = os.path.join(self.output_dir, 'snapshots', folder_name)
-        folder_path_root = os.path.join(self.output_dir, 'snapshots')
+    #     Args:
+    #         epoch (int): Current epoch.
+    #     '''
+    #     snapshot = {}
+    #     snapshot['MODEL_STATE'] = self.model.module.state_dict()
+    #     snapshot['EPOCHS_RUN'] = epoch
+    #     folder_name = self.version + '_' + 'snapshot.pth'
+    #     folder_path = os.path.join(self.output_dir, 'snapshots', folder_name)
+    #     folder_path_root = os.path.join(self.output_dir, 'snapshots')
 
-        if os.path.exists(folder_path):
-            os.remove(folder_path)
-        elif not os.path.exists(folder_path_root):
-            os.makedirs(folder_path_root)
-        torch.save(snapshot, folder_path)
-        print('Epoch {}: Training snapshot saved at snapshot.pth'.format(epoch))
+    #     if os.path.exists(folder_path):
+    #         os.remove(folder_path)
+    #     elif not os.path.exists(folder_path_root):
+    #         os.makedirs(folder_path_root)
+    #     torch.save(snapshot, folder_path)
+    #     print('Epoch {}: Training snapshot saved at snapshot.pth'.format(epoch))
 
     def save_output(
             self, 
@@ -119,11 +143,11 @@ class Trainer:
             exit(1)
         
         if output_type == 'weights':
-            folder_name = self.version + '_weights.pth'
+            folder_name = self.backbone + '_weights.pth'
         elif output_type == 'history':
-            folder_name = self.version + '_hist.npy'
+            folder_name = self.backbone + '_hist.npy'
         elif output_type == 'preds':
-            folder_name = self.version + '_preds.npy'
+            folder_name = self.backbone + '_preds.npy'
         folder_path = os.path.join(self.output_dir, 'model_' + output_type, folder_name)
         folder_path_root = os.path.join(self.output_dir, 'model_' + output_type)
 
@@ -210,7 +234,7 @@ class Trainer:
         epoch_loss_values = []
         self.model.eval()
         with torch.no_grad():
-            for step, batch_data in enumerate(self.dataloaders['val']):
+            for batch_data in self.dataloaders['val']:
                 inputs, labels = batch_data['image'].to(self.gpu_id), batch_data['label'].to(self.gpu_id)
                 outputs = self.model(inputs.as_tensor())
                 preds = torch.argmax(outputs, 1)
@@ -230,6 +254,7 @@ class Trainer:
             self, 
             metric: torchmetrics, 
             min_epochs: int, 
+            val_every: int,
             accum_steps: int, 
             early_stopping: bool, 
             patience: int
@@ -241,6 +266,7 @@ class Trainer:
         Args:
             metric (torch.nn): Metric to optimize.
             min_epochs (int): Minimum number of epochs to train.
+            val_every (int): Number of epochs to wait before validation.
             accum_steps (int): Number of steps to accumulate gradients.
             patience (int): Number of epochs to wait before early stopping.
             early_stopping (bool): Whether to use early stopping.
@@ -255,26 +281,26 @@ class Trainer:
         for epoch in range(max_epochs):
             start_time = time.time()
             train_loss, train_f1score = self.train(metric, epoch, accum_steps)
-            val_loss, val_f1score = self.validate(metric, epoch)
+            history['train_loss'].append(train_loss)
+            history['train_f1score'].append(train_f1score.cpu().item())
+            if (epoch + 1) % val_every == 0:
+                val_loss, val_f1score = self.validate(metric, epoch)
+                history['val_loss'].append(val_loss)
+                history['val_f1score'].append(val_f1score.cpu().item())
+                if self.gpu_id == 0:
+                    if val_loss < best_loss:
+                        best_loss = val_loss
+                        f1score = val_f1score
+                        counter = 0
+                        print('New best validation loss. Saving model weights...')
+                        best_weights = copy.deepcopy(self.model.state_dict())
+                    elif val_loss >= best_loss:
+                        counter += 1
+                        if epoch >= min_epochs and counter >= patience:
+                            early_stop_flag += 1
             train_time = time.time() - start_time
             if self.gpu_id == 0:
                 print(f'Epoch {epoch} complete in {train_time // 60:.0f}min {train_time % 60:.0f}sec')
-            history['train_loss'].append(train_loss)
-            history['train_f1score'].append(train_f1score.cpu().item())
-            history['val_loss'].append(val_loss)
-            history['val_f1score'].append(val_f1score.cpu().item())
-
-            if self.gpu_id == 0:
-                if val_loss < best_loss:
-                    best_loss = val_loss
-                    f1score = val_f1score
-                    counter = 0
-                    print('New best validation loss. Saving model weights...')
-                    best_weights = copy.deepcopy(self.model.state_dict())
-                elif val_loss >= best_loss:
-                    counter += 1
-                    if epoch >= min_epochs and counter >= patience:
-                        early_stop_flag += 1
                 
             torch.distributed.all_reduce(early_stop_flag, op=torch.distributed.ReduceOp.SUM)
             if early_stopping:
@@ -310,8 +336,8 @@ class Trainer:
         elif metric == 'f1score':
             metric_label = 'F1-Score'
 
-        file_name = self.version + '_hist.npy'
-        plot_name = self.version + '_' + metric + '.png'
+        file_name = self.backbone + '_hist.npy'
+        plot_name = self.backbone + '_' + metric + '.png'
         history = np.load(os.path.join(self.output_dir, 'model_history', file_name), allow_pickle='TRUE').item()
         plt.plot(history['train_' + metric], color='dimgray',)
         plt.plot(history['val_' + metric], color='darkgray',)
@@ -327,7 +353,7 @@ class Trainer:
         plt.savefig(file_path, dpi=300, bbox_inches="tight")
         plt.close()
 
-class FocalLoss(torch.nn.Module):
+class FocalLoss(nn.Module):
 
     '''
     Focal loss implementation using cross entropy loss.
@@ -365,7 +391,7 @@ class FocalLoss(torch.nn.Module):
             input (torch.Tensor): Input tensor.
             target (torch.Tensor): Target tensor.
         '''
-        ce_loss = torch.nn.functional.cross_entropy(input, target, weight=self.weight, reduction="none")
+        ce_loss = F.cross_entropy(input, target, weight=self.weight, reduction="none")
         p_t = torch.exp(-ce_loss)
         loss = (1 - p_t)**self.gamma * ce_loss
         if self.reduction == "mean":
@@ -383,36 +409,44 @@ def parse_args() -> argparse.Namespace:
         argparse.Namespace: Arguments.
     '''
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--version", required=True, type=str, 
-                        help="Model version to train")
+    parser.add_argument("--mil-mode", default='att', type=str,
+                        help="MIL pooling mode. Can be mean, max, att, att_trans, and att_trans_pyramid. Defaults to att.")
+    parser.add_argument("--backbone", type=str, 
+                        help="Model encoder to use. Defaults to ResNet50.")
     parser.add_argument("--pretrained", action='store_true',
-                        help="Flag to use pretrained weights")
-    parser.add_argument("--feature-extraction", action='store_true',
-                        help="Flag to use feature extraction")
-    parser.add_argument("--epochs", required=True, type=int, 
-                        help="Number of epochs to train for")
+                        help="Flag to use pretrained weights.")
+    parser.add_argument("--distributed", action='store_true',
+                        help="Flag to use distributed training.")
+    parser.add_argument("--test-run", action='store_true',
+                        help="Flag to run a test run.")
+    parser.add_argument("--num-classes", default=2, type=int,
+                        help="Number of output classes. Defaults to 2.")
+    parser.add_argument("--min-epochs", default=10, type=int, 
+                        help="Minimum number of epochs to train for. Defaults to 10.")
+    parser.add_argument("--val-interval", default=2, type=int,
+                        help="Number of epochs to wait before running validation. Defaults to 2.")
     parser.add_argument("--batch-size", default=4, type=int, 
-                        help="Batch size to use for training")
+                        help="Batch size to use for training. Defaults to 4.")
+    parser.add_argument("--num-patches", default=64, type=int,
+                        help="Number of patches to use for training. Defaults to None.")
+    parser.add_argument("--num-workers", default=4, type=int,
+                        help="Number of workers to use for training. Defaults to 4.")
     parser.add_argument("--accum-steps", default=1, type=int, 
-                        help="Accumulation steps to take before computing the gradient")
+                        help="Accumulation steps to take before computing the gradient. Defaults to 1.")
     parser.add_argument("--train-ratio", default=0.8, type=float, 
-                        help="Ratio of training data to use for training")
+                        help="Ratio of data to use for training. Defaults to 0.8.")
     parser.add_argument("--learning-rate", default=1e-4, type=float, 
-                        help="Learning rate to use for training")
+                        help="Learning rate to use for training. Defaults to 1e-4.")
     parser.add_argument("--weight-decay", default=0.0, type=float, 
-                        help="Weight decay to use for training")
-    parser.add_argument("--early-stopping", default=True, type=bool, 
-                        help="Flag to use early stopping")
-    parser.add_argument("--patience", default=10, type=int, 
-                        help="Patience to use for early stopping")
-    parser.add_argument("--modality-list", default=MODALITY_LIST, nargs='+', 
+                        help="Weight decay to use for training. Defaults to 0.")
+    parser.add_argument("--early-stopping", action='store_true',
+                        help="Flag to use early stopping.")
+    parser.add_argument("--patience", default=5, type=int, 
+                        help="Patience to use for early stopping. Defaults to 5.")
+    parser.add_argument("--mod-list", default=MODALITY_LIST, nargs='+', 
                         help="List of modalities to use for training")
     parser.add_argument("--seed", default=123, type=int, 
                         help="Seed to use for reproducibility")
-    parser.add_argument("--weighted-sampler", action='store_true',
-                        help="Flag to use a weighted sampler")
-    parser.add_argument("--quant-images", action='store_true',
-                        help="Flag to run analysis on quant images")
     parser.add_argument("--data-dir", default=DATA_DIR, type=str, 
                         help="Path to data directory")
     parser.add_argument("--results-dir", default=RESULTS_DIR, type=str, 
@@ -434,45 +468,38 @@ def load_train_objs(
     Returns:
         tuple: Training objects consisting of the data loader, the model, and the performance metric.
     '''
-    dataloader = DataLoader(args.data_dir, args.modality_list)
-    data_dict = dataloader.create_data_dict()
-    dataloader_dict = dataloader.load_data(data_dict, args.train_ratio, args.batch_size, 2, args.weighted_sampler, args.quant_images)
-
-    if args.version == 'ensemble':
-        versions = ['resnet10','resnet18','resnet34','resnet50']
-        resnet10 = ResNet('resnet10', 2, len(args.modality_list), args.pretrained, args.feature_extraction, args.weights_dir)
-        resnet18 = ResNet('resnet18', 2, len(args.modality_list), args.pretrained, args.feature_extraction, args.weights_dir)
-        resnet34 = ResNet('resnet34', 2, len(args.modality_list), args.pretrained, args.feature_extraction, args.weights_dir)
-        resnet50 = ResNet('resnet50', 2, len(args.modality_list), args.pretrained, args.feature_extraction, args.weights_dir)
-
-        for idx, model in enumerate([resnet10, resnet18, resnet34, resnet50]):
-            model_dict = model.state_dict()
-            if idx == 0:
-                version = 'resnet10'
-            elif idx == 1:
-                version = 'resnet18'
-            elif idx == 2:
-                version = 'resnet34'
-            elif idx == 3:
-                version = 'resnet50'
-            weights_dict = torch.load(os.path.join(args.results_dir, 'model_weights', version + '_weights.pth'))
-            weights_dict = {k.replace('module.', ''): v for k, v in weights_dict.items()}
-            model_dict.update(weights_dict)
-            model.load_state_dict(model_dict)
-        print('Model weights are updated.')
-        model = EnsembleModel(resnet10, resnet18, resnet34, resnet50, versions, 2, args.results_dir)
+    data_dict, label_df = DatasetPreprocessor(data_dir=DATA_DIR, test_run=args.test_run).load_imaging_data(MODALITY_LIST)
+    train, val_test = GroupStratifiedSplit(split_ratio=args.train_ratio).split_dataset(label_df)
+    val, test = GroupStratifiedSplit(split_ratio=0.5).split_dataset(val_test)
+    split_dict = GroupStratifiedSplit().convert_to_dict(train, val, test, data_dict)
+    transforms = Compose([
+            LoadImaged(keys=args.mod_list, image_only=False),
+            EnsureChannelFirstd(keys=args.mod_list),
+            Orientationd(keys=args.mod_list, axcodes='PLI'),
+            Resized(keys=args.mod_list, spatial_size=(256, 256, 64)),
+            ConcatItemsd(keys=args.mod_list, name='image', dim=0),
+            # ScaleIntensityRangePercentilesd(keys='image', lower=5, upper=95, b_min=0, b_max=1, clip=True, channel_wise=True),
+            NormalizeIntensityd(keys='image', channel_wise=True),
+            GridPatchd(keys='image', patch_size=(256, 256, 1), num_patches=args.num_patches),
+            SqueezeDimd(keys='image', dim=-1),
+            CenterSpatialCropd(keys='image', roi_size=(args.num_patches, 224, 224)),
+            ToTensord(keys=['image', 'label'])
+        ])
+    datasets = {x: CacheDataset(data=split_dict[x], transform=transforms) for x in ['train','val','test']}
+    if args.distributed:
+        sampler = {x: DistributedSampler(dataset=datasets[x], even_divisible=True, shuffle=(True if x == 'train' else False)) for x in ['train','val','test']}
     else:
-        model = ResNet(args.version, 2, len(args.modality_list), args.pretrained, args.feature_extraction, args.weights_dir)
-    model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
-
-    if args.weighted_sampler:
-        print('Model is trained using weighted random sampling')
-    else:
-        print('Model is trained using focal loss')
+        sampler = {x: None for x in ['train','val','test']}
+    dataloader = {x: DataLoader(datasets[x], batch_size=args.batch_size, shuffle=(True if x == 'train' and sampler[x] is None else False), num_workers=args.num_workers, sampler=sampler[x], pin_memory=True) for x in ['train','val','test']}
+    
+    net = milmodel(args.num_classes, args.mil_mode, args.pretrained, args.backbone)
+    if args.distributed:
+        net = torch.nn.SyncBatchNorm.convert_sync_batchnorm(net)
 
     metric = torchmetrics.F1Score(task='binary')
-    model.metric = metric
-    return dataloader_dict, model, metric
+    net.metric = metric
+    weights = 759 / (2 * torch.Tensor([679, 80]))
+    return dataloader, net, metric, weights
 
 def setup() -> None:
 
@@ -504,14 +531,16 @@ def main(
     # Set a seed for reproducibility.
     ReproducibilityUtils.seed_everything(args.seed)
     # Setup distributed training.
-    setup()
+    if args.distributed:
+        setup()
     # Load the dataloaders, model, and model metric.
-    dataloader_dict, model, metric = load_train_objs(args)
+    dataloader, net, metric, weights = load_train_objs(args)
     # Train the model using the training data and validate the model on the validation data following each epoch.
-    trainer = Trainer(model, args.version, dataloader_dict, args.learning_rate, args.weight_decay, args.results_dir)
-    trainer.training_loop(metric, args.epochs, args.accum_steps, args.early_stopping, args.patience)
+    trainer = Trainer(net, args.backbone, args.distributed, dataloader, args.learning_rate, args.weight_decay, weights, args.results_dir)
+    trainer.training_loop(metric, args.epochs, args.val_interval, args.accum_steps, args.early_stopping, args.patience)
     # Cleanup distributed training.
-    cleanup()
+    if args.distributed:
+        cleanup()
     # Plot the training and validation loss and F1 score.
     trainer.visualize_training('loss')
     trainer.visualize_training('f1score')

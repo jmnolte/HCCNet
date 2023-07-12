@@ -2,18 +2,27 @@ import torch
 import monai
 import os
 
-class ResNet(torch.nn.Module):
+class MILModel(monai.networks.nets.MILModel):
 
     def __init__(
             self, 
-            version: str, 
-            num_out_classes: int, 
-            num_in_channels: int, 
-            pretrained: bool, 
-            feature_extraction: bool, 
-            weights_path: str
+            num_classes: int,
+            mil_mode: str,
+            pretrained: bool,
+            backbone: str,
+            backbone_num_features: int,
+            trans_blocks: int = 4,
+            trans_dropout: float = 0.0,
             ) -> None:
-        super().__init__()
+        super().__init__(
+            num_classes=num_classes,
+            mil_mode=mil_mode.lower(),
+            pretrained=pretrained,
+            backbone=backbone,
+            backbone_num_features=backbone_num_features,
+            trans_blocks=trans_blocks,
+            trans_dropout=trans_dropout
+        )
 
         '''
         Define the model's version and set the number of input channels.
@@ -28,20 +37,20 @@ class ResNet(torch.nn.Module):
                 all layers are updated.
             weights_path (str): Path to the pretrained weights.
         '''
-        try: 
-            assert any(version == version_item for version_item in ['resnet10','resnet18','resnet34','resnet50','resnet101','resnet152','resnet200'])
-        except AssertionError:
-            print('Invalid version. Please choose from: resnet10, resnet18, resnet34, resnet50, resnet101, resnet152, resnet200')
-            exit(1)
+        if backbone.lower() not in ['resnet10','resnet18','resnet34','resnet50','resnet101','resnet152','resnet200']:
+            raise ValueError('Unsupported backbone model selected. Please choose from: resnet10, resnet18, resnet34, resnet50, resnet101, resnet152, resnet200')
+        if mil_mode.lower() not in ['mean', 'max', 'att', 'att_trans', 'att_trans_pyramid']:
+            raise ValueError('Unsupported mil_mode selected. Please choose from: mean, max, att, att_trans, att_trans_pyramid')
 
-        self.version = version
-        self.num_in_channels = num_in_channels
+        # if backbone != 'resnet50':
+
+        self.backbone = backbone
         self.pretrained = pretrained
-        if self.version == 'resnet10':
+        if self.backbone == 'resnet10':
             self.model = monai.networks.nets.resnet10(spatial_dims=3, n_input_channels=num_in_channels)
-        elif self.version == 'resnet18':
+        elif self.backbone == 'resnet18':
             self.model = monai.networks.nets.resnet18(spatial_dims=3, n_input_channels=num_in_channels)
-        elif self.version == 'resnet34':
+        elif self.backbone == 'resnet34':
             self.model = monai.networks.nets.resnet34(spatial_dims=3, n_input_channels=num_in_channels)
         elif self.version == 'resnet50':
             self.model = monai.networks.nets.resnet50(spatial_dims=3, n_input_channels=num_in_channels)
@@ -229,3 +238,7 @@ class EnsembleModel(torch.nn.Module):
             param.requires_grad = False
         for param in self.classifier.parameters():
             param.requires_grad = True 
+
+if __name__ == '__main__':
+    net = monai.networks.nets.MILModel(num_classes=2, backbone='resnet152')
+    print(net)

@@ -1,3 +1,4 @@
+from typing import Any
 import monai
 import numpy as np
 import glob
@@ -9,18 +10,16 @@ from natsort import natsorted
 from glob import glob
 import dicom2nifti
 import pandas as pd
-from sklearn.model_selection import train_test_split, GroupShuffleSplit
+from sklearn.model_selection import GroupShuffleSplit
 from utils import ReproducibilityUtils
 import argparse
 
-
-class DicomToNifti:
+class Dicom2NiftiConverter:
 
     def __init__(
             self, 
-            path: str
+            data_dir: str
             ) -> None:
-
         '''
         Initialize the data utils class.
 
@@ -28,15 +27,15 @@ class DicomToNifti:
             path (str): Path to the data.
         '''
 
-        self.dicom_dir = os.path.join(path, 'dicom')
-        self.nifti_dir = os.path.join(path, 'nifti')
+        self.data_dir = data_dir
+        self.dicom_dir = os.path.join(data_dir, 'dicom')
+        self.nifti_dir = os.path.join(data_dir, 'nifti')
         self.dicom_patients = glob(os.path.join(self.dicom_dir, '*'), recursive = True)
         self.nifti_patients = glob(os.path.join(self.nifti_dir, '*'), recursive = True)
 
     def get_dicom_observations(
             self
             ) -> list:
-
         '''
         Get list of existing observations.
 
@@ -54,19 +53,17 @@ class DicomToNifti:
     
     def convert_dicom_to_nifti(
             self, 
-            df_path: str
+            labels_dict: dict,
+            observation_list: list
             ) -> None:
-
         '''
         Convert dicom files into nifti file format.
 
         Args:
-            df_path (str): Path to the dataframe.
+            labels_dict (dict): Dictionary of labels.
+            observation_list (list): List of observations.
         '''
 
-        labels_dict = pd.read_csv(df_path).to_dict('list')
-        labels_dict['date'] = [str(date) for date in labels_dict['date']]
-        observation_list = self.get_dicom_observations()
         for entry in tqdm(observation_list):
             if entry in natsorted(list(zip(labels_dict['id'], labels_dict['date']))):
                 index = natsorted(list(zip(labels_dict['id'], labels_dict['date']))).index(entry)
@@ -88,24 +85,45 @@ class DicomToNifti:
             else:
                 print('File {} not found.'.format(entry))
 
-class PreprocessingUtils:
+    def __call__(
+            self,
+            ) -> None:
+        '''
+        Call the convert dicom to nifti function.
+        '''
+
+        labels_df = os.path.join(self.data_dir, 'labels/labels.csv')
+        try:
+            assert os.path.exists(labels_df)
+        except AssertionError:
+            print('Labels file not found.')
+            exit(1)
+        labels_dict = pd.read_csv(labels_df).to_dict('list')
+        labels_dict['date'] = [str(date) for date in labels_dict['date']]
+        observation_list = self.get_dicom_observations()
+        self.convert_dicom_to_nifti(labels_dict, observation_list)
+
+
+class DirectoryCleaner:
 
     def __init__(
             self, 
-            path: str
+            data_dir: str,
+            modality_list: list
             ) -> None:
 
         '''
-        Initialize the preprocessing utils class.
+        Initialize the directory cleaner class.
 
         Args:
             path (str): Path to the data.
+            modality_list (list): List of image modalities to keep.
         '''
-
-        self.nifti_dir = os.path.join(path, 'nifti')
-        self.dicom_dir = os.path.join(path, 'dicom')
+        self.nifti_dir = os.path.join(data_dir, 'nifti')
+        self.dicom_dir = os.path.join(data_dir, 'dicom')
         self.nifti_patients = glob(os.path.join(self.nifti_dir, '*'), recursive = True)
         self.dicom_patients = glob(os.path.join(self.dicom_dir, '*'), recursive = True)
+        self.modality_list = modality_list
 
     def extract_image_names(
             self
@@ -117,7 +135,6 @@ class PreprocessingUtils:
         Returns:
             image_list (list): List of images.
         '''
-
         image_list = []
         for observation in tqdm(natsorted(self.nifti_patients)):
             images = glob(os.path.join(observation, '*.nii.gz'))
@@ -128,23 +145,21 @@ class PreprocessingUtils:
 
     def clean_directory(
             self, 
-            image_list: list
             ) -> None:
 
         '''
-        Clean the directory.
-
-        Args:
-            image_list (list): List of images to keep.
+        Remove non-convertable images from the directory.
         '''
         for observation in tqdm(natsorted(self.nifti_patients)):
             images = glob(os.path.join(observation, '*.nii.gz'))
             for image in images:
                 image_head = os.path.split(image)[-1]
-                image_name = image_head.split('.')[0]
-                if image_name not in image_list:
+                modality = image_head.split('.')[0]
+                if modality not in self.modality_list:
                     os.remove(image)
                     print('Deleting {}.'.format(image))
+
+
 
     # def create_label_list(
     #         self, 
@@ -179,25 +194,279 @@ class PreprocessingUtils:
     #     labels_df = labels_df.dropna(subset=['date'])
     #     return labels_df.to_csv(os.path.join(path_root, 'labels.csv'), encoding='utf-8', index=False)
 
-class DataLoader:
+
+class ModalityCheck:
 
     def __init__(
             self, 
-            path: str, 
-            modality_list
+            data_dir: str
             ) -> None:
 
         '''
-        Initialize the data loader class.
+        Initialize the modality check class.
 
         Args:
-            path (str): Path to the data.
-            modality_list (list): List of modalities to load.
+            data_dir (str): Path to the data.
+            modalities (list): List of modalities to check.
         '''
-        self.modality_list = modality_list
-        self.nifti_dir = os.path.join(path, 'nifti')
+        self.nifti_dir = os.path.join(data_dir, 'nifti')
         self.nifti_patients = glob(os.path.join(self.nifti_dir, '*'), recursive = True)
-        self.label_dir = os.path.join(path, 'labels')
+        self.label_dir = os.path.join(data_dir, 'labels')
+
+    def assert_observation_completeness(
+            self,
+            modalities: list,
+            verbose: bool = True
+            ) -> list:
+
+        '''
+        Assert that all observations include all required images.
+
+        Args:
+            verbose (bool): Print the number of observations that include all required images.
+
+        Returns:
+            observation_list (list): List of observations that include all required images.
+        '''
+        image_names_list = [image_name + '.nii.gz' for image_name in modalities]
+        observation_list = []
+        for observation in natsorted(self.nifti_patients):
+            images = [image for image in glob(os.path.join(observation, '*.nii.gz'))]
+            common_prefix = os.path.commonprefix(images)
+            image_names = [image_name[len(common_prefix):] for image_name in images]
+            if all(names in image_names for names in image_names_list):
+                observation_list.append(observation)
+        if verbose:
+            print('{} out of {} observations include all required images'.format(len(observation_list), len(self.nifti_patients)))
+        return observation_list
+    
+
+class GroupStratifiedSplit(GroupShuffleSplit):
+
+    def __init__(
+            self,
+            split_ratio: float = 0.8,
+            n_splits: int = 100,
+        ) -> None:
+        super().__init__(
+            train_size=split_ratio, 
+            n_splits=n_splits
+        )
+        
+        '''
+        Initialize the group stratified split class.
+
+        Args:
+            test_ratio (float): Ratio of the data to be used for testing.
+            n_splits (int): Number of splits to perform.
+        '''
+        self.test_ratio = 1 - split_ratio
+
+    def select_best_split(
+            self,
+            dataframe: pd.DataFrame,
+            splits: list,
+            ) -> pd.DataFrame:
+
+        '''
+        Split the data into training, validation and test sets.
+
+        Args:
+            dataframe (pd.DataFrame): Dataframe to split.
+            splits (list): List of splits.
+
+        Returns:
+            dataframes (pd.DataFrame): Dataframes split according to the test ratio.
+        '''
+        label_ratio = 1
+        for split in splits:
+            set1, set2 = dataframe.iloc[split[0]], dataframe.iloc[split[1]]
+            if abs(set1['label'].mean() - set2['label'].mean()) < label_ratio:
+                if len(set1) / (1 - self.test_ratio) > len(set2) / self.test_ratio * 0.95 and len(set1) / (1 - self.test_ratio) < len(set1) / self.test_ratio * 1.05:
+                    label_ratio = abs(set1['label'].mean() - set2['label'].mean())
+                    best_split = split
+        return best_split
+    
+    def split_dataset(
+            self,
+            dataframe: pd.DataFrame,
+            ) -> pd.DataFrame:
+        
+        '''
+        Call the group stratified split class.
+
+        Args:
+            dataframe (pd.DataFrame): Dataframe to split.
+            group_id (str): Column name of the group id.
+
+        Returns:
+            dataframes (pd.DataFrame): Dataframes split according to the test ratio.
+        '''
+        splits = super().split(dataframe, groups=dataframe['patient_id'])
+        split1, split2 = self.select_best_split(dataframe, splits)
+        return dataframe.iloc[split1], dataframe.iloc[split2]
+    
+    @staticmethod
+    def convert_to_dict(
+            train: pd.DataFrame,
+            val: pd.DataFrame,
+            test: pd.DataFrame,
+            data_dict: dict
+            ) -> dict:
+        
+        '''
+        Convert the dataframes to dictionaries.
+
+        Args:
+            train (pd.DataFrame): Training dataframe.
+            val (pd.DataFrame): Validation dataframe.
+            test (pd.DataFrame): Test dataframe.
+            data_dict (dict): Dictionary of data.
+        
+        Returns:
+            split_dict (dict): Dictionary of split data.
+        '''
+        for idx, df in enumerate([train, val, test]):
+            name = 'training' if idx == 0 else 'validation' if idx == 1 else 'test'
+            print('{} total observations in {} set with {} positive cases ({} %).'.format(len(df), name, df['label'].sum(), round(df['label'].mean(), ndigits=3)))
+        split_dict = {'train': train[['uid']].values, 'val': val[['uid']].values, 'test': test[['uid']].values}
+        split_dict = {x: [patient for patient in data_dict if patient['uid'] in split_dict[x]] for x in ['train', 'val', 'test']} 
+
+        for phase in split_dict:
+            for patient in split_dict[phase]:
+                del patient['uid']
+        return split_dict
+        
+
+class DatasetPreprocessor(ModalityCheck):
+
+    def __init__(
+            self,
+            data_dir: str,
+            test_run: bool = False
+        ) -> dict:
+        super().__init__(
+            data_dir=data_dir
+        )
+        
+        '''
+        Initialize the dataset preprocessor class.
+
+        Args:
+            data_dir (str): Path to the data.
+            test_run (bool): Run the code on a small subset of the data.
+
+        Returns:
+            data_dict (dict): Dictionary containing the paths to the images and corresponding labels.
+        '''
+        self.nifti_dir = os.path.join(data_dir, 'nifti')
+        self.nifti_patients = glob(os.path.join(self.nifti_dir, '*'), recursive = True)
+        if test_run:
+            self.nifti_patients = self.nifti_patients[:20]
+        self.label_dir = os.path.join(data_dir, 'labels')
+
+    @staticmethod
+    def split_observations_by_modality(
+            observation_list: list, 
+            modality: str
+            ) -> list:
+
+        '''
+        Create a dictionary of paths to images.
+
+        Args:
+            observation_list (list): List of observations to split.
+            modality (str): Modality to split by.
+
+        Returns:
+            image_paths (list): List of paths to images.
+        '''
+        return [glob(os.path.join(observation, modality + '.nii.gz')) for observation in observation_list]
+    
+    @staticmethod
+    def create_label_dict(
+            observation_list: list, 
+            label_path: str
+            ) -> dict:
+
+        '''
+        Extract the labels from the dataframe.
+
+        Args:
+            observation_list (list): List of observations to create labels for.
+            label_path (str): Path to the dataframe containing the labels.
+
+        Returns:
+            label_dict (dict): Dictionary containing the labels.
+        '''
+        label_dict = {'uid': [], 'label': []}
+        labels_df = pd.read_csv(label_path)
+        for idx, row in labels_df.iterrows():
+            if labels_df.loc[idx, 'observation'] < 10:
+                labels_df.loc[idx, 'uid'] = row['id'] + '_00' + str(row['observation'])
+            else:
+                labels_df.loc[idx, 'uid'] = row['id'] + '_0' + str(row['observation'])
+        for observation in observation_list:
+            observation_id = os.path.basename(observation)
+            if observation_id not in labels_df['uid'].values:
+                continue
+            else:
+                label = labels_df.loc[labels_df['uid'] == observation_id, 'outcome'].values.item()
+            label_dict['label'].append(label)
+            label_dict['uid'].append(observation_id)
+        return [dict(zip(label_dict.keys(), vals)) for vals in zip(*(label_dict[k] for k in label_dict.keys()))]
+    
+    @staticmethod
+    def create_data_dict(
+            observation_list: list,
+            input_dict: dict
+            ) -> dict:
+        
+        '''
+        Transpose the dictionary.
+
+        Args:
+            observation_list (list): List of observations to create labels for.
+            input_dict (dict): Dictionary containing the paths to the images.
+        
+        Returns:
+            data_dict (dict): Dictionary containing the paths to the images.
+        '''
+        input_dict['uid'] = [os.path.basename(observation) for observation in observation_list]
+        return [dict(zip(input_dict.keys(), vals)) for vals in zip(*(input_dict[k] for k in input_dict.keys()))]
+    
+    def load_imaging_data(
+            self,
+            modalities: list,
+            label_column: str = 'label',
+            verbose: bool = True
+            ) -> list:
+        
+        '''
+        Call the dataset preprocessor class.
+
+        Args:
+            modality_list (list): List of modalities to load.
+            label_column (str): Column name of the label.
+            verbose (bool): Print statement indicating the number of observations that include all required images.
+
+        Returns:
+            data_dict (dict): Dictionary containing the paths to the images and corresponding labels.
+        '''
+        observation_list = super().assert_observation_completeness(modalities, verbose)
+        modality_dict = {modality: self.split_observations_by_modality(observation_list, modality) for modality in modalities}
+        label_dict = self.create_label_dict(observation_list, os.path.join(self.label_dir, 'labels.csv'))
+        label_df = pd.DataFrame.from_dict(label_dict)
+        label_df['patient_id'] = label_df['uid'].str.split('_').str[1]
+        data_dict = self.create_data_dict(observation_list, modality_dict)
+        for idx, patient in enumerate(data_dict):
+            if patient['uid'] in [label['uid'] for label in label_dict]:
+                data_dict[idx][label_column] = label_dict[[label['uid'] for label in label_dict].index(patient['uid'])][label_column]
+            else:
+                data_dict[idx][label_column] = None
+        data_dict = [patient for patient in data_dict if not (patient[label_column] == None)]
+        return data_dict, label_df
+
 
     def apply_transformations(
             self, 
@@ -213,15 +482,21 @@ class DataLoader:
         Returns:
             transforms (monai.transforms): Data transformations to be applied.
         '''
-
         preprocessing = monai.transforms.Compose([
-            monai.transforms.LoadImaged(keys=self.modality_list),
+            monai.transforms.LoadImaged(keys=self.modality_list, image_only=False),
             monai.transforms.EnsureChannelFirstd(keys=self.modality_list),
             monai.transforms.Orientationd(keys=self.modality_list, axcodes='PLI'),
-            monai.transforms.Resized(keys=self.modality_list, spatial_size=(96, 96, 96)),
+            monai.transforms.Resized(keys=self.modality_list, spatial_size=(512, 512, 128)),
             monai.transforms.ConcatItemsd(keys=self.modality_list, name='image', dim=0),
             monai.transforms.ScaleIntensityRangePercentilesd(keys='image', lower=5, upper=95, b_min=0, b_max=1, clip=True, channel_wise=True),
-            monai.transforms.NormalizeIntensityd(keys='image', channel_wise=True)
+            # monai.transforms.NormalizeIntensityd(keys='image', channel_wise=True),
+            # monai.transforms.CropForegroundd(keys=["image"], source_key="image"),
+            monai.transforms.GridPatchd(keys='image', patch_size=(128, 128, 1), sort_fn='min', num_patches=None),
+            # monai.transforms.RandSpatialCropSamplesd(keys='image', 
+            #                                          roi_size=(128, 128, 1), 
+            #                                          num_samples=32,
+            #                                          random_size=False),
+            monai.transforms.SqueezeDimd(keys='image', dim=-1),
         ])
         
         augmentation = monai.transforms.Compose([
@@ -237,243 +512,9 @@ class DataLoader:
         ])
 
         if dataset_indicator == 'train':
-            return monai.transforms.Compose([preprocessing, augmentation, postprocessing])
+            return monai.transforms.Compose([preprocessing, postprocessing])
         else:
             return monai.transforms.Compose([preprocessing, postprocessing])
-        
-    def assert_observation_completeness(
-            self, 
-            modality_list: list, 
-            print_statement: bool
-            ) -> list:
-
-        '''
-        Assert that all observations include all required images.
-
-        Args:
-            modality_list (list): List of modalities to load.
-            print_statement (bool): Print statement indicating the number of observations that include all required images.
-
-        Returns:
-            observation_list (list): List of observations that include all required images.
-        '''
-
-        image_names_list = [image_name + '.nii.gz' for image_name in modality_list]
-        observation_list = []
-        for observation in natsorted(self.nifti_patients):
-            images = [image for image in glob(os.path.join(observation, '*.nii.gz'))]
-            common_prefix = os.path.commonprefix(images)
-            image_names = [image_name[len(common_prefix):] for image_name in images]
-            if all(names in image_names for names in image_names_list):
-                observation_list.append(observation)
-        if print_statement:
-            print('{} out of {} observations include all required images'.format(len(observation_list), len(self.nifti_patients)))
-        return observation_list
-    
-    @staticmethod
-    def split_observations_by_modality(
-            observation_list: list, 
-            modality: str
-            ) -> list:
-
-        '''
-        Split the observation paths by modality.
-
-        Args:
-            observation_list (list): List of observations to split.
-            modality (str): Modality to split by.
-        
-        Returns:
-            observation_list (list): List of observations split by modality.
-        '''
-        return [glob(os.path.join(observation, modality + '.nii.gz')) for observation in observation_list]
-    
-    @staticmethod
-    def create_label_dict(
-            observation_list: list, 
-            df_path: str
-            ) -> dict:
-
-        '''
-        Create a list of labels.
-
-        Args:
-            observation_list (list): List of observations to create labels for.
-            df_path (str): Path to the dataframe containing the labels.
-
-        Returns:
-            label_dict (dict): Dictionary containing the labels.
-        '''
-        label_dict = {'uid': [], 'label': []}
-        labels_df = pd.read_csv(df_path)
-        for idx, row in labels_df.iterrows():
-            if labels_df.loc[idx, 'observation'] < 10:
-                labels_df.loc[idx, 'uid'] = row['id'] + '_00' + str(row['observation'])
-            else:
-                labels_df.loc[idx, 'uid'] = row['id'] + '_0' + str(row['observation'])
-        for observation in observation_list:
-            observation_id = os.path.basename(observation)
-            if observation_id not in labels_df['uid'].values:
-                continue
-            else:
-                label = labels_df.loc[labels_df['uid'] == observation_id, 'outcome'].values.item()
-            label_dict['label'].append(label)
-            label_dict['uid'].append(observation_id)
-        return label_dict
-            
-    def create_data_dict(
-            self
-            ) -> dict:
-
-        '''
-        Create a dictionary containing the data.
-
-        Returns:
-            data_dict (dict): Dictionary containing the data.
-        '''
-        observation_list = self.assert_observation_completeness(self.modality_list, True)
-        path_dict = {modality: self.split_observations_by_modality(observation_list, modality) for modality in self.modality_list}
-        label_dict = self.create_label_dict(observation_list, os.path.join(self.label_dir, 'labels.csv'))
-        path_dict['uid'] = [os.path.basename(observation) for observation in observation_list]
-        path_dict = [dict(zip(path_dict.keys(), vals)) for vals in zip(*(path_dict[k] for k in path_dict.keys()))]
-        label_dict = [dict(zip(label_dict.keys(), vals)) for vals in zip(*(label_dict[k] for k in label_dict.keys()))]
-        for idx, patient in enumerate(path_dict):
-            if patient['uid'] in [label['uid'] for label in label_dict]:
-                path_dict[idx]['label'] = label_dict[[label['uid'] for label in label_dict].index(patient['uid'])]['label']
-            else:
-                path_dict[idx]['label'] = None
-        return [patient for patient in path_dict if not (patient['label'] == None)]
-    
-    @staticmethod
-    def stratified_data_split(
-            df: pd.DataFrame, 
-            test_ratio: float, 
-            n_splits: int = 100
-            ) -> pd.DataFrame:
-
-        '''
-        Split the data into training, validation and test sets.
-
-        Args:
-            df (pd.DataFrame): Dataframe containing the data.
-            test_ratio (float): Ratio of the data to be used for testing.
-            n_splits (int): Number of splits to perform.
-
-        Returns:
-            dataframes (pd.DataFrame): Dataframes split according to the test ratio.
-        '''
-        label_ratio = 1
-        splits = GroupShuffleSplit(test_size=test_ratio, n_splits=n_splits).split(df, groups=df['patient_id'])
-        for split in splits:
-            set1, set2 = df.iloc[split[0]], df.iloc[split[1]]
-            if abs(set1['label'].mean() - set2['label'].mean()) < label_ratio:
-                if len(set1) / (1 - test_ratio) > len(set2) / test_ratio * 0.95 and len(set1) / (1 - test_ratio) < len(set1) / test_ratio * 1.05:
-                    label_ratio = abs(set1['label'].mean() - set2['label'].mean())
-                    best_split = split
-        return best_split
-
-    def split_dataset(
-            self, 
-            train_ratio: float, 
-            quant: bool
-            ) -> dict:
-
-        '''
-        Split the dataset into training, validation and test sets.
-
-        Args:
-            train_ratio (float): Ratio of the data to be used for training.
-            quant (bool): Whether to only use observations including quant images.
-
-        Returns:
-            dataframes (dict): Dictionary containing the dataframes split according to the train ratio.
-        '''
-        quant_list = self.assert_observation_completeness(['T1W_QNT'], False)
-        observation_list = self.assert_observation_completeness(self.modality_list, False)
-        quant_dict = {'uid': [os.path.split(observation)[-1] for observation in quant_list], 'quant': [1 for _ in range(len(quant_list))]}
-        label_dict = self.create_label_dict(observation_list, os.path.join(self.label_dir, 'labels.csv'))
-        quant_df = pd.DataFrame.from_dict(quant_dict)
-        label_df = pd.DataFrame.from_dict(label_dict)
-        df = pd.merge(label_df, quant_df, on='uid', how='left').fillna(0)
-        df['patient_id'] = df['uid'].str.split('_').str[1]
-        train, val_test = train_test_split(df, test_size=1-train_ratio, stratify=df['label'])
-        val, test = train_test_split(val_test, test_size=0.5, stratify=val_test['label'])
-        if quant:
-            for idx, df in enumerate([train, val, test]):
-                df = df.drop(df[df['quant'] == 0].index)
-                train, val, test = df if idx == 0 else train, df if idx == 1 else val, df if idx == 2 else test
-                name = 'training' if idx == 0 else 'validation' if idx == 1 else 'test'
-                print('{} total observations in {} set with {} positive cases ({} %).'.format(len(df), name, df['label'].sum(), round(df['label'].mean(), ndigits=3)))
-            return {'train': train[['uid']].values, 'val': val[['uid']].values, 'test': test[['uid']].values}
-        else:
-            for idx, df in enumerate([train, val, test]):
-                name = 'training' if idx == 0 else 'validation' if idx == 1 else 'test'
-                print('{} total observations in {} set with {} positive cases ({} %).'.format(len(df), name, df['label'].sum(), round(df['label'].mean(), ndigits=3)))
-            return {'train': train[['uid']].values, 'val': val[['uid']].values, 'test': test[['uid']].values}
-        
-    @staticmethod
-    def get_class_weights(
-            data_split_dict: dict
-            ) -> dict:
-
-        '''
-        Calculate the sample class weights per dataset.
-
-        Args:
-            data_split_dict (dict): Dictionary containing the dataframes split according to the train ratio.
-        
-        Returns:
-            class_weights (dict): Dictionary containing the class weights for each set.
-        '''
-        labels = {x: [patient['label'] for patient in data_split_dict[x]] for x in ['train', 'val', 'test']}
-        class_sample_count = {x: np.array([len(np.where(labels[x] == t)[0]) for t in np.unique(labels[x])]) for x in ['train', 'val', 'test']}
-        weights = {x: 1. / class_sample_count[x] for x in ['train', 'val', 'test']}
-        sample_weights = {x: np.array([weights[x][t] for t in labels[x]]) for x in ['train', 'val', 'test']}
-        sample_weights = {x: torch.from_numpy(sample_weights[x]) for x in ['train','val','test']}
-        return {x: sample_weights[x].double() for x in ['train','val','test']}  
-        
-    def load_data(
-            self, 
-            data_dict: dict, 
-            train_ratio: float, 
-            batch_size: int, 
-            num_workers: int, 
-            weighted_sampler: bool, 
-            quant_images: bool
-            ) -> dict:
-
-        '''
-        Load the data.
-
-        Args:
-            data_dict (dict): Dictionary containing the data.
-            train_ratio (float): Ratio of the data to be used for training.
-            batch_size (int): Batch size to use.
-            num_workers (int): Number of workers to use.
-            weighted_sampler (bool): Whether to use a weighted sampler.
-            quant_images (bool): Whether to only use observations including quant images.
-
-        Returns:
-            data_loaders (dict): Dictionary containing the data loaders.
-        '''
-        split_dict = self.split_dataset(train_ratio, quant_images)
-        data_split_dict = {x: [patient for patient in data_dict if patient['uid'] in split_dict[x]] for x in ['train', 'val', 'test']} 
-        sample_weights = self.get_class_weights(data_split_dict)     
-        for phase in data_split_dict:
-            for patient in data_split_dict[phase]:
-                del patient['uid']
-        persistent_cache = os.path.join(tempfile.mkdtemp(), 'persistent_cache')
-        datasets = {x: monai.data.PersistentDataset(data=data_split_dict[x], transform=self.apply_transformations(x), cache_dir=persistent_cache) for x in ['train','val','test']}
-        sampler = {x: [] for x in ['train','val','test']}
-        if weighted_sampler:
-            sampler['train'] = monai.data.DistributedWeightedRandomSampler(dataset=datasets['train'], weights=sample_weights['train'], even_divisible=True, shuffle=True)
-            sampler['val'] = monai.data.DistributedSampler(dataset=datasets['val'], even_divisible=True, shuffle=True)
-            sampler['test'] = monai.data.DistributedSampler(dataset=datasets['test'], even_divisible=True, shuffle=True)
-
-        else:
-            sampler = {x: monai.data.DistributedSampler(dataset=datasets[x], even_divisible=True, shuffle=True) for x in ['train','val','test']}
-        return {x: monai.data.DataLoader(datasets[x], batch_size=batch_size, shuffle=(sampler[x] is None), num_workers=num_workers, sampler=sampler[x], pin_memory=True) for x in ['train','val','test']}
-        
     
 def parse_args() -> argparse.Namespace:
 
@@ -554,7 +595,38 @@ def main(
 DATA_DIR = '/Users/noltinho/thesis/sensitive_data'
 IMAGES_TO_KEEP = ['T1W_OOP','T1W_IP','T1W_DYN','T1W_QNT','T2W_TES','T2W_TEL','DWI_b0','DWI_b150','DWI_b400','DWI_b800']
 MODALITY_LIST = ['T1W_OOP','T1W_IP','T1W_DYN','T2W_TES','T2W_TEL','DWI_b150','DWI_b400','DWI_b800']
+MOD_LIST = ['T1W_OOP']
 
 if __name__ == '__main__':
-    args = parse_args()
-    main(args)
+    # args = parse_args()
+    # main(args)
+    ReproducibilityUtils.seed_everything(123)
+    data_dict, label_df = DatasetPreprocessor(data_dir=DATA_DIR, test_run=True).load_imaging_data(MODALITY_LIST)
+    train, val_test = GroupStratifiedSplit(split_ratio=0.6).split_dataset(label_df)
+    val, test = GroupStratifiedSplit(split_ratio=0.5).split_dataset(val_test)
+    split_dict = GroupStratifiedSplit().convert_to_dict(train, val, test, data_dict)
+    transforms = monai.transforms.Compose([
+            monai.transforms.LoadImaged(keys=MOD_LIST, image_only=False),
+            monai.transforms.EnsureChannelFirstd(keys=MOD_LIST),
+            monai.transforms.Orientationd(keys=MOD_LIST, axcodes='PLI'),
+            monai.transforms.Resized(keys=MOD_LIST, spatial_size=(256, 256, 64)),
+            monai.transforms.ConcatItemsd(keys=MOD_LIST, name='image', dim=0),
+            monai.transforms.ScaleIntensityRangePercentilesd(keys='image', lower=5, upper=95, b_min=0, b_max=1, clip=True, channel_wise=True),
+            # monai.transforms.NormalizeIntensityd(keys='image', channel_wise=True),
+            monai.transforms.GridPatchd(keys='image', patch_size=(256, 256, 1), num_patches=None),
+            monai.transforms.SqueezeDimd(keys='image', dim=-1),
+            monai.transforms.CenterSpatialCropd(keys='image', roi_size=(64, 224, 224))
+        ])
+    distributed = False
+    batch_size = 4
+    num_workers = 4
+    datasets = {x: monai.data.CacheDataset(data=split_dict[x], transform=transforms) for x in ['train','val','test']}
+    if distributed:
+        sampler = {x: monai.data.DistributedSampler(dataset=datasets[x], even_divisible=True, shuffle=(True if x == 'train' else False)) for x in ['train','val','test']}
+    else:
+        sampler = {x: None for x in ['train','val','test']}
+    dataloader = {x: monai.data.DataLoader(datasets[x], batch_size=batch_size, shuffle=(True if x == 'train' and sampler[x] is None else False), num_workers=num_workers, sampler=sampler[x], pin_memory=True) for x in ['train','val','test']}
+    for i, batch in enumerate(dataloader['val']):
+        print(i, batch['image'].shape)
+        if i == 0:
+            break
