@@ -33,14 +33,12 @@ echo "Starting worker: "
 torchrun \
     --standalone \
     --nproc_per_node=4 /path_to_script_directory/training.py \
-    --version resnet50 \
+    --mil-mode att \
+    --backbone resnet50 \
     --pretrained \
-    --weighted-sampler \
-    --epochs 10 \
-    --batch-size 2 \
-    --accum-steps 8 \
-    --learning-rate 1e-4 \
-    --weight-decay 1e-5 \
+    --distributed \
+    --early-stopping \
+    --mod-list T1W-OOP T2W-TES DWI-b150 \
     --data-dir /path_to_data_directory \
     --results-dir /path_to_output_directory \
     --weights-dir /path_to_pretrained_weights
