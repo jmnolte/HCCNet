@@ -10,23 +10,10 @@ import numpy as np
 import matplotlib.pyplot as plt
 from preprocessing import (
     DatasetPreprocessor, 
-    GroupStratifiedSplit
+    GroupStratifiedSplit,
+    transformations
 )
 from utils import ReproducibilityUtils
-from monai.transforms import (
-    Compose,
-    LoadImaged,
-    EnsureChannelFirstd,
-    Orientationd,
-    Resized,
-    ConcatItemsd,
-    ScaleIntensityRangePercentilesd,
-    NormalizeIntensityd,
-    GridPatchd,
-    SqueezeDimd,
-    CenterSpatialCropd,
-    ToTensord
-)
 from monai.data import (
     DataLoader,
     CacheDataset,
@@ -192,9 +179,9 @@ class Trainer:
 
         for step, batch_data in enumerate(self.dataloaders['train']):
             inputs, labels = batch_data['image'].to(self.gpu_id), batch_data['label'].to(self.gpu_id)
-            outputs = self.model(inputs.as_tensor())
-            preds = torch.argmax(outputs, 1)
-            loss = self.criterion(outputs, labels)
+            logits = self.model(inputs.as_tensor())
+            preds = torch.argmax(logits, 1)
+            loss = self.criterion(logits, labels)
             loss /= accum_steps
             loss.backward()
             running_loss += loss.item()
@@ -217,7 +204,8 @@ class Trainer:
     def validate(
             self, 
             metric: torchmetrics, 
-            epoch: int
+            epoch: int,
+            num_patches: int
             ) -> tuple:
 
         '''
@@ -226,6 +214,7 @@ class Trainer:
         Args:
             metric (torchmetrics): Metric to use for validation.
             epoch (int): Current epoch.
+            num_patches (int): Number of patches to split the input into.
         
         Returns:
             tuple: Tuple containing the loss and f1 score.
@@ -236,9 +225,22 @@ class Trainer:
         with torch.no_grad():
             for batch_data in self.dataloaders['val']:
                 inputs, labels = batch_data['image'].to(self.gpu_id), batch_data['label'].to(self.gpu_id)
-                outputs = self.model(inputs.as_tensor())
-                preds = torch.argmax(outputs, 1)
-                loss = self.criterion(outputs, labels)
+
+                if inputs.shape[1] > num_patches:
+                    logits = []
+
+                    for i in range(int(np.ceil(inputs.shape[1] / float(num_patches)))):
+                        data_slice = inputs[:, i * num_patches : (i + 1) * num_patches]
+                        logits_slice = self.model(data_slice, no_head=True)
+                        logits.append(logits_slice)
+
+                    logits = torch.cat(logits, dim=1)
+                    logits = self.model.module.calc_head(logits)
+                else:
+                    logits = self.model(inputs.as_tensor())
+
+                preds = torch.argmax(logits, 1)
+                loss = self.criterion(logits, labels)
                 running_loss += loss.item()
                 metric.update(preds, labels)
 
@@ -257,7 +259,8 @@ class Trainer:
             val_every: int,
             accum_steps: int, 
             early_stopping: bool, 
-            patience: int
+            patience: int,
+            num_patches: int
             ) -> None:
 
         '''
@@ -270,6 +273,7 @@ class Trainer:
             accum_steps (int): Number of steps to accumulate gradients.
             patience (int): Number of epochs to wait before early stopping.
             early_stopping (bool): Whether to use early stopping.
+            num_patches (int): Number of slice patches to use for training.
         '''
         since = time.time()
         max_epochs = min_epochs * 100
@@ -284,7 +288,7 @@ class Trainer:
             history['train_loss'].append(train_loss)
             history['train_f1score'].append(train_f1score.cpu().item())
             if (epoch + 1) % val_every == 0:
-                val_loss, val_f1score = self.validate(metric, epoch)
+                val_loss, val_f1score = self.validate(metric, epoch, num_patches)
                 history['val_loss'].append(val_loss)
                 history['val_f1score'].append(val_f1score.cpu().item())
                 if self.gpu_id == 0:
@@ -429,6 +433,10 @@ def parse_args() -> argparse.Namespace:
                         help="Batch size to use for training. Defaults to 4.")
     parser.add_argument("--num-patches", default=64, type=int,
                         help="Number of patches to use for training. Defaults to None.")
+    parser.add_argument("--max-patches", default=64, type=int,
+                        help="Maximum number of slice patches to extract from 3D image. Defaults to 64.")
+    parser.add_argument("--image-size", default=224, type=int,
+                        help="Image size to use for training. Defaults to 224.")
     parser.add_argument("--num-workers", default=4, type=int,
                         help="Number of workers to use for training. Defaults to 4.")
     parser.add_argument("--accum-steps", default=1, type=int, 
@@ -472,20 +480,7 @@ def load_train_objs(
     train, val_test = GroupStratifiedSplit(split_ratio=args.train_ratio).split_dataset(label_df)
     val, test = GroupStratifiedSplit(split_ratio=0.5).split_dataset(val_test)
     split_dict = GroupStratifiedSplit().convert_to_dict(train, val, test, data_dict)
-    transforms = Compose([
-            LoadImaged(keys=args.mod_list, image_only=False),
-            EnsureChannelFirstd(keys=args.mod_list),
-            Orientationd(keys=args.mod_list, axcodes='PLI'),
-            Resized(keys=args.mod_list, spatial_size=(256, 256, 64)),
-            ConcatItemsd(keys=args.mod_list, name='image', dim=0),
-            # ScaleIntensityRangePercentilesd(keys='image', lower=5, upper=95, b_min=0, b_max=1, clip=True, channel_wise=True),
-            NormalizeIntensityd(keys='image', channel_wise=True),
-            GridPatchd(keys='image', patch_size=(256, 256, 1), num_patches=args.num_patches),
-            SqueezeDimd(keys='image', dim=-1),
-            CenterSpatialCropd(keys='image', roi_size=(args.num_patches, 224, 224)),
-            ToTensord(keys=['image', 'label'])
-        ])
-    datasets = {x: CacheDataset(data=split_dict[x], transform=transforms) for x in ['train','val','test']}
+    datasets = {x: CacheDataset(data=split_dict[x], transform=transformations(x, args.mod_list, args.num_patches, args.max_patches, args.image_size)) for x in ['train','val','test']}
     if args.distributed:
         sampler = {x: DistributedSampler(dataset=datasets[x], even_divisible=True, shuffle=(True if x == 'train' else False)) for x in ['train','val','test']}
     else:
@@ -537,7 +532,7 @@ def main(
     dataloader, net, metric, weights = load_train_objs(args)
     # Train the model using the training data and validate the model on the validation data following each epoch.
     trainer = Trainer(net, args.backbone, args.distributed, dataloader, args.learning_rate, args.weight_decay, weights, args.results_dir)
-    trainer.training_loop(metric, args.epochs, args.val_interval, args.accum_steps, args.early_stopping, args.patience)
+    trainer.training_loop(metric, args.epochs, args.val_interval, args.accum_steps, args.early_stopping, args.patience, args.num_patches)
     # Cleanup distributed training.
     if args.distributed:
         cleanup()

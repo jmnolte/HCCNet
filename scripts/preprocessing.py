@@ -1,10 +1,32 @@
-from typing import Any
-import monai
+from monai.transforms import (
+    Compose,
+    LoadImaged,
+    EnsureChannelFirstd,
+    Orientationd,
+    CropForegroundd,
+    Resized,
+    ConcatItemsd,
+    ScaleIntensityRangePercentilesd,
+    NormalizeIntensityd,
+    GridPatchd,
+    SqueezeDimd,
+    CenterSpatialCropd,
+    RandGridPatchd,
+    RandFlipd,
+    RandRotated,
+    RandZoomd,
+    RandGibbsNoised,
+    ToTensord
+)
+from monai import transforms
+from monai.data import (
+    DataLoader,
+    CacheDataset,
+    DistributedSampler
+)
 import numpy as np
 import glob
 import os
-import tempfile
-import torch
 from tqdm import tqdm
 from natsort import natsorted
 from glob import glob
@@ -13,6 +35,8 @@ import pandas as pd
 from sklearn.model_selection import GroupShuffleSplit
 from utils import ReproducibilityUtils
 import argparse
+import matplotlib.pyplot as plt
+
 
 class Dicom2NiftiConverter:
 
@@ -468,53 +492,71 @@ class DatasetPreprocessor(ModalityCheck):
         return data_dict, label_df
 
 
-    def apply_transformations(
-            self, 
-            dataset_indicator: str
-            ) -> monai.transforms:
+def transformations(
+        dataset: str,
+        modalities: list,
+        num_patches: int,
+        image_size: int
+        ) -> transforms:
+    '''
+    Perform data transformations on image and image labels.
 
-        '''
-        Perform data transformations on image and image labels.
+    Args:
+        dataset (str): Dataset to apply transformations on. Can be 'train', 'val' or 'test'.
 
-        Args:
-            dataset_indicator (str): Dataset to apply transformations on. Can be 'train', 'val' or 'test'.
-
-        Returns:
-            transforms (monai.transforms): Data transformations to be applied.
-        '''
-        preprocessing = monai.transforms.Compose([
-            monai.transforms.LoadImaged(keys=self.modality_list, image_only=False),
-            monai.transforms.EnsureChannelFirstd(keys=self.modality_list),
-            monai.transforms.Orientationd(keys=self.modality_list, axcodes='PLI'),
-            monai.transforms.Resized(keys=self.modality_list, spatial_size=(512, 512, 128)),
-            monai.transforms.ConcatItemsd(keys=self.modality_list, name='image', dim=0),
-            monai.transforms.ScaleIntensityRangePercentilesd(keys='image', lower=5, upper=95, b_min=0, b_max=1, clip=True, channel_wise=True),
-            # monai.transforms.NormalizeIntensityd(keys='image', channel_wise=True),
-            # monai.transforms.CropForegroundd(keys=["image"], source_key="image"),
-            monai.transforms.GridPatchd(keys='image', patch_size=(128, 128, 1), sort_fn='min', num_patches=None),
-            # monai.transforms.RandSpatialCropSamplesd(keys='image', 
-            #                                          roi_size=(128, 128, 1), 
-            #                                          num_samples=32,
-            #                                          random_size=False),
-            monai.transforms.SqueezeDimd(keys='image', dim=-1),
-        ])
+    Returns:
+        transforms (monai.transforms): Data transformations to be applied.
+    '''
+    resized_image = int(image_size * 1.5)
+    preprocessing = Compose([
+        LoadImaged(keys=modalities, image_only=False),
+        EnsureChannelFirstd(keys=modalities),
+        Orientationd(keys=modalities, axcodes='PLI'),
+        Resized(keys=modalities, spatial_size=(resized_image, resized_image, 64)),          
+        ConcatItemsd(keys=modalities, name='image', dim=0),
+        # ScaleIntensityRangePercentilesd(keys='image', lower=1, upper=99, b_min=0, b_max=1, clip=True, channel_wise=True),
+        NormalizeIntensityd(keys='image', channel_wise=True)
+    ])
         
-        augmentation = monai.transforms.Compose([
-            monai.transforms.RandRotated(keys='image', prob=0.2, range_x=np.pi/8),
-            monai.transforms.RandFlipd(keys='image', prob=0.2, spatial_axis=2),
-            monai.transforms.RandZoomd(keys='image', prob=0.2, min_zoom=1.1, max_zoom=1.3),
-            monai.transforms.RandGibbsNoised(keys='image', prob=0.1, alpha=(0.6, 0.8)),
-            monai.transforms.RandAdjustContrastd(keys='image', prob=0.1, gamma=(0.5, 2.0))
-        ])
-        
-        postprocessing = monai.transforms.Compose([
-            monai.transforms.ToTensord(keys=['image', 'label'])
-        ])
+    train_specific = Compose([
+        RandGridPatchd(
+            keys='image', 
+            patch_size=(resized_image, resized_image, 1), 
+            min_offset=(32, 32, 0),
+            max_offset=(32, 32, 0),
+            sort_fn='max', 
+            num_patches=num_patches, 
+            pad_mode='constant', 
+            constant_values=0),
+        SqueezeDimd(keys='image', dim=-1),
+        CenterSpatialCropd(keys='image', roi_size=(num_patches, image_size, image_size)), 
+        RandRotated(keys='image', prob=0.5, range_x=np.pi/8),
+        RandFlipd(keys='image', prob=0.5, spatial_axis=1),
+        RandFlipd(keys='image', prob=0.5, spatial_axis=2),
+        RandZoomd(keys='image', prob=0.5, min_zoom=0.9, max_zoom=1.3),
+        RandGibbsNoised(keys='image', prob=0.5, alpha=(0.6, 0.8))
+    ])
 
-        if dataset_indicator == 'train':
-            return monai.transforms.Compose([preprocessing, postprocessing])
-        else:
-            return monai.transforms.Compose([preprocessing, postprocessing])
+    val_test_specific = Compose([
+        GridPatchd(
+            keys='image', 
+            patch_size=(resized_image, resized_image, 1), 
+            pad_mode='constant', 
+            constant_values=0),
+        SqueezeDimd(keys='image', dim=-1),
+        CenterSpatialCropd(keys='image', roi_size=(-1, image_size, image_size)), 
+    ])
+        
+    postprocessing = Compose([
+        ToTensord(keys=['image', 'label'])
+    ])
+
+    if dataset == 'train':
+        return Compose([preprocessing, train_specific, postprocessing])
+    elif dataset in ['val', 'test']:
+        return Compose([preprocessing, val_test_specific, postprocessing])
+    else:
+        raise ValueError ("Dataset must be 'train', 'val' or 'test'.")
     
 def parse_args() -> argparse.Namespace:
 
@@ -600,33 +642,25 @@ MOD_LIST = ['T1W_OOP']
 if __name__ == '__main__':
     # args = parse_args()
     # main(args)
-    ReproducibilityUtils.seed_everything(123)
-    data_dict, label_df = DatasetPreprocessor(data_dir=DATA_DIR, test_run=True).load_imaging_data(MODALITY_LIST)
+    ReproducibilityUtils.seed_everything(124)
+    data_dict, label_df = DatasetPreprocessor(data_dir=DATA_DIR, test_run=True).load_imaging_data(MOD_LIST)
     train, val_test = GroupStratifiedSplit(split_ratio=0.6).split_dataset(label_df)
     val, test = GroupStratifiedSplit(split_ratio=0.5).split_dataset(val_test)
     split_dict = GroupStratifiedSplit().convert_to_dict(train, val, test, data_dict)
-    transforms = monai.transforms.Compose([
-            monai.transforms.LoadImaged(keys=MOD_LIST, image_only=False),
-            monai.transforms.EnsureChannelFirstd(keys=MOD_LIST),
-            monai.transforms.Orientationd(keys=MOD_LIST, axcodes='PLI'),
-            monai.transforms.Resized(keys=MOD_LIST, spatial_size=(256, 256, 64)),
-            monai.transforms.ConcatItemsd(keys=MOD_LIST, name='image', dim=0),
-            monai.transforms.ScaleIntensityRangePercentilesd(keys='image', lower=5, upper=95, b_min=0, b_max=1, clip=True, channel_wise=True),
-            # monai.transforms.NormalizeIntensityd(keys='image', channel_wise=True),
-            monai.transforms.GridPatchd(keys='image', patch_size=(256, 256, 1), num_patches=None),
-            monai.transforms.SqueezeDimd(keys='image', dim=-1),
-            monai.transforms.CenterSpatialCropd(keys='image', roi_size=(64, 224, 224))
-        ])
     distributed = False
     batch_size = 4
     num_workers = 4
-    datasets = {x: monai.data.CacheDataset(data=split_dict[x], transform=transforms) for x in ['train','val','test']}
+    datasets = {x: CacheDataset(data=split_dict[x], transform=transformations(x, MOD_LIST, 32, 224)) for x in ['train','val','test']}
     if distributed:
-        sampler = {x: monai.data.DistributedSampler(dataset=datasets[x], even_divisible=True, shuffle=(True if x == 'train' else False)) for x in ['train','val','test']}
+        sampler = {x: DistributedSampler(dataset=datasets[x], even_divisible=True, shuffle=(True if x == 'train' else False)) for x in ['train','val','test']}
     else:
         sampler = {x: None for x in ['train','val','test']}
-    dataloader = {x: monai.data.DataLoader(datasets[x], batch_size=batch_size, shuffle=(True if x == 'train' and sampler[x] is None else False), num_workers=num_workers, sampler=sampler[x], pin_memory=True) for x in ['train','val','test']}
+    dataloader = {x: DataLoader(datasets[x], batch_size=(batch_size if x == 'train' else 1), shuffle=(True if x == 'train' and sampler[x] is None else False), num_workers=num_workers, sampler=sampler[x], pin_memory=True) for x in ['train','val','test']}
     for i, batch in enumerate(dataloader['val']):
-        print(i, batch['image'].shape)
+        image, label = batch['image'], batch['label']
+        print(image.shape)
+        plt.imshow(image[0,16,0,...], cmap="gray")
+        plt.savefig('/Users/noltinho/thesis/miscellaneous/images/new3.png', dpi=300, bbox_inches="tight")
+        plt.close()
         if i == 0:
             break
