@@ -16,7 +16,9 @@ from monai.transforms import (
     RandRotated,
     RandZoomd,
     RandGibbsNoised,
-    ToTensord
+    ToTensord,
+    EnsureTyped,
+    ToDeviced
 )
 from monai import transforms
 from monai.data import (
@@ -24,6 +26,7 @@ from monai.data import (
     CacheDataset,
     DistributedSampler
 )
+import torch.distributed as dist
 import numpy as np
 import glob
 import os
@@ -386,7 +389,7 @@ class DatasetPreprocessor(ModalityCheck):
         self.nifti_dir = os.path.join(data_dir, 'nifti')
         self.nifti_patients = glob(os.path.join(self.nifti_dir, '*'), recursive = True)
         if test_run:
-            self.nifti_patients = self.nifti_patients[:20]
+            self.nifti_patients = self.nifti_patients[:100]
         self.label_dir = os.path.join(data_dir, 'labels')
 
     @staticmethod
@@ -496,7 +499,8 @@ def transformations(
         dataset: str,
         modalities: list,
         num_patches: int,
-        image_size: int
+        image_size: int,
+        device,
         ) -> transforms:
     '''
     Perform data transformations on image and image labels.
@@ -514,27 +518,33 @@ def transformations(
         Orientationd(keys=modalities, axcodes='PLI'),
         Resized(keys=modalities, spatial_size=(resized_image, resized_image, 64)),          
         ConcatItemsd(keys=modalities, name='image', dim=0),
-        # ScaleIntensityRangePercentilesd(keys='image', lower=1, upper=99, b_min=0, b_max=1, clip=True, channel_wise=True),
-        NormalizeIntensityd(keys='image', channel_wise=True)
+        ScaleIntensityRangePercentilesd(keys='image', lower=1, upper=99, b_min=0, b_max=1, clip=True, channel_wise=True)
     ])
         
     train_specific = Compose([
+        EnsureTyped(keys=['image', 'label'], device=device, track_meta=False),
         RandGridPatchd(
             keys='image', 
             patch_size=(resized_image, resized_image, 1), 
-            min_offset=(32, 32, 0),
-            max_offset=(32, 32, 0),
-            sort_fn='max', 
+            min_offset=(16, 16, 0),
+            max_offset=(16, 16, 0),
+            sort_fn='random', 
             num_patches=num_patches, 
             pad_mode='constant', 
             constant_values=0),
         SqueezeDimd(keys='image', dim=-1),
-        CenterSpatialCropd(keys='image', roi_size=(num_patches, image_size, image_size)), 
         RandRotated(keys='image', prob=0.5, range_x=np.pi/8),
         RandFlipd(keys='image', prob=0.5, spatial_axis=1),
         RandFlipd(keys='image', prob=0.5, spatial_axis=2),
-        RandZoomd(keys='image', prob=0.5, min_zoom=0.9, max_zoom=1.3),
-        RandGibbsNoised(keys='image', prob=0.5, alpha=(0.6, 0.8))
+        RandZoomd(
+            keys='image', 
+            prob=0.5, 
+            min_zoom=(1, 0.9, 0.9), 
+            max_zoom=(1, 1.3, 1.3),
+            padding_mode='constant', 
+            constant_values=0),
+        RandGibbsNoised(keys='image', prob=0.5, alpha=(0.1, 0.6)),
+        CenterSpatialCropd(keys='image', roi_size=(num_patches, image_size, image_size))
     ])
 
     val_test_specific = Compose([
@@ -544,17 +554,14 @@ def transformations(
             pad_mode='constant', 
             constant_values=0),
         SqueezeDimd(keys='image', dim=-1),
-        CenterSpatialCropd(keys='image', roi_size=(-1, image_size, image_size)), 
-    ])
-        
-    postprocessing = Compose([
-        ToTensord(keys=['image', 'label'])
+        CenterSpatialCropd(keys='image', roi_size=(-1, image_size, image_size)),
+        EnsureTyped(keys=['image', 'label'], device=device, track_meta=False)
     ])
 
     if dataset == 'train':
-        return Compose([preprocessing, train_specific, postprocessing])
+        return Compose([preprocessing, train_specific])
     elif dataset in ['val', 'test']:
-        return Compose([preprocessing, val_test_specific, postprocessing])
+        return Compose([preprocessing, val_test_specific])
     else:
         raise ValueError ("Dataset must be 'train', 'val' or 'test'.")
     
