@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.autograd import Variable
+from torch.cuda.amp import GradScaler, autocast
 import os
 import time
 import copy
@@ -15,9 +15,10 @@ from preprocessing import (
 )
 from utils import ReproducibilityUtils
 from monai.data import (
-    DataLoader,
+    ThreadDataLoader,
     CacheDataset,
-    DistributedSampler
+    DistributedSampler,
+    set_track_meta
 )
 from monai.networks.nets import milmodel
 import argparse
@@ -27,9 +28,9 @@ class Trainer:
     
     def __init__(
             self, 
-            net: torch.nn.Module, 
+            model: torch.nn.Module, 
             backbone: str, 
-            distributed: bool,
+            amp: bool,
             dataloaders: dict, 
             learning_rate: float, 
             weight_decay: float,
@@ -49,13 +50,16 @@ class Trainer:
             weight_decay (float): Weight decay.
             output_dir (str): Output directory.
         '''
-        if distributed:
-            self.gpu_id = int(os.environ['LOCAL_RANK'])
-            self.model = net.to(self.gpu_id)
-            self.model = nn.parallel.DistributedDataParallel(self.model, device_ids=[self.gpu_id])
-        else:
-            self.gpu_id = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-            self.model = net.to(self.gpu_id)
+        # if distributed:
+        self.gpu_id = int(os.environ['LOCAL_RANK'])
+        #     self.model = model.to(self.gpu_id)
+        #     self.model = nn.parallel.DistributedDataParallel(self.model, device_ids=[self.gpu_id])
+        # else:
+        #     self.gpu_id = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        #     self.model = model.to(self.gpu_id)
+        self.model = model
+        self.amp = amp
+        self.scaler = GradScaler(enabled=amp)
         self.backbone = backbone
         self.dataloaders = dataloaders
         self.output_dir = output_dir
@@ -64,7 +68,13 @@ class Trainer:
         # if self.epochs_run != 0 and os.path.exists(self.snapshot_path):
         #     print('Loading snapshot')
         #     self.load_snapshot(self.snapshot_path)
-        self.optimizer = optim.Adam(self.model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+        params = self.model.parameters()
+        if args.mil_mode in ["att_trans", "att_trans_pyramid"]:
+            params = [
+                {"params": list(self.model.module.attention.parameters()) + list(self.model.module.myfc.parameters()) + list(self.model.module.net.parameters())},
+                {"params": list(self.model.module.transformer.parameters()), "lr": 6e-6, "weight_decay": 0.1},
+            ]
+        self.optimizer = optim.Adam(params, lr=learning_rate, weight_decay=weight_decay)
         # weights = 759 / (2 * torch.Tensor([679, 80])).to(self.gpu_id)
         # self.criterion = FocalLoss(gamma=2, weight=weights).to(self.gpu_id)
         self.criterion = nn.CrossEntropyLoss(weight=weights.to(self.gpu_id)).to(self.gpu_id)
@@ -170,7 +180,7 @@ class Trainer:
         epoch_loss_values = []
         self.model.train()
         self.dataloaders['train'].sampler.set_epoch(epoch)
-        self.optimizer.zero_grad()
+        self.optimizer.zero_grad(set_to_none=True)
 
         if self.gpu_id == 0:
             print('-' * 10)
@@ -179,17 +189,24 @@ class Trainer:
 
         for step, batch_data in enumerate(self.dataloaders['train']):
             inputs, labels = batch_data['image'].to(self.gpu_id), batch_data['label'].to(self.gpu_id)
-            logits = self.model(inputs.as_tensor())
-            preds = torch.argmax(logits, 1)
-            loss = self.criterion(logits, labels)
+
+            with autocast(enabled=self.amp):
+                logits = self.model(inputs)
+                loss = self.criterion(logits, labels)
+
+            self.scaler.scale(loss).backward()
+            # logits = self.model(inputs.as_tensor())
+            # loss = self.criterion(logits, labels)
+            # loss.backward()
             loss /= accum_steps
-            loss.backward()
             running_loss += loss.item()
+            preds = torch.argmax(logits, 1)
             batch_f1score = metric(preds, labels)
     
             if ((step + 1) % accum_steps == 0) or (step + 1 == len(self.dataloaders['train'])):
-                self.optimizer.step()
-                self.optimizer.zero_grad()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                self.optimizer.zero_grad(set_to_none=True)
                 if self.gpu_id == 0:
                     print(f"{step + 1}/{len(self.dataloaders['train'])}, Batch Loss: {loss.item() * accum_steps:.4f}, Batch F1-Score: {batch_f1score.item():.4f}")
 
@@ -226,22 +243,38 @@ class Trainer:
             for batch_data in self.dataloaders['val']:
                 inputs, labels = batch_data['image'].to(self.gpu_id), batch_data['label'].to(self.gpu_id)
 
-                if inputs.shape[1] > num_patches:
-                    logits = []
+                with autocast(enabled=self.amp):
+                    if inputs.shape[1] > num_patches:
+                        logits = []
+                        logits2 = []
 
-                    for i in range(int(np.ceil(inputs.shape[1] / float(num_patches)))):
-                        data_slice = inputs[:, i * num_patches : (i + 1) * num_patches]
-                        logits_slice = self.model(data_slice, no_head=True)
-                        logits.append(logits_slice)
+                        for i in range(int(np.ceil(inputs.shape[1] / float(num_patches)))):
+                            data_slice = inputs[:, i * num_patches : (i + 1) * num_patches]
+                            logits_slice = self.model(data_slice, no_head=True)
+                            logits.append(logits_slice)
 
-                    logits = torch.cat(logits, dim=1)
-                    logits = self.model.module.calc_head(logits)
-                else:
-                    logits = self.model(inputs.as_tensor())
+                            if self.model.module.mil_mode == 'att_trans_pyramid':
+                                logits2.append([
+                                        self.model.module.extra_outputs["layer1"],
+                                        self.model.module.extra_outputs["layer2"],
+                                        self.model.module.extra_outputs["layer3"],
+                                        self.model.module.extra_outputs["layer4"]
+                                        ])
 
-                preds = torch.argmax(logits, 1)
-                loss = self.criterion(logits, labels)
+                        logits = torch.cat(logits, dim=1)
+                        if self.model.module.mil_mode == 'att_trans_pyramid':
+                            self.model.module.extra_outputs["layer1"] = torch.cat([l[0] for l in logits2], dim=0)
+                            self.model.module.extra_outputs["layer2"] = torch.cat([l[1] for l in logits2], dim=0)
+                            self.model.module.extra_outputs["layer3"] = torch.cat([l[2] for l in logits2], dim=0)
+                            self.model.module.extra_outputs["layer4"] = torch.cat([l[3] for l in logits2], dim=0)
+                        logits = self.model.module.calc_head(logits)
+                    else:
+                        logits = self.model(inputs)
+
+                    loss = self.criterion(logits, labels)
+
                 running_loss += loss.item()
+                preds = torch.argmax(logits, 1)
                 metric.update(preds, labels)
 
             epoch_loss = running_loss / len(self.dataloaders['val'])
@@ -420,24 +453,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pretrained", action='store_true',
                         help="Flag to use pretrained weights.")
     parser.add_argument("--distributed", action='store_true',
-                        help="Flag to use distributed training.")
+                        help="Flag to enable distributed training.")
+    parser.add_argument("--amp", action='store_true',
+                        help="Flag to enable automated mixed precision training.")
     parser.add_argument("--test-run", action='store_true',
-                        help="Flag to run a test run.")
+                        help="Flag to perform test run on subset (n=100) of the data.")
     parser.add_argument("--num-classes", default=2, type=int,
                         help="Number of output classes. Defaults to 2.")
     parser.add_argument("--min-epochs", default=10, type=int, 
                         help="Minimum number of epochs to train for. Defaults to 10.")
-    parser.add_argument("--val-interval", default=2, type=int,
+    parser.add_argument("--val-interval", default=1, type=int,
                         help="Number of epochs to wait before running validation. Defaults to 2.")
     parser.add_argument("--batch-size", default=4, type=int, 
                         help="Batch size to use for training. Defaults to 4.")
     parser.add_argument("--num-patches", default=64, type=int,
                         help="Number of patches to use for training. Defaults to None.")
-    parser.add_argument("--max-patches", default=64, type=int,
-                        help="Maximum number of slice patches to extract from 3D image. Defaults to 64.")
     parser.add_argument("--image-size", default=224, type=int,
                         help="Image size to use for training. Defaults to 224.")
-    parser.add_argument("--num-workers", default=4, type=int,
+    parser.add_argument("--num-workers", default=8, type=int,
                         help="Number of workers to use for training. Defaults to 4.")
     parser.add_argument("--accum-steps", default=1, type=int, 
                         help="Accumulation steps to take before computing the gradient. Defaults to 1.")
@@ -464,6 +497,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 def load_train_objs(
+        device_id,
         args: argparse.Namespace
         ) -> tuple:
 
@@ -476,25 +510,32 @@ def load_train_objs(
     Returns:
         tuple: Training objects consisting of the data loader, the model, and the performance metric.
     '''
-    data_dict, label_df = DatasetPreprocessor(data_dir=DATA_DIR, test_run=args.test_run).load_imaging_data(MODALITY_LIST)
+    data_dict, label_df = DatasetPreprocessor(data_dir=args.data_dir, test_run=args.test_run).load_imaging_data(args.mod_list)
     train, val_test = GroupStratifiedSplit(split_ratio=args.train_ratio).split_dataset(label_df)
     val, test = GroupStratifiedSplit(split_ratio=0.5).split_dataset(val_test)
     split_dict = GroupStratifiedSplit().convert_to_dict(train, val, test, data_dict)
-    datasets = {x: CacheDataset(data=split_dict[x], transform=transformations(x, args.mod_list, args.num_patches, args.max_patches, args.image_size)) for x in ['train','val','test']}
+    datasets = {x: CacheDataset(
+        data=split_dict[x], 
+        transform=transformations(x, args.mod_list, args.num_patches, args.image_size, device_id), 
+        num_workers=(args.num_workers if x == 'train' else int(args.num_workers / 2)),
+        copy_cache=False) for x in ['train','val']}
     if args.distributed:
-        sampler = {x: DistributedSampler(dataset=datasets[x], even_divisible=True, shuffle=(True if x == 'train' else False)) for x in ['train','val','test']}
+        sampler = {x: DistributedSampler(
+            dataset=datasets[x], 
+            even_divisible=True, 
+            shuffle=(True if x == 'train' else False)) for x in ['train','val']}
     else:
-        sampler = {x: None for x in ['train','val','test']}
-    dataloader = {x: DataLoader(datasets[x], batch_size=args.batch_size, shuffle=(True if x == 'train' and sampler[x] is None else False), num_workers=args.num_workers, sampler=sampler[x], pin_memory=True) for x in ['train','val','test']}
-    
-    net = milmodel(args.num_classes, args.mil_mode, args.pretrained, args.backbone)
-    if args.distributed:
-        net = torch.nn.SyncBatchNorm.convert_sync_batchnorm(net)
+        sampler = {x: None for x in ['train','val']}
+    dataloader = {x: ThreadDataLoader(
+        datasets[x], 
+        batch_size=(args.batch_size if x == 'train' else 1), 
+        shuffle=(True if x == 'train' and sampler[x] is None else False), 
+        num_workers=0, 
+        sampler=sampler[x]) for x in ['train','val']}
 
     metric = torchmetrics.F1Score(task='binary')
-    net.metric = metric
     weights = 759 / (2 * torch.Tensor([679, 80]))
-    return dataloader, net, metric, weights
+    return dataloader, metric, weights
 
 def setup() -> None:
 
@@ -528,11 +569,25 @@ def main(
     # Setup distributed training.
     if args.distributed:
         setup()
-    # Load the dataloaders, model, and model metric.
-    dataloader, net, metric, weights = load_train_objs(args)
+        rank = torch.distributed.get_rank()
+        num_devices = torch.cuda.device_count()
+        device_id = rank % num_devices
+        args.learning_rate = num_devices * args.learning_rate
+    else:
+        device_id = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    dataloader, metric, weights = load_train_objs(device_id, args)
+    model = milmodel.MILModel(args.num_classes, args.mil_mode, args.pretrained)
+    model.metric = metric
+    if args.distributed:
+        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+        model = model.to(device_id)
+        model = nn.parallel.DistributedDataParallel(model, device_ids=[device_id])
+    else:
+        model = model.to(device_id)
+    set_track_meta(False)
     # Train the model using the training data and validate the model on the validation data following each epoch.
-    trainer = Trainer(net, args.backbone, args.distributed, dataloader, args.learning_rate, args.weight_decay, weights, args.results_dir)
-    trainer.training_loop(metric, args.epochs, args.val_interval, args.accum_steps, args.early_stopping, args.patience, args.num_patches)
+    trainer = Trainer(model, args.backbone, args.amp, dataloader, args.learning_rate, args.weight_decay, weights, args.results_dir)
+    trainer.training_loop(metric, args.min_epochs, args.val_interval, args.accum_steps, args.early_stopping, args.patience, args.num_patches)
     # Cleanup distributed training.
     if args.distributed:
         cleanup()
