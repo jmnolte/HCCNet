@@ -13,16 +13,20 @@ from preprocessing import (
     GroupStratifiedSplit,
     transformations
 )
-from utils import ReproducibilityUtils
+# from utils import ReproducibilityUtils
 from monai.data import (
     ThreadDataLoader,
     CacheDataset,
+    SmartCacheDataset,
     DistributedSampler,
+    partition_dataset_classes,
     set_track_meta
 )
+from monai.utils import set_determinism
 from monai.networks.nets import milmodel
 import argparse
 import torchmetrics
+from models import MILNet
 
 class Trainer:
     
@@ -179,7 +183,7 @@ class Trainer:
         running_loss = 0.0
         epoch_loss_values = []
         self.model.train()
-        self.dataloaders['train'].sampler.set_epoch(epoch)
+        # self.dataloaders['train'].sampler.set_epoch(epoch)
         self.optimizer.zero_grad(set_to_none=True)
 
         if self.gpu_id == 0:
@@ -287,6 +291,7 @@ class Trainer:
     
     def training_loop(
             self, 
+            train_ds,
             metric: torchmetrics, 
             min_epochs: int, 
             val_every: int,
@@ -315,11 +320,14 @@ class Trainer:
         early_stop_flag = torch.zeros(1).to(self.gpu_id)
         history = {'train_loss': [], 'train_f1score': [], 'val_loss': [], 'val_f1score': []}
         f1score = 0
+        train_ds.start()
+
         for epoch in range(max_epochs):
             start_time = time.time()
             train_loss, train_f1score = self.train(metric, epoch, accum_steps)
             history['train_loss'].append(train_loss)
             history['train_f1score'].append(train_f1score.cpu().item())
+            train_ds.update_cache()
             if (epoch + 1) % val_every == 0:
                 val_loss, val_f1score = self.validate(metric, epoch, num_patches)
                 history['val_loss'].append(val_loss)
@@ -344,6 +352,7 @@ class Trainer:
                 if early_stop_flag == 1:
                     break
 
+        train_ds.shutdown()
         if self.gpu_id == 0:
             time_elapsed = time.time() - since
             print('Training complete in {:.0f}m {:.0f}s'.format(time_elapsed // 60, time_elapsed % 60))
@@ -466,14 +475,14 @@ def parse_args() -> argparse.Namespace:
                         help="Number of epochs to wait before running validation. Defaults to 2.")
     parser.add_argument("--batch-size", default=4, type=int, 
                         help="Batch size to use for training. Defaults to 4.")
+    parser.add_argument("--total-batch-size", default=32, type=int,
+                        help="Total batch size: batch size x number of devices x number of accumulations steps.")
     parser.add_argument("--num-patches", default=64, type=int,
                         help="Number of patches to use for training. Defaults to None.")
     parser.add_argument("--image-size", default=224, type=int,
                         help="Image size to use for training. Defaults to 224.")
     parser.add_argument("--num-workers", default=8, type=int,
                         help="Number of workers to use for training. Defaults to 4.")
-    parser.add_argument("--accum-steps", default=1, type=int, 
-                        help="Accumulation steps to take before computing the gradient. Defaults to 1.")
     parser.add_argument("--train-ratio", default=0.8, type=float, 
                         help="Ratio of data to use for training. Defaults to 0.8.")
     parser.add_argument("--learning-rate", default=1e-4, type=float, 
@@ -514,28 +523,44 @@ def load_train_objs(
     train, val_test = GroupStratifiedSplit(split_ratio=args.train_ratio).split_dataset(label_df)
     val, test = GroupStratifiedSplit(split_ratio=0.5).split_dataset(val_test)
     split_dict = GroupStratifiedSplit().convert_to_dict(train, val, test, data_dict)
-    datasets = {x: CacheDataset(
-        data=split_dict[x], 
-        transform=transformations(x, args.mod_list, args.num_patches, args.image_size, device_id), 
-        num_workers=(args.num_workers if x == 'train' else int(args.num_workers / 2)),
-        copy_cache=False) for x in ['train','val']}
+    label_dict = {x: [patient['label'] for patient in split_dict[x]] for x in ['train', 'val', 'test']}
     if args.distributed:
-        sampler = {x: DistributedSampler(
-            dataset=datasets[x], 
-            even_divisible=True, 
-            shuffle=(True if x == 'train' else False)) for x in ['train','val']}
-    else:
-        sampler = {x: None for x in ['train','val']}
+        split_dict = {x: partition_dataset_classes(
+            data=split_dict[x],
+            classes=label_dict[x],
+            num_partitions=torch.distributed.get_world_size(),
+            shuffle=True,
+            even_divisible=True)[torch.distributed.get_rank()] for x in ['train','val']}
+    datasets = {x: None for x in ['train','val']}
+    datasets['train'] = SmartCacheDataset(
+        data=split_dict['train'], 
+        transform=transformations('train', args.mod_list, args.num_patches, args.image_size, device_id), 
+        replace_rate=0.125,
+        cache_num=(64 if args.test_run else 512),
+        num_init_workers=args.num_workers,
+        num_replace_workers=args.num_workers,
+        copy_cache=False)
+    datasets['val'] = CacheDataset(
+        data=split_dict['val'], 
+        transform=transformations('val', args.mod_list, args.num_patches, args.image_size, device_id), 
+        num_workers=int(args.num_workers / 2),
+        copy_cache=False)
+    # if args.distributed:
+    #     sampler = {x: DistributedSampler(
+    #         dataset=datasets[x], 
+    #         even_divisible=True, 
+    #         shuffle=(True if x == 'train' else False)) for x in ['train','val']}
+    # else:
+    #     sampler = {x: None for x in ['train','val']}
     dataloader = {x: ThreadDataLoader(
         datasets[x], 
         batch_size=(args.batch_size if x == 'train' else 1), 
-        shuffle=(True if x == 'train' and sampler[x] is None else False), 
-        num_workers=0, 
-        sampler=sampler[x]) for x in ['train','val']}
+        shuffle=(True if x == 'train' else False), 
+        num_workers=0) for x in ['train','val']}
 
     metric = torchmetrics.F1Score(task='binary')
     weights = 759 / (2 * torch.Tensor([679, 80]))
-    return dataloader, metric, weights
+    return datasets, dataloader, metric, weights
 
 def setup() -> None:
 
@@ -565,7 +590,7 @@ def main(
         args (argparse.Namespace): Arguments.
     '''
     # Set a seed for reproducibility.
-    ReproducibilityUtils.seed_everything(args.seed)
+    set_determinism(seed=args.seed)
     # Setup distributed training.
     if args.distributed:
         setup()
@@ -573,21 +598,27 @@ def main(
         num_devices = torch.cuda.device_count()
         device_id = rank % num_devices
         args.learning_rate = num_devices * args.learning_rate
+        accum_steps = args.total_batch_size / args.batch_size * num_devices
     else:
         device_id = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    dataloader, metric, weights = load_train_objs(device_id, args)
-    model = milmodel.MILModel(args.num_classes, args.mil_mode, args.pretrained)
+        accum_steps = args.total_batch_size / args.batch_size
+    datasets, dataloader, metric, weights = load_train_objs(device_id, args)
+    # model = milmodel.MILModel(args.num_classes, args.mil_mode, args.pretrained)
+    model = MILNet(args.num_classes, args.mil_mode, args.pretrained, args.backbone)
     model.metric = metric
     if args.distributed:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
         model = model.to(device_id)
-        model = nn.parallel.DistributedDataParallel(model, device_ids=[device_id])
+        model = nn.parallel.DistributedDataParallel(
+            model, 
+            device_ids=[device_id],
+            find_unused_parameters=(True if args.backbone == 'densenet121' and args.mil_mode == 'att_trans_pyramid' else False))
     else:
         model = model.to(device_id)
     set_track_meta(False)
     # Train the model using the training data and validate the model on the validation data following each epoch.
     trainer = Trainer(model, args.backbone, args.amp, dataloader, args.learning_rate, args.weight_decay, weights, args.results_dir)
-    trainer.training_loop(metric, args.min_epochs, args.val_interval, args.accum_steps, args.early_stopping, args.patience, args.num_patches)
+    trainer.training_loop(datasets['train'], metric, args.min_epochs, args.val_interval, accum_steps, args.early_stopping, args.patience, args.num_patches)
     # Cleanup distributed training.
     if args.distributed:
         cleanup()

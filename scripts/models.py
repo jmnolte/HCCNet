@@ -1,29 +1,23 @@
+from __future__ import annotations
+from typing import cast
 import torch
-import monai
+import torch.nn as nn
 import os
+from monai.networks.nets import milmodel
+from torchvision.models import resnet50, densenet121, inception_v3, ResNet50_Weights, DenseNet121_Weights, Inception_V3_Weights
 
-class MILModel(monai.networks.nets.MILModel):
+class MILNet(nn.Module):
 
     def __init__(
             self, 
             num_classes: int,
-            mil_mode: str,
-            pretrained: bool,
-            backbone: str,
-            backbone_num_features: int,
+            mil_mode: str = 'att',
+            pretrained: bool = True,
+            backbone: str | None = None,
             trans_blocks: int = 4,
             trans_dropout: float = 0.0,
             ) -> None:
-        super().__init__(
-            num_classes=num_classes,
-            mil_mode=mil_mode.lower(),
-            pretrained=pretrained,
-            backbone=backbone,
-            backbone_num_features=backbone_num_features,
-            trans_blocks=trans_blocks,
-            trans_dropout=trans_dropout
-        )
-
+        super().__init__()
         '''
         Define the model's version and set the number of input channels.
 
@@ -37,208 +31,182 @@ class MILModel(monai.networks.nets.MILModel):
                 all layers are updated.
             weights_path (str): Path to the pretrained weights.
         '''
-        if backbone.lower() not in ['resnet10','resnet18','resnet34','resnet50','resnet101','resnet152','resnet200']:
-            raise ValueError('Unsupported backbone model selected. Please choose from: resnet10, resnet18, resnet34, resnet50, resnet101, resnet152, resnet200')
         if mil_mode.lower() not in ['mean', 'max', 'att', 'att_trans', 'att_trans_pyramid']:
             raise ValueError('Unsupported mil_mode selected. Please choose from: mean, max, att, att_trans, att_trans_pyramid')
-
-        # if backbone != 'resnet50':
-
-        self.backbone = backbone
-        self.pretrained = pretrained
-        if self.backbone == 'resnet10':
-            self.model = monai.networks.nets.resnet10(spatial_dims=3, n_input_channels=num_in_channels)
-        elif self.backbone == 'resnet18':
-            self.model = monai.networks.nets.resnet18(spatial_dims=3, n_input_channels=num_in_channels)
-        elif self.backbone == 'resnet34':
-            self.model = monai.networks.nets.resnet34(spatial_dims=3, n_input_channels=num_in_channels)
-        elif self.version == 'resnet50':
-            self.model = monai.networks.nets.resnet50(spatial_dims=3, n_input_channels=num_in_channels)
-        elif self.version == 'resnet101':
-            self.model = monai.networks.nets.resnet101(spatial_dims=3, n_input_channels=num_in_channels)
-        elif self.version == 'resnet152':
-            self.model = monai.networks.nets.resnet152(spatial_dims=3, n_input_channels=num_in_channels)
-        elif self.version == 'resnet200':
-            self.model = monai.networks.nets.resnet200(spatial_dims=3, n_input_channels=num_in_channels)
-
-        self.model.fc = self.define_output_layer(num_out_classes)
-        if self.pretrained:
-            model_dict = self.intialize_model(weights_path)
-            self.model.load_state_dict(model_dict)
-            print('Pretrained weights are loaded.')
-        self.extract_features(feature_extraction)
-
-    def forward(
-            self, 
-            input: torch.Tensor
-            ) -> torch.Tensor:
-
-        '''
-        Forward pass through the model.
-
-        Args:
-            input (torch.Tensor): Input tensor.
-
-        Returns:
-            output (torch.Tensor): Output tensor.
-        '''
-        output = self.model(input)
-        return output
-    
-    def define_output_layer(
-            self, 
-            num_classes: int
-            ) -> torch.nn.Linear:
-
-        '''
-        Define the model's number of output classes.
-
-        Args:
-            num_classes (int): Number of output classes.
-    
-        Returns:
-            torch.nn.Linear: Output layer.
-        '''
-        num_ftrs = self.model.fc.in_features
-        return torch.nn.Linear(num_ftrs, num_classes)
-
-    def intialize_model(
-            self, 
-            weights_path: str
-            ) -> dict:
-
-        '''
-        Initialize the networks weights. If pretrained weights are used, 
-        the weights are loaded from the MedicalNet repository. To access them,
-        see: https://github.com/Tencent/MedicalNet
-
-        Args:
-            weights_path (str): Path to the pretrained weights.
         
-        Returns:
-            dict: Dictionary containing the model's weights.
-        '''
-        model_dict = self.model.state_dict()
-        new_weights_path = os.path.join(weights_path, 'resnet_' + str(self.version.strip('resnet')) + '.pth')
-        weights_dict = torch.load(new_weights_path, map_location=torch.device('cuda'))
-        weights_dict = {k.replace('module.', ''): v for k, v in weights_dict['state_dict'].items()}
-        model_dict.update(weights_dict)
-        conv1_weight = model_dict['conv1.weight']
-        channel = 1
-        while channel < self.num_in_channels:
-            model_dict['conv1.weight'] = torch.cat((model_dict['conv1.weight'], conv1_weight), 1)
-            channel += 1
-        return model_dict
+        self.extra_outputs: dict[str, torch.Tensor] = {}
+        self.mil_mode = mil_mode.lower()
+        self.attention = nn.Sequential()
+        self.transformer: nn.Module | None = None
 
-    def extract_features(
-            self, 
-            feature_extraction: bool
-            ) -> None:
-
-        '''
-        Freeze the model's weights. If feature_extraction is set to True, only the last layer
-        is updated during training. If feature_extraction is set to False, all layers are updated.
-
-        Args:
-            feature_extraction (bool): If True, only the last layer is unfrozen. If False,
-            all layers are unfrozen.
-        '''
-        if feature_extraction:
-            for param in self.model.parameters():
-                param.requires_grad = False
-            for param in self.model.fc.parameters():
-                param.requires_grad = True
+        if pretrained:
+            weights = 'IMAGENET1K_V1'
         else:
-            for param in self.model.parameters():
-                param.requires_grad = True
-
-    def assert_unfrozen_parameters(
-            self
-            ) -> None:
-
-        '''
-        Assert which parameters will be updated during the training run.
-        '''
-        print("Parameters to be updated:")
-        for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                print(name)
-
-class EnsembleModel(torch.nn.Module):
-
-    def __init__(
-            self, 
-            model1: torch.nn.Module, 
-            model2: torch.nn.Module, 
-            model3: torch.nn.Module, 
-            model4: torch.nn.Module, 
-            versions: list, 
-            num_out_classes: int, 
-            output_dir: str
-            ) -> None:
-        super().__init__()
-
-        '''
-        Ensemble model that combines the predictions of four ResNet models.
-
-        Args:
-            model1 (torch.nn.Module): First ResNet model.
-            model2 (torch.nn.Module): Second ResNet model.
-            model3 (torch.nn.Module): Third ResNet model.
-            model4 (torch.nn.Module): Fourth ResNet model.
-            versions (list): List of ResNet versions.
-            num_out_classes (int): Number of output classes.
-            output_dir (str): Path to the output directory.
-        '''
-        self.model1 = model1
-        self.model2 = model2
-        self.model3 = model3
-        self.model4 = model4
-        self.versions = versions
-        self.output_dir = output_dir
-        self.classifier = torch.nn.Linear(num_out_classes * 4, num_out_classes)
-        self.freeze_model_parameters()
-
-    def forward(
-            self, 
-            input: torch.Tensor
-            ) -> torch.Tensor:
-
-        '''
-        Forward pass through the model.
-
-        Args:
-            input (torch.Tensor): Input tensor.
+            weights = None
         
-        Returns:
-            output (torch.Tensor): Output tensor.
-        '''
-        x1 = self.model1(input)
-        x2 = self.model2(input)
-        x3 = self.model3(input)
-        x4 = self.model4(input)
-        x = torch.cat((x1, x2, x3, x4), dim=1)
-        output = self.classifier(x)
-        return output
+        if backbone is None or backbone.lower() == 'resnet50':
+            net = resnet50(weights=weights)
+            nfc = net.fc.in_features
+            net.fc = nn.Identity()
+            if mil_mode == "att_trans_pyramid":
+                net.layer1.register_forward_hook(self.forward_hook("layer1"))
+                net.layer2.register_forward_hook(self.forward_hook("layer2"))
+                net.layer3.register_forward_hook(self.forward_hook("layer3"))
+                net.layer4.register_forward_hook(self.forward_hook("layer4"))
 
-    def freeze_model_parameters(
-            self
-            ) -> None:
+        elif backbone.lower() == 'densenet121':
+            net = densenet121(weights=weights)
+            nfc = net.classifier.in_features
+            net.classifier = nn.Identity()
+            if mil_mode == 'att_trans_pyramid':
+                net.features._modules['denseblock1'].register_forward_hook(self.forward_hook('layer1'))
+                net.features._modules['denseblock2'].register_forward_hook(self.forward_hook('layer2'))
+                net.features._modules['denseblock3'].register_forward_hook(self.forward_hook('layer3'))
+                net.features._modules['denseblock4'].register_forward_hook(self.forward_hook('layer4'))
 
-        '''
-        Freeze the model's weights.
-        '''
-        for param in self.model1.parameters():
-            param.requires_grad = False
-        for param in self.model2.parameters():
-            param.requires_grad = False
-        for param in self.model3.parameters():
-            param.requires_grad = False
-        for param in self.model4.parameters():
-            param.requires_grad = False
-        for param in self.classifier.parameters():
-            param.requires_grad = True 
+        elif backbone.lower() == 'inceptionv3':
+            net = inception_v3(weights=weights)
+            nfc = net.fc.in_features
+            net.fc = nn.Identity()
+            if mil_mode == 'att_trans_pyramid':
+                net.Mixed_5b.register_forward_hook(self.forward_hook("layer1"))
+                net.Mixed_5c.register_forward_hook(self.forward_hook("layer2"))
+                net.Mixed_5d.register_forward_hook(self.forward_hook("layer3"))
+                net.Mixed_6a.register_forward_hook(self.forward_hook("layer4"))
+                net.Mixed_6b.register_forward_hook(self.forward_hook("layer5"))
+                net.Mixed_6c.register_forward_hook(self.forward_hook("layer6"))
+                net.Mixed_6d.register_forward_hook(self.forward_hook("layer7"))
+                net.Mixed_6e.register_forward_hook(self.forward_hook("layer8"))
+                net.Mixed_7a.register_forward_hook(self.forward_hook("layer9"))
+                net.Mixed_7b.register_forward_hook(self.forward_hook("layer10"))
+                net.Mixed_7c.register_forward_hook(self.forward_hook("layer11"))
+        else:
+            raise ValueError('Unsupported backbone model selected. Please choose from: resnet50, dense121, inceptionv3. Defaults to resnet50.')
+        
+        if self.mil_mode in ["mean", "max"]:
+            pass
 
-if __name__ == '__main__':
-    net = monai.networks.nets.MILModel(num_classes=2, backbone='resnet152')
-    print(net)
+        elif self.mil_mode == "att":
+            self.attention = nn.Sequential(nn.Linear(nfc, 2048), nn.Tanh(), nn.Linear(2048, 1))
+
+        elif self.mil_mode == "att_trans":
+            transformer = nn.TransformerEncoderLayer(d_model=nfc, nhead=8, dropout=trans_dropout)
+            self.transformer = nn.TransformerEncoder(transformer, num_layers=trans_blocks)
+            self.attention = nn.Sequential(nn.Linear(nfc, 2048), nn.Tanh(), nn.Linear(2048, 1))
+
+        elif self.mil_mode == "att_trans_pyramid":
+            transformer_list = nn.ModuleList(
+                [
+                    nn.TransformerEncoder(
+                        nn.TransformerEncoderLayer(d_model=256, nhead=8, dropout=trans_dropout), 
+                        num_layers=trans_blocks
+                    ),
+                    nn.Sequential(
+                        nn.Linear(768, 256),
+                        nn.TransformerEncoder(
+                            nn.TransformerEncoderLayer(d_model=256, nhead=8, dropout=trans_dropout),
+                            num_layers=trans_blocks,
+                        ),
+                    ),
+                    nn.Sequential(
+                        nn.Linear(1280, 256),
+                        nn.TransformerEncoder(
+                            nn.TransformerEncoderLayer(d_model=256, nhead=8, dropout=trans_dropout),
+                            num_layers=trans_blocks,
+                        ),
+                    ),
+                    nn.TransformerEncoder(
+                        nn.TransformerEncoderLayer(d_model=nfc + 256, nhead=8, dropout=trans_dropout),
+                        num_layers=trans_blocks,
+                    ),
+                ]
+            )
+            self.transformer = transformer_list
+            nfc = nfc + 256
+            self.attention = nn.Sequential(nn.Linear(nfc, 2048), nn.Tanh(), nn.Linear(2048, 1))
+
+        else:
+            raise ValueError("Unsupported mil_mode: " + str(mil_mode))
+
+        self.myfc = nn.Linear(nfc, num_classes)
+        self.net = net
+
+    def forward_hook(self, layer_name):
+        @staticmethod
+        def hook(module, input, output):
+            self.extra_outputs[layer_name] = output
+        return hook
+
+    def calc_head(self, x: torch.Tensor) -> torch.Tensor:
+        sh = x.shape
+
+        if self.mil_mode == "mean":
+            x = self.myfc(x)
+            x = torch.mean(x, dim=1)
+
+        elif self.mil_mode == "max":
+            x = self.myfc(x)
+            x, _ = torch.max(x, dim=1)
+
+        elif self.mil_mode == "att":
+            a = self.attention(x)
+            a = torch.softmax(a, dim=1)
+            x = torch.sum(x * a, dim=1)
+
+            x = self.myfc(x)
+
+        elif self.mil_mode == "att_trans" and self.transformer is not None:
+            x = x.permute(1, 0, 2)
+            x = self.transformer(x)
+            x = x.permute(1, 0, 2)
+
+            a = self.attention(x)
+            a = torch.softmax(a, dim=1)
+            x = torch.sum(x * a, dim=1)
+
+            x = self.myfc(x)
+
+        elif self.mil_mode == "att_trans_pyramid" and self.transformer is not None:
+            l1 = torch.mean(self.extra_outputs["layer1"], dim=(2, 3)).reshape(sh[0], sh[1], -1).permute(1, 0, 2)
+            l2 = torch.mean(self.extra_outputs["layer2"], dim=(2, 3)).reshape(sh[0], sh[1], -1).permute(1, 0, 2)
+            l3 = torch.mean(self.extra_outputs["layer3"], dim=(2, 3)).reshape(sh[0], sh[1], -1).permute(1, 0, 2)
+            l4 = torch.mean(self.extra_outputs["layer4"], dim=(2, 3)).reshape(sh[0], sh[1], -1).permute(1, 0, 2)
+
+            transformer_list = cast(nn.ModuleList, self.transformer)
+
+            x = transformer_list[0](l1)
+            x = transformer_list[1](torch.cat((x, l2), dim=2))
+            x = transformer_list[2](torch.cat((x, l3), dim=2))
+            x = transformer_list[3](torch.cat((x, l4), dim=2))
+
+            x = x.permute(1, 0, 2)
+
+            a = self.attention(x)
+            a = torch.softmax(a, dim=1)
+            x = torch.sum(x * a, dim=1)
+
+            x = self.myfc(x)
+
+        else:
+            raise ValueError("Wrong model mode" + str(self.mil_mode))
+
+        return x
+
+    def forward(self, x: torch.Tensor, no_head: bool = False) -> torch.Tensor:
+        sh = x.shape
+        x = x.reshape(sh[0] * sh[1], sh[2], sh[3], sh[4])
+
+        x = self.net(x)
+        x = x.reshape(sh[0], sh[1], -1)
+
+        if not no_head:
+            x = self.calc_head(x)
+
+        return x
+
+
+    # def calc_head(self, x: torch.Tensor) -> torch.Tensor:
+    #     return super().calc_head(x)
+    
+    # def forward(self, x: torch.Tensor, no_head: bool = False) -> torch.Tensor:
+    #     return super().forward(x, no_head)

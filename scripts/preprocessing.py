@@ -518,7 +518,8 @@ def transformations(
         Orientationd(keys=modalities, axcodes='PLI'),
         Resized(keys=modalities, spatial_size=(resized_image, resized_image, 64)),          
         ConcatItemsd(keys=modalities, name='image', dim=0),
-        ScaleIntensityRangePercentilesd(keys='image', lower=1, upper=99, b_min=0, b_max=1, clip=True, channel_wise=True)
+        ScaleIntensityRangePercentilesd(keys='image', lower=1, upper=99, b_min=0, b_max=1, clip=True, channel_wise=True),
+        NormalizeIntensityd(keys='image', nonzero=True, channel_wise=True)
     ])
         
     train_specific = Compose([
