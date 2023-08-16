@@ -13,20 +13,21 @@ from preprocessing import (
     GroupStratifiedSplit,
     transformations
 )
-# from utils import ReproducibilityUtils
 from monai.data import (
     ThreadDataLoader,
     CacheDataset,
     SmartCacheDataset,
     DistributedSampler,
+    partition_dataset,
     partition_dataset_classes,
     set_track_meta
 )
 from monai.utils import set_determinism
 from monai.networks.nets import milmodel
+from monai.optimizers import LearningRateFinder
 import argparse
 import torchmetrics
-from models import MILNet
+from milnet import MILNet
 
 class Trainer:
     
@@ -38,7 +39,9 @@ class Trainer:
             dataloaders: dict, 
             learning_rate: float, 
             weight_decay: float,
+            accum_steps: int,
             weights: torch.Tensor,
+            smoothing_coef: float,
             output_dir: str,
             ) -> None:
 
@@ -47,82 +50,41 @@ class Trainer:
 
         Args:
             model (torch.nn): Model to train.
-            version (str): Model version. Can be 'resnet10', 'resnet18', 'resnet34', 'resnet50',
-                'resnet101', 'resnet152', 'resnet200', or 'ensemble'.
-            dataloaders (dict): Dataloader objects.
-            learning_rate (float): Learning rate.
-            weight_decay (float): Weight decay.
-            output_dir (str): Output directory.
+            backbone (str): Backbone architecture to use. Has to be 'resnet50', or 'densenet121'.
+            amp (bool): Flag to use automated mixed precision.
+            dataloaders (dict): Dataloader objects. Have to be provided as a dictionary, where the the entries are 'train', 'val', and/or 'test'. 
+            learning_rate (float): Float specifiying the learning rate.
+            weight_decay (float): Float specifying the Weight decay.
+            accum_steps (int): Number of accumulations steps.
+            weights (torch.Tensor): Tensor to rescale the weights given to each class C. Has to be of size C.
+            smoothing_coef (float): Float to specify the amount of smoothing applied to the class labels. Has to be in range [0.0 to 1.0].
+            output_dir (str): Directory to store model outputs.
         '''
-        # if distributed:
         self.gpu_id = int(os.environ['LOCAL_RANK'])
-        #     self.model = model.to(self.gpu_id)
-        #     self.model = nn.parallel.DistributedDataParallel(self.model, device_ids=[self.gpu_id])
-        # else:
-        #     self.gpu_id = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        #     self.model = model.to(self.gpu_id)
         self.model = model
         self.amp = amp
         self.scaler = GradScaler(enabled=amp)
         self.backbone = backbone
         self.dataloaders = dataloaders
         self.output_dir = output_dir
-        # self.epochs_run = 0
-        # self.snapshot_path = os.path.join(output_dir, 'snapshots' + version + '_' + 'snapshot.pth')
-        # if self.epochs_run != 0 and os.path.exists(self.snapshot_path):
-        #     print('Loading snapshot')
-        #     self.load_snapshot(self.snapshot_path)
         params = self.model.parameters()
         if args.mil_mode in ["att_trans", "att_trans_pyramid"]:
             params = [
                 {"params": list(self.model.module.attention.parameters()) + list(self.model.module.myfc.parameters()) + list(self.model.module.net.parameters())},
                 {"params": list(self.model.module.transformer.parameters()), "lr": 6e-6, "weight_decay": 0.1},
             ]
-        self.optimizer = optim.Adam(params, lr=learning_rate, weight_decay=weight_decay)
-        # weights = 759 / (2 * torch.Tensor([679, 80])).to(self.gpu_id)
-        # self.criterion = FocalLoss(gamma=2, weight=weights).to(self.gpu_id)
-        self.criterion = nn.CrossEntropyLoss(weight=weights.to(self.gpu_id)).to(self.gpu_id)
-    
-    # def load_snapshot(
-    #         self, 
-    #         snapshot_path: str
-    #         ) -> dict:
-
-    #     '''
-    #     Load a snapshot of the model.
-
-    #     Args:
-    #         snapshot_path (str): Path to snapshot.
-    #     '''
-    #     snapshot = torch.load(snapshot_path)
-    #     self.model.load_state_dict(snapshot['MODEL_STATE'])
-    #     self.epochs_run = snapshot['EPOCHS_RUN']
-    #     print('Resuming training from epoch:'.format(self.epochs_run))
-
-    # def save_snapshot(
-    #         self, 
-    #         epoch: int
-    #         ) -> None:
-        
-    #     '''
-    #     Save a snapshot of the model.
-
-    #     Args:
-    #         epoch (int): Current epoch.
-    #     '''
-    #     snapshot = {}
-    #     snapshot['MODEL_STATE'] = self.model.module.state_dict()
-    #     snapshot['EPOCHS_RUN'] = epoch
-    #     folder_name = self.version + '_' + 'snapshot.pth'
-    #     folder_path = os.path.join(self.output_dir, 'snapshots', folder_name)
-    #     folder_path_root = os.path.join(self.output_dir, 'snapshots')
-
-    #     if os.path.exists(folder_path):
-    #         os.remove(folder_path)
-    #     elif not os.path.exists(folder_path_root):
-    #         os.makedirs(folder_path_root)
-    #     torch.save(snapshot, folder_path)
-    #     print('Epoch {}: Training snapshot saved at snapshot.pth'.format(epoch))
+        self.optimizer = optim.AdamW(params, lr=learning_rate, weight_decay=weight_decay)
+        self.scheduler = optim.lr_scheduler.CyclicLR(
+            self.optimizer, 
+            base_lr=learning_rate,
+            max_lr=learning_rate*10,
+            mode='triangular2', 
+            step_size_up=int(len(dataloaders['train']) / accum_steps * 4),
+            cycle_momentum=False)
+        # self.scheduler = optim.lr_scheduler.ExponentialLR(
+        #     self.optimizer, 
+        #     gamma=0.5)
+        self.criterion = nn.CrossEntropyLoss(weight=weights.to(self.gpu_id), label_smoothing=smoothing_coef).to(self.gpu_id)
 
     def save_output(
             self, 
@@ -134,7 +96,7 @@ class Trainer:
         Save the model's output.
 
         Args:
-            output_dict (dict): Output dictionary.
+            output_dict (dict): Dictionary containing the model outputs.
             output_type (str): Type of output. Can be 'weights', 'history', or 'preds'.
         '''
         try: 
@@ -173,15 +135,14 @@ class Trainer:
         Train the model.
 
         Args:
-            metric (torchmetrics): Metric to use for training.
+            metric (torchmetrics): Metric to assess model performance while training.
             epoch (int): Current epoch.
-            accum_steps (int): Number of steps to accumulate gradients over.
+            accum_steps (int): Number of accumulation steps to use before updating the model weights.
 
         Returns:
-            tuple: Tuple containing the loss and f1 score.
+            tuple: Tuple containing the loss and F1-score.
         '''
         running_loss = 0.0
-        epoch_loss_values = []
         self.model.train()
         # self.dataloaders['train'].sampler.set_epoch(epoch)
         self.optimizer.zero_grad(set_to_none=True)
@@ -197,13 +158,10 @@ class Trainer:
             with autocast(enabled=self.amp):
                 logits = self.model(inputs)
                 loss = self.criterion(logits, labels)
+                loss /= accum_steps
+                running_loss += loss.item()
 
             self.scaler.scale(loss).backward()
-            # logits = self.model(inputs.as_tensor())
-            # loss = self.criterion(logits, labels)
-            # loss.backward()
-            loss /= accum_steps
-            running_loss += loss.item()
             preds = torch.argmax(logits, 1)
             batch_f1score = metric(preds, labels)
     
@@ -211,11 +169,11 @@ class Trainer:
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 self.optimizer.zero_grad(set_to_none=True)
+                self.scheduler.step()
                 if self.gpu_id == 0:
                     print(f"{step + 1}/{len(self.dataloaders['train'])}, Batch Loss: {loss.item() * accum_steps:.4f}, Batch F1-Score: {batch_f1score.item():.4f}")
 
-        epoch_loss = running_loss / (len(self.dataloaders['train']) // accum_steps + 1)
-        epoch_loss_values.append(running_loss)
+        epoch_loss = running_loss / (len(self.dataloaders['train']) // accum_steps)
         epoch_f1score = metric.compute()
         metric.reset()
         if self.gpu_id == 0:
@@ -233,15 +191,14 @@ class Trainer:
         Validate the model.
 
         Args:
-            metric (torchmetrics): Metric to use for validation.
+            metric (torchmetrics): Metric to assess model performance while validating.
             epoch (int): Current epoch.
             num_patches (int): Number of patches to split the input into.
         
         Returns:
-            tuple: Tuple containing the loss and f1 score.
+            tuple: Tuple containing the loss and F1-score.
         '''
         running_loss = 0.0
-        epoch_loss_values = []
         self.model.eval()
         with torch.no_grad():
             for batch_data in self.dataloaders['val']:
@@ -282,7 +239,6 @@ class Trainer:
                 metric.update(preds, labels)
 
             epoch_loss = running_loss / len(self.dataloaders['val'])
-            epoch_loss_values.append(running_loss)
             epoch_f1score = metric.compute()
             metric.reset()
             if self.gpu_id == 0:
@@ -291,7 +247,7 @@ class Trainer:
     
     def training_loop(
             self, 
-            train_ds,
+            train_ds: monai.data,
             metric: torchmetrics, 
             min_epochs: int, 
             val_every: int,
@@ -305,12 +261,13 @@ class Trainer:
         Training loop.
 
         Args:
-            metric (torch.nn): Metric to optimize.
+            train_ds (monai.data): Training dataset.
+            metric (torch.nn): Metric to assess model performance while training/validating.
             min_epochs (int): Minimum number of epochs to train.
-            val_every (int): Number of epochs to wait before validation.
-            accum_steps (int): Number of steps to accumulate gradients.
-            patience (int): Number of epochs to wait before early stopping.
+            val_every (int): Integer specifying the interval the model is validated.
+            accum_steps (int): Number of accumulation steps to use before updating the model weights.
             early_stopping (bool): Whether to use early stopping.
+            patience (int): Number of epochs to wait before aborting the training process.
             num_patches (int): Number of slice patches to use for training.
         '''
         since = time.time()
@@ -327,7 +284,7 @@ class Trainer:
             train_loss, train_f1score = self.train(metric, epoch, accum_steps)
             history['train_loss'].append(train_loss)
             history['train_f1score'].append(train_f1score.cpu().item())
-            train_ds.update_cache()
+            # self.scheduler.step()
             if (epoch + 1) % val_every == 0:
                 val_loss, val_f1score = self.validate(metric, epoch, num_patches)
                 history['val_loss'].append(val_loss)
@@ -343,6 +300,7 @@ class Trainer:
                         counter += 1
                         if epoch >= min_epochs and counter >= patience:
                             early_stop_flag += 1
+            train_ds.update_cache()
             train_time = time.time() - start_time
             if self.gpu_id == 0:
                 print(f'Epoch {epoch} complete in {train_time // 60:.0f}min {train_time % 60:.0f}sec')
@@ -369,7 +327,7 @@ class Trainer:
         Visualize the training and validation history.
 
         Args:
-            metric (str): 'loss' or 'f1score'.
+            metric (str): String specifying the metric to be visualized. Can be 'loss' or 'f1score'.
         '''
         try: 
             assert any(metric == metric_item for metric_item in ['loss','f1score'])
@@ -452,7 +410,7 @@ def parse_args() -> argparse.Namespace:
     Parse command line arguments.
 
     Returns:
-        argparse.Namespace: Arguments.
+        argparse.Namespace: Command line arguments.
     '''
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--mil-mode", default='att', type=str,
@@ -480,29 +438,37 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-patches", default=64, type=int,
                         help="Number of patches to use for training. Defaults to None.")
     parser.add_argument("--image-size", default=224, type=int,
-                        help="Image size to use for training. Defaults to 224.")
+                        help="Image size to use for training.")
+    parser.add_argument("--augment-prob", default=0.5, type=float,
+                        help="Probability with which random transform is to be applied.")
     parser.add_argument("--num-workers", default=8, type=int,
                         help="Number of workers to use for training. Defaults to 4.")
     parser.add_argument("--train-ratio", default=0.8, type=float, 
                         help="Ratio of data to use for training. Defaults to 0.8.")
     parser.add_argument("--learning-rate", default=1e-4, type=float, 
                         help="Learning rate to use for training. Defaults to 1e-4.")
-    parser.add_argument("--weight-decay", default=0.0, type=float, 
+    parser.add_argument("--weight-decay", default=0, type=float, 
                         help="Weight decay to use for training. Defaults to 0.")
+    parser.add_argument("--smoothing-coef", default=0, type=float, 
+                        help="Coefficient to smooth labels. Defaults to 0.")
+    parser.add_argument("--tl-strategy", default='finetune', type=str, 
+                        help="Transfer learning strategy to use. Can be finetuning (FT), layer-wise finetuning (LWFT), or TransFusion (TF). Defaults to FT.")
+    parser.add_argument("--shrink-coef", default=1, type=int, 
+                        help="Factor by which the network architecture should be reduced. Only applies if TransFusion is selected as transfer learning strategy.")                   
+    parser.add_argument("--cutoff-point", default=-1, type=int, 
+                        help="Cutoff point from where layers are to be updated when layer-wise finetuning is selected or from where layers are randomly initialized when transfusion is selected.")                 
     parser.add_argument("--early-stopping", action='store_true',
                         help="Flag to use early stopping.")
-    parser.add_argument("--patience", default=5, type=int, 
+    parser.add_argument("--patience", default=10, type=int, 
                         help="Patience to use for early stopping. Defaults to 5.")
     parser.add_argument("--mod-list", default=MODALITY_LIST, nargs='+', 
                         help="List of modalities to use for training")
-    parser.add_argument("--seed", default=123, type=int, 
+    parser.add_argument("--seed", default=1234, type=int, 
                         help="Seed to use for reproducibility")
     parser.add_argument("--data-dir", default=DATA_DIR, type=str, 
                         help="Path to data directory")
     parser.add_argument("--results-dir", default=RESULTS_DIR, type=str, 
                         help="Path to results directory")
-    parser.add_argument("--weights-dir", default=WEIGHTS_DIR, type=str, 
-                        help="Path to pretrained weights")
     return parser.parse_args()
 
 def load_train_objs(
@@ -514,35 +480,43 @@ def load_train_objs(
     Load training objects.
 
     Args:
-        args (argparse.Namespace): Arguments.
+        args (argparse.Namespace): Command line arguments.
 
     Returns:
-        tuple: Training objects consisting of the data loader, the model, and the performance metric.
+        tuple: Training objects consisting of the datasets, dataloaders, the model, and the performance metric.
     '''
-    data_dict, label_df = DatasetPreprocessor(data_dir=args.data_dir, test_run=args.test_run).load_imaging_data(args.mod_list)
-    train, val_test = GroupStratifiedSplit(split_ratio=args.train_ratio).split_dataset(label_df)
-    val, test = GroupStratifiedSplit(split_ratio=0.5).split_dataset(val_test)
-    split_dict = GroupStratifiedSplit().convert_to_dict(train, val, test, data_dict)
+    multiclass = True if args.num_classes > 2 else False
+    data_dict, label_df = DatasetPreprocessor(data_dir=args.data_dir, test_run=args.test_run).load_imaging_data(modalities=args.mod_list, multiclass=multiclass)
+    train, val_test = GroupStratifiedSplit(split_ratio=args.train_ratio, multiclass=multiclass).split_dataset(label_df)
+    val, test = GroupStratifiedSplit(split_ratio=0.5, multiclass=multiclass).split_dataset(val_test)
+    split_dict = GroupStratifiedSplit(multiclass=multiclass).convert_to_dict(train, val, test, data_dict)
     label_dict = {x: [patient['label'] for patient in split_dict[x]] for x in ['train', 'val', 'test']}
     if args.distributed:
-        split_dict = {x: partition_dataset_classes(
-            data=split_dict[x],
-            classes=label_dict[x],
-            num_partitions=torch.distributed.get_world_size(),
-            shuffle=True,
-            even_divisible=True)[torch.distributed.get_rank()] for x in ['train','val']}
+        if args.test_run:
+            split_dict = {x: partition_dataset(
+                data=split_dict[x],
+                num_partitions=torch.distributed.get_world_size(),
+                shuffle=True,
+                even_divisible=True)[torch.distributed.get_rank()] for x in ['train','val']}
+        else:
+            split_dict = {x: partition_dataset_classes(
+                data=split_dict[x],
+                classes=label_dict[x],
+                num_partitions=torch.distributed.get_world_size(),
+                shuffle=True,
+                even_divisible=True)[torch.distributed.get_rank()] for x in ['train','val']}
     datasets = {x: None for x in ['train','val']}
     datasets['train'] = SmartCacheDataset(
         data=split_dict['train'], 
-        transform=transformations('train', args.mod_list, args.num_patches, args.image_size, device_id), 
-        replace_rate=0.125,
-        cache_num=(64 if args.test_run else 512),
+        transform=transformations('train', args.mod_list, args.num_patches, args.image_size, args.augment_prob, device_id), 
+        replace_rate=0.25,
+        cache_num=(64 if args.test_run else int(512 / torch.cuda.device_count())),
         num_init_workers=args.num_workers,
         num_replace_workers=args.num_workers,
         copy_cache=False)
     datasets['val'] = CacheDataset(
         data=split_dict['val'], 
-        transform=transformations('val', args.mod_list, args.num_patches, args.image_size, device_id), 
+        transform=transformations('val', args.mod_list, args.num_patches, args.image_size, args.augment_prob, device_id), 
         num_workers=int(args.num_workers / 2),
         copy_cache=False)
     # if args.distributed:
@@ -554,12 +528,13 @@ def load_train_objs(
     #     sampler = {x: None for x in ['train','val']}
     dataloader = {x: ThreadDataLoader(
         datasets[x], 
-        batch_size=(args.batch_size if x == 'train' else 1), 
+        batch_size=(args.batch_size if x == 'train' else int(args.batch_size / 2)), 
         shuffle=(True if x == 'train' else False), 
         num_workers=0) for x in ['train','val']}
 
-    metric = torchmetrics.F1Score(task='binary')
-    weights = 759 / (2 * torch.Tensor([679, 80]))
+    metric = torchmetrics.F1Score(task=('multiclass' if args.num_classes > 2 else 'binary'), num_classes=args.num_classes)
+    values, counts = np.unique(label_dict['train'], return_counts=True)
+    weights = len(label_dict['train']) / (args.num_classes * torch.Tensor([class_count for class_count in counts]))
     return datasets, dataloader, metric, weights
 
 def setup() -> None:
@@ -587,7 +562,7 @@ def main(
     plots.
 
     Args:
-        args (argparse.Namespace): Arguments.
+        args (argparse.Namespace): Command line arguments.
     '''
     # Set a seed for reproducibility.
     set_determinism(seed=args.seed)
@@ -598,13 +573,19 @@ def main(
         num_devices = torch.cuda.device_count()
         device_id = rank % num_devices
         args.learning_rate = num_devices * args.learning_rate
-        accum_steps = args.total_batch_size / args.batch_size * num_devices
+        accum_steps = args.total_batch_size / args.batch_size / num_devices
     else:
         device_id = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         accum_steps = args.total_batch_size / args.batch_size
     datasets, dataloader, metric, weights = load_train_objs(device_id, args)
-    # model = milmodel.MILModel(args.num_classes, args.mil_mode, args.pretrained)
-    model = MILNet(args.num_classes, args.mil_mode, args.pretrained, args.backbone)
+    model = MILNet(
+        num_classes=args.num_classes, 
+        mil_mode=args.mil_mode, 
+        backbone=args.backbone, 
+        pretrained=args.pretrained, 
+        tl_strategy=args.tl_strategy, 
+        shrink_coefficient=args.shrink_coef,
+        load_up_to=args.cutoff_point)
     model.metric = metric
     if args.distributed:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
@@ -617,7 +598,7 @@ def main(
         model = model.to(device_id)
     set_track_meta(False)
     # Train the model using the training data and validate the model on the validation data following each epoch.
-    trainer = Trainer(model, args.backbone, args.amp, dataloader, args.learning_rate, args.weight_decay, weights, args.results_dir)
+    trainer = Trainer(model, args.backbone, args.amp, dataloader, args.learning_rate, args.weight_decay, accum_steps, weights, args.smoothing_coef, args.results_dir)
     trainer.training_loop(datasets['train'], metric, args.min_epochs, args.val_interval, accum_steps, args.early_stopping, args.patience, args.num_patches)
     # Cleanup distributed training.
     if args.distributed:

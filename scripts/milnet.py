@@ -2,9 +2,7 @@ from __future__ import annotations
 from typing import cast
 import torch
 import torch.nn as nn
-import os
-from monai.networks.nets import milmodel
-from torchvision.models import resnet50, densenet121, inception_v3, ResNet50_Weights, DenseNet121_Weights, Inception_V3_Weights
+from resnet import resnet50
 
 class MILNet(nn.Module):
 
@@ -12,40 +10,47 @@ class MILNet(nn.Module):
             self, 
             num_classes: int,
             mil_mode: str = 'att',
-            pretrained: bool = True,
             backbone: str | None = None,
+            pretrained: bool = True,
+            tl_strategy: str = 'finetune',
+            shrink_coefficient: int = 1,
+            load_up_to: int = -1,
             trans_blocks: int = 4,
-            trans_dropout: float = 0.0,
+            trans_dropout: float = 0.0
             ) -> None:
         super().__init__()
         '''
         Define the model's version and set the number of input channels.
 
         Args:
-            version (str): ResNet model version. Can be 'resnet10', 'resnet18', 'resnet34', 'resnet50',
-                'resnet101', 'resnet152', or 'resnet200'.
-            num_out_classes (int): Number of output classes.
-            num_in_channels (int): Number of input channels.
-            pretrained (bool): If True, pretrained weights are used.
-            feature_extraction (bool): If True, only the last layer is updated during training. If False,
-                all layers are updated.
-            weights_path (str): Path to the pretrained weights.
+            num_classes (int): Integer specifying the number of classes.
+            mil_mode (str): Mutiple instance learning (MIL) algorithm. Can be one of the following (defaults to 'att'):
+                'mean': takes the average over all instances (decision boundary = 0.5).
+                'max': retains the maximum value over all instances.
+                'att': attention based MIL https://arxiv.org/abs/1802.04712.
+                'att_trans': transformer MIL https://arxiv.org/abs/2111.01556.
+                'att_trans_pyramid': transformer pyramid MIL https://arxiv.org/abs/2111.01556.
+            backbone (str): backbone (str): Backbone architecture to use. Has to be 'resnet50', or 'densenet121'.
+            pretrained (bool): Flag to initialize model using pretrained weights.
+            tl_strategy (str): String specifying the transfer learning strategy. Can be one of the following (defaults to 'finetune'):
+                'finetune': finetunes the model, updating all model weights.
+                'lw_finetune': finetunes a subset of the model, freezing the reamining layer until a given cutoff point k.
+                'transfusion': reduces the dimensionality of k top layers, initializing their weights randomly, and updating all model weights.
+            shrink_coefficient (int): Integer specifying the factor by which the dimensionality of the model should be reduced in the top layers. Only applies if 'transfusion' is selcted as the model's transfer learning strategy.
+            load_up_to (int): Integer specifying the cutoff point k, when 'lw_finetune' or 'transfusion' is used as the model's transfer learning strategy.
         '''
         if mil_mode.lower() not in ['mean', 'max', 'att', 'att_trans', 'att_trans_pyramid']:
             raise ValueError('Unsupported mil_mode selected. Please choose from: mean, max, att, att_trans, att_trans_pyramid')
+        if tl_strategy.lower() not in ['finetune', 'lw_finetune', 'transfusion']:
+            raise ValueError('Unsupported transfer learning strategy selected. Please choose from: finetuning (finetune), layer-wise finetuning (lw_finetune), or TransFusion (transfusion). Defaults to finetuning.')
         
         self.extra_outputs: dict[str, torch.Tensor] = {}
         self.mil_mode = mil_mode.lower()
         self.attention = nn.Sequential()
         self.transformer: nn.Module | None = None
-
-        if pretrained:
-            weights = 'IMAGENET1K_V1'
-        else:
-            weights = None
         
         if backbone is None or backbone.lower() == 'resnet50':
-            net = resnet50(weights=weights)
+            net = resnet50(pretrained=pretrained, shrink_coefficient=shrink_coefficient, load_up_to=load_up_to)
             nfc = net.fc.in_features
             net.fc = nn.Identity()
             if mil_mode == "att_trans_pyramid":
@@ -54,76 +59,72 @@ class MILNet(nn.Module):
                 net.layer3.register_forward_hook(self.forward_hook("layer3"))
                 net.layer4.register_forward_hook(self.forward_hook("layer4"))
 
-        elif backbone.lower() == 'densenet121':
-            net = densenet121(weights=weights)
-            nfc = net.classifier.in_features
-            net.classifier = nn.Identity()
-            if mil_mode == 'att_trans_pyramid':
-                net.features._modules['denseblock1'].register_forward_hook(self.forward_hook('layer1'))
-                net.features._modules['denseblock2'].register_forward_hook(self.forward_hook('layer2'))
-                net.features._modules['denseblock3'].register_forward_hook(self.forward_hook('layer3'))
-                net.features._modules['denseblock4'].register_forward_hook(self.forward_hook('layer4'))
-
-        elif backbone.lower() == 'inceptionv3':
-            net = inception_v3(weights=weights)
-            nfc = net.fc.in_features
-            net.fc = nn.Identity()
-            if mil_mode == 'att_trans_pyramid':
-                net.Mixed_5b.register_forward_hook(self.forward_hook("layer1"))
-                net.Mixed_5c.register_forward_hook(self.forward_hook("layer2"))
-                net.Mixed_5d.register_forward_hook(self.forward_hook("layer3"))
-                net.Mixed_6a.register_forward_hook(self.forward_hook("layer4"))
-                net.Mixed_6b.register_forward_hook(self.forward_hook("layer5"))
-                net.Mixed_6c.register_forward_hook(self.forward_hook("layer6"))
-                net.Mixed_6d.register_forward_hook(self.forward_hook("layer7"))
-                net.Mixed_6e.register_forward_hook(self.forward_hook("layer8"))
-                net.Mixed_7a.register_forward_hook(self.forward_hook("layer9"))
-                net.Mixed_7b.register_forward_hook(self.forward_hook("layer10"))
-                net.Mixed_7c.register_forward_hook(self.forward_hook("layer11"))
+        # elif backbone.lower() == 'densenet121':
+        #     net = models.densenet121(weights=weights)
+        #     nfc = net.classifier.in_features
+        #     net.classifier = nn.Identity()
+        #     if mil_mode == 'att_trans_pyramid':
+        #         net.features._modules['denseblock1'].register_forward_hook(self.forward_hook("layer1"))
+        #         net.features._modules['denseblock2'].register_forward_hook(self.forward_hook("layer2"))
+        #         net.features._modules['denseblock3'].register_forward_hook(self.forward_hook("layer3"))
+        #         net.features._modules['denseblock4'].register_forward_hook(self.forward_hook("layer4"))
         else:
-            raise ValueError('Unsupported backbone model selected. Please choose from: resnet50, dense121, inceptionv3. Defaults to resnet50.')
+            raise ValueError('Unsupported backbone model selected. Please choose from: resnet50, or densenet121. Defaults to resnet50.')
         
+        if tl_strategy == 'lw_finetune':
+
+            frozen_param = ['conv1.weight', 'bn1.weight', 'bn1.bias']
+            for name, param in net.named_parameters():
+                param.requires_grad = False if name in frozen_param else True
+            param_count = 0
+            for layer in net.children():
+                for bottleneck in layer.children():
+                    param_count += 1
+                    for name, param in bottleneck.named_parameters():
+                        if param_count <= load_up_to:
+                            param.requires_grad = False
+
         if self.mil_mode in ["mean", "max"]:
             pass
 
         elif self.mil_mode == "att":
-            self.attention = nn.Sequential(nn.Linear(nfc, 2048), nn.Tanh(), nn.Linear(2048, 1))
+            self.attention = nn.Sequential(nn.Linear(nfc, nfc), nn.Tanh(), nn.Linear(nfc, 1))
 
         elif self.mil_mode == "att_trans":
             transformer = nn.TransformerEncoderLayer(d_model=nfc, nhead=8, dropout=trans_dropout)
             self.transformer = nn.TransformerEncoder(transformer, num_layers=trans_blocks)
-            self.attention = nn.Sequential(nn.Linear(nfc, 2048), nn.Tanh(), nn.Linear(2048, 1))
+            self.attention = nn.Sequential(nn.Linear(nfc, nfc), nn.Tanh(), nn.Linear(nfc, 1))
 
         elif self.mil_mode == "att_trans_pyramid":
             transformer_list = nn.ModuleList(
                 [
                     nn.TransformerEncoder(
-                        nn.TransformerEncoderLayer(d_model=256, nhead=8, dropout=trans_dropout), 
+                        nn.TransformerEncoderLayer(d_model=nfc // 8, nhead=8, dropout=trans_dropout), 
                         num_layers=trans_blocks
                     ),
                     nn.Sequential(
-                        nn.Linear(768, 256),
+                        nn.Linear(nfc // 4 + nfc // 8, nfc // 8),
                         nn.TransformerEncoder(
-                            nn.TransformerEncoderLayer(d_model=256, nhead=8, dropout=trans_dropout),
+                            nn.TransformerEncoderLayer(d_model=nfc // 8, nhead=8, dropout=trans_dropout),
                             num_layers=trans_blocks,
                         ),
                     ),
                     nn.Sequential(
-                        nn.Linear(1280, 256),
+                        nn.Linear(nfc // 2 + nfc // 8, nfc // 8),
                         nn.TransformerEncoder(
-                            nn.TransformerEncoderLayer(d_model=256, nhead=8, dropout=trans_dropout),
+                            nn.TransformerEncoderLayer(d_model=nfc // 8, nhead=8, dropout=trans_dropout),
                             num_layers=trans_blocks,
                         ),
                     ),
                     nn.TransformerEncoder(
-                        nn.TransformerEncoderLayer(d_model=nfc + 256, nhead=8, dropout=trans_dropout),
+                        nn.TransformerEncoderLayer(d_model=nfc + nfc // 8, nhead=8, dropout=trans_dropout),
                         num_layers=trans_blocks,
                     ),
                 ]
             )
             self.transformer = transformer_list
-            nfc = nfc + 256
-            self.attention = nn.Sequential(nn.Linear(nfc, 2048), nn.Tanh(), nn.Linear(2048, 1))
+            self.attention = nn.Sequential(nn.Linear(nfc + nfc // 8, nfc), nn.Tanh(), nn.Linear(nfc, 1))
+            nfc = nfc + nfc // 8
 
         else:
             raise ValueError("Unsupported mil_mode: " + str(mil_mode))
@@ -204,9 +205,6 @@ class MILNet(nn.Module):
 
         return x
 
-
-    # def calc_head(self, x: torch.Tensor) -> torch.Tensor:
-    #     return super().calc_head(x)
-    
-    # def forward(self, x: torch.Tensor, no_head: bool = False) -> torch.Tensor:
-    #     return super().forward(x, no_head)
+if __name__ == '__main__':
+    milnet = MILNet(num_classes=2, mil_mode='att_trans_pyramid', pretrained=True, backbone='resnet50', tl_strategy='TF', shrink_coefficient=2, load_up_to=7)
+    print(milnet)

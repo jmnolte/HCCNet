@@ -11,14 +11,15 @@ from monai.transforms import (
     GridPatchd,
     SqueezeDimd,
     CenterSpatialCropd,
+    RandSpatialCropd,
     RandGridPatchd,
     RandFlipd,
     RandRotated,
     RandZoomd,
     RandGibbsNoised,
-    ToTensord,
     EnsureTyped,
-    ToDeviced
+    Lambdad,
+    RandKSpaceSpikeNoised
 )
 from monai import transforms
 from monai.data import (
@@ -274,6 +275,7 @@ class GroupStratifiedSplit(GroupShuffleSplit):
             self,
             split_ratio: float = 0.8,
             n_splits: int = 100,
+            multiclass: bool = False
         ) -> None:
         super().__init__(
             train_size=split_ratio, 
@@ -288,6 +290,7 @@ class GroupStratifiedSplit(GroupShuffleSplit):
             n_splits (int): Number of splits to perform.
         '''
         self.test_ratio = 1 - split_ratio
+        self.multiclass = multiclass
 
     def select_best_split(
             self,
@@ -329,12 +332,18 @@ class GroupStratifiedSplit(GroupShuffleSplit):
         Returns:
             dataframes (pd.DataFrame): Dataframes split according to the test ratio.
         '''
+        if self.multiclass:
+            dataframe['prevlabel'] = np.where(dataframe['label'] == 2, 1, 0)
+            dataframe['label'] = np.where(dataframe['label'] == 2, 0, dataframe['label'])
         splits = super().split(dataframe, groups=dataframe['patient_id'])
         split1, split2 = self.select_best_split(dataframe, splits)
+        if self.multiclass:
+            dataframe['label'] = np.where(dataframe['prevlabel'] == 1, 2, dataframe['label'])
+            dataframe = dataframe.drop(columns=['prevlabel'])
         return dataframe.iloc[split1], dataframe.iloc[split2]
     
-    @staticmethod
     def convert_to_dict(
+            self,
             train: pd.DataFrame,
             val: pd.DataFrame,
             test: pd.DataFrame,
@@ -355,7 +364,10 @@ class GroupStratifiedSplit(GroupShuffleSplit):
         '''
         for idx, df in enumerate([train, val, test]):
             name = 'training' if idx == 0 else 'validation' if idx == 1 else 'test'
-            print('{} total observations in {} set with {} positive cases ({} %).'.format(len(df), name, df['label'].sum(), round(df['label'].mean(), ndigits=3)))
+            if not self.multiclass:
+                print('{} total observations in {} set with {} positive cases ({} %).'.format(len(df), name, df['label'].sum(), round(df['label'].mean(), ndigits=3)))
+            else:
+                print('{} total observations in {} set with {} diagnosed HCC ({} %) and {} developing HCC cases ({} %).'.format(len(df), name, df['label'].value_counts()[1], round(df['label'].value_counts()[1] / len(df), ndigits=3), df['label'].value_counts()[2], round(df['label'].value_counts()[2] / len(df), ndigits=3)))
         split_dict = {'train': train[['uid']].values, 'val': val[['uid']].values, 'test': test[['uid']].values}
         split_dict = {x: [patient for patient in data_dict if patient['uid'] in split_dict[x]] for x in ['train', 'val', 'test']} 
 
@@ -389,7 +401,7 @@ class DatasetPreprocessor(ModalityCheck):
         self.nifti_dir = os.path.join(data_dir, 'nifti')
         self.nifti_patients = glob(os.path.join(self.nifti_dir, '*'), recursive = True)
         if test_run:
-            self.nifti_patients = self.nifti_patients[:100]
+            self.nifti_patients = self.nifti_patients[100:250]
         self.label_dir = os.path.join(data_dir, 'labels')
 
     @staticmethod
@@ -466,6 +478,7 @@ class DatasetPreprocessor(ModalityCheck):
             self,
             modalities: list,
             label_column: str = 'label',
+            multiclass: bool = False,
             verbose: bool = True
             ) -> list:
         
@@ -482,7 +495,10 @@ class DatasetPreprocessor(ModalityCheck):
         '''
         observation_list = super().assert_observation_completeness(modalities, verbose)
         modality_dict = {modality: self.split_observations_by_modality(observation_list, modality) for modality in modalities}
-        label_dict = self.create_label_dict(observation_list, os.path.join(self.label_dir, 'labels.csv'))
+        if not multiclass:
+            label_dict = self.create_label_dict(observation_list, os.path.join(self.label_dir, 'labels.csv'))
+        else:
+            label_dict = self.create_label_dict(observation_list, os.path.join(self.label_dir, 'labels_mc.csv'))
         label_df = pd.DataFrame.from_dict(label_dict)
         label_df['patient_id'] = label_df['uid'].str.split('_').str[1]
         data_dict = self.create_data_dict(observation_list, modality_dict)
@@ -494,13 +510,23 @@ class DatasetPreprocessor(ModalityCheck):
         data_dict = [patient for patient in data_dict if not (patient[label_column] == None)]
         return data_dict, label_df
 
+class NoneTransform(object):
+    """ Does nothing to the image, to be used instead of None
+    
+    Args:
+        image in, image out, nothing is done
+    """
+    def __call__(self, image):       
+        return image
+
 
 def transformations(
         dataset: str,
         modalities: list,
         num_patches: int,
         image_size: int,
-        device,
+        random_prob: float,
+        device
         ) -> transforms:
     '''
     Perform data transformations on image and image labels.
@@ -511,15 +537,27 @@ def transformations(
     Returns:
         transforms (monai.transforms): Data transformations to be applied.
     '''
-    resized_image = int(image_size * 1.5)
+    resized_image = int(image_size * 1.25)
+    # min_offset = None if random_prob == 0 else (0, 0, 0)
+    # max_offset = None if random_prob == 0 else (16, 16, 0)
     preprocessing = Compose([
         LoadImaged(keys=modalities, image_only=False),
         EnsureChannelFirstd(keys=modalities),
         Orientationd(keys=modalities, axcodes='PLI'),
         Resized(keys=modalities, spatial_size=(resized_image, resized_image, 64)),          
+        Lambdad(
+            keys=modalities, 
+            func=lambda x: x.repeat(3, 1, 1, 1)
+            ) if len(modalities) == 1 else NoneTransform(),
         ConcatItemsd(keys=modalities, name='image', dim=0),
-        ScaleIntensityRangePercentilesd(keys='image', lower=1, upper=99, b_min=0, b_max=1, clip=True, channel_wise=True),
-        NormalizeIntensityd(keys='image', nonzero=True, channel_wise=True)
+        ScaleIntensityRangePercentilesd(
+            keys='image', 
+            lower=1, 
+            upper=99, 
+            b_min=0, 
+            b_max=1, 
+            clip=True, 
+            channel_wise=True)
     ])
         
     train_specific = Compose([
@@ -527,25 +565,25 @@ def transformations(
         RandGridPatchd(
             keys='image', 
             patch_size=(resized_image, resized_image, 1), 
-            min_offset=(16, 16, 0),
-            max_offset=(16, 16, 0),
             sort_fn='random', 
             num_patches=num_patches, 
             pad_mode='constant', 
             constant_values=0),
         SqueezeDimd(keys='image', dim=-1),
-        RandRotated(keys='image', prob=0.5, range_x=np.pi/8),
-        RandFlipd(keys='image', prob=0.5, spatial_axis=1),
-        RandFlipd(keys='image', prob=0.5, spatial_axis=2),
+        RandRotated(keys='image', prob=random_prob, range_x=np.pi/8),
+        RandFlipd(keys='image', prob=random_prob, spatial_axis=1),
+        RandFlipd(keys='image', prob=random_prob, spatial_axis=2),
         RandZoomd(
             keys='image', 
-            prob=0.5, 
+            prob=random_prob, 
             min_zoom=(1, 0.9, 0.9), 
-            max_zoom=(1, 1.3, 1.3),
+            max_zoom=(1, 1.1, 1.1),
             padding_mode='constant', 
             constant_values=0),
-        RandGibbsNoised(keys='image', prob=0.5, alpha=(0.1, 0.6)),
-        CenterSpatialCropd(keys='image', roi_size=(num_patches, image_size, image_size))
+        RandSpatialCropd(keys='image', roi_size=(num_patches, image_size, image_size), random_size=False),
+        NormalizeIntensityd(keys='image', channel_wise=True),
+        RandGibbsNoised(keys='image', prob=random_prob, alpha=(0.1, 0.8)),
+        RandKSpaceSpikeNoised("image", prob=random_prob, intensity_range=(1, 11))
     ])
 
     val_test_specific = Compose([
@@ -556,6 +594,7 @@ def transformations(
             constant_values=0),
         SqueezeDimd(keys='image', dim=-1),
         CenterSpatialCropd(keys='image', roi_size=(-1, image_size, image_size)),
+        NormalizeIntensityd(keys='image', channel_wise=True),
         EnsureTyped(keys=['image', 'label'], device=device, track_meta=False)
     ])
 
