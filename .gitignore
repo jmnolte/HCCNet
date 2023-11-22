@@ -250,8 +250,10 @@ research_report/
 ### Output files ###
 *.out
 *.err
+*.sh
 
-### Miscellaneous ###
+### Additional Files ###
 miscellaneous/
+data/preprocessing/
 
 # End of https://www.toptal.com/developers/gitignore/api/python,macos,jupyternotebooks,visualstudiocode
