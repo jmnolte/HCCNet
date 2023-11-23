@@ -42,7 +42,7 @@ def _resnet(
 
     model = ResNet3D(block, layers, block_inplanes, **kwargs)
     if pretrained:
-        weights_path = os.path.join('/Users/noltinho/thesis/sensitive_data/weights', 'resnet_' + arch[-2:] + '_23dataset.pth')
+        weights_path = os.path.join('/home/x3007104/thesis/pretrained_models', 'resnet_' + arch[-2:] + '_23dataset.pth')
         _load_pretrained_weights(model, weights_path, num_channels=kwargs['n_input_channels'])
         if progress:
             print("Loaded pretrained weights from: " + str(weights_path))

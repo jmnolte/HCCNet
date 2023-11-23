@@ -104,8 +104,8 @@ class DatasetPreprocessor:
 
         Returns:
             data_dict (dict): Dictionary containing the paths to the images and corresponding labels.
-        '''
-        self.nifti_dir = os.path.join(data_dir, 'nifti')
+        ''' 
+        self.nifti_dir = os.path.join(data_dir, 'images')
         self.nifti_patients = glob(os.path.join(self.nifti_dir, '*'), recursive = True)
         self.label_dir = os.path.join(data_dir, 'labels')
 
@@ -127,7 +127,11 @@ class DatasetPreprocessor:
         observation_list = []
         for observation in natsorted(self.nifti_patients):
             images = [image for image in glob(os.path.join(observation, '*.nii.gz'))]
-            common_prefix = os.path.commonprefix(images)
+            if len(images) == 1:
+                tail, _ = os.path.split(images[0])
+                common_prefix = tail + '/'
+            else:
+                common_prefix = os.path.commonprefix(images)
             image_names = [image_name[len(common_prefix):] for image_name in images]
             if all(names in image_names for names in image_names_list):
                 observation_list.append(observation)

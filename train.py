@@ -31,7 +31,8 @@ from monai.transforms import (
     EnsureTyped,
     ScaleIntensityd,
     DeleteItemsd,
-    ScaleIntensityd
+    ScaleIntensityd,
+    Resized
 )
 from monai import transforms
 from monai.data import (
@@ -55,6 +56,7 @@ class Trainer:
             model: nn.Module, 
             backbone: str, 
             amp: bool,
+            temp_scaling: bool,
             dataloaders: dict, 
             learning_rate: float, 
             weight_decay: float,
@@ -80,13 +82,16 @@ class Trainer:
         self.gpu_id = int(os.environ['LOCAL_RANK'])
         self.model = model
         self.amp = amp
+        self.temp_scaling = temp_scaling
         self.scaler = GradScaler(enabled=amp)
         self.backbone = backbone
         self.dataloaders = dataloaders
         self.output_dir = output_dir
-        params = self.model.parameters()
+        params = self.model.parameters() if not self.temp_scaling else self.model.module.model.parameters()
         self.optimizer = optim.AdamW(params, lr=learning_rate, weight_decay=weight_decay)
-        # self.temp_optimizer = optim.LBFGS([self.model.module.temperature], lr=0.01, max_iter=50)
+        if self.temp_scaling:
+            self.temperature = self.model.module.temperature
+            self.temp_optimizer = optim.LBFGS([self.temperature], lr=0.01, max_iter=50)
         self.criterion = nn.CrossEntropyLoss(weight=weights, ignore_index=99).to(self.gpu_id)
         self.val_criterion = nn.CrossEntropyLoss(ignore_index=99).to(self.gpu_id)
 
@@ -160,9 +165,6 @@ class Trainer:
             # inputs, labels, pos_encodings = batch_data['image'].to(self.gpu_id), batch_data['label'].to(self.gpu_id), batch_data['age'].type(torch.float32).to(self.gpu_id)
             inputs, labels = batch_data['image'].to(self.gpu_id), batch_data['label'].to(self.gpu_id)
 
-            # inputs = inputs.view(-1, 4, 1, 64, 64)
-            # labels = labels.view(-1, 4)[:,0]
-
             # input_mask = (labels == 99).bool()
             # input_mask = input_mask.view(batch_size, -1)
 
@@ -219,14 +221,14 @@ class Trainer:
         labels_list = []
         running_loss = 0.0
         self.model.eval()
-        with torch.no_grad():
+
+        with torch.set_grad_enabled(self.temp_scaling):
             for step, batch_data in enumerate(self.dataloaders['val']):
                 # inputs, labels, pos_encodings = batch_data['image'].to(self.gpu_id), batch_data['label'].to(self.gpu_id), batch_data['age'].type(torch.float32).to(self.gpu_id)
                 inputs, labels = batch_data['image'].to(self.gpu_id), batch_data['label'].to(self.gpu_id)
 
                 with autocast(enabled=self.amp):
                     # pos_encodings = (pos_encodings - 64.214) / 11.826
-
                     # logits = self.model(
                     #     x=inputs,
                     #     pos_encodings=pos_encodings,
@@ -234,48 +236,50 @@ class Trainer:
                     logits = self.model(inputs)
                     loss = self.criterion(logits, labels)
 
-                # labels_list.append(labels) 
+                if self.temp_scaling:
+                    labels_list.append(labels) 
+                    logits_list.append(logits)
+                else:
+                    running_loss += loss.item()
+                    preds = torch.argmax(logits, 1)
+                    metric.update(preds, labels)
 
-        #     logits = torch.cat(logits_list).to(self.gpu_id)
-        #     labels = torch.cat(labels_list).to(self.gpu_id)
+            if self.temp_scaling:
+                logits = torch.cat(logits_list).to(self.gpu_id)
+                labels = torch.cat(labels_list).to(self.gpu_id)
+                unscaled_ce = self.val_criterion(logits, labels)
+                self.temp_optimizer.step(self.closure(logits, labels))
+                epoch_loss = self.val_criterion(logits, labels)
+                
+                if self.gpu_id == 0:
+                    print(f'Validation loss after temperature scaling: {unscaled_ce:.4f}')
+                    print(f'Validation loss before temperature scaling: {epoch_loss:.4f}')
+                    print(epoch_loss)
+                    print(f'Optimal temperature: {self.temperature.item():.4f}')
 
-        # # Calculate unscaled ce loss
-        # loss_before_scaling = self.val_criterion(logits, labels)
-        # print(f'Validation loss before temperature scaling: {loss_before_scaling:.4f}')
-
-        # # Next: optimize the temperature w.r.t. NLL
-        # # optimizer = optim.LBFGS([self.temperature], lr=0.01, max_iter=50)
-
-        # def eval():
-        #     self.temp_optimizer.zero_grad()
-        #     loss = self.val_criterion(self.scale_temperature(logits), labels)
-        #     loss.backward()
-        #     dist.all_reduce(loss, op=dist.ReduceOp.AVG)
-        #     return loss
-
-        # self.temp_optimizer.step(eval)
-
-        # loss_after_scaling = self.val_criterion(self.scale_temperature(logits), labels)
-        # print(f'Validation loss after temperature scaling: {loss_after_scaling:.4f}')
-        # print(f'Optimal temperature: {self.model.module.temperature.item():.4f}')
-
-        # preds = torch.argmax(logits, 1)
-        # metric.update(preds, labels)
-        # epoch_f1score = metric.compute()
-        # metric.reset()
-        # epoch_loss = loss_after_scaling
-
-                running_loss += loss.item()
                 preds = torch.argmax(logits, 1)
                 metric.update(preds, labels)
+            else:
+                epoch_loss = running_loss / len(self.dataloaders['val'])
 
-            epoch_loss = running_loss / len(self.dataloaders['val'])
             epoch_f1score = metric.compute()
             metric.reset()
             print(f"[GPU {self.gpu_id}] Epoch {epoch}, Validation Loss: {epoch_loss:.4f}, and F1-Score: {epoch_f1score:.4f}")
 
-        # print(f"[GPU {self.gpu_id}] Epoch {epoch}, Validation Loss: {epoch_loss:.4f}, and F1-Score: {epoch_f1score:.4f}")
         return epoch_loss, epoch_f1score
+
+    def closure(
+            self, 
+            logits: torch.Tensor, 
+            labels: torch.Tensor
+        ) -> torch.Tensor:
+
+        self.temp_optimizer.zero_grad()
+        loss = self.val_criterion(logits, labels)
+        loss.backward()
+        dist.all_reduce(loss, op=dist.ReduceOp.AVG)
+        return loss
+
     
     def training_loop(
             self, 
@@ -318,14 +322,15 @@ class Trainer:
                 history['val_loss'].append(val_loss)
                 history['val_f1score'].append(val_f1score.cpu().item())
 
-                if dist.all_reduce(val_loss, op=dist.ReduceOp.AVG) < best_loss:
-                    best_loss = val_loss
-                    f1score = val_f1score
-                    counter = 0
-                    print(f'[GPU {self.gpu_id}] New best Validation Loss: {best_loss:.4f}. Saving model weights...')
-                    best_weights = copy.deepcopy(self.model.state_dict())
-                else:
-                    counter += 1
+                if self.gpu_id == 0:
+                    if val_loss < best_loss:
+                        best_loss = val_loss
+                        f1score = val_f1score
+                        counter = 0
+                        print(f'[GPU {self.gpu_id}] New best Validation Loss: {best_loss:.4f}. Saving model weights...')
+                        best_weights = copy.deepcopy(self.model.state_dict())
+                    else:
+                        counter += 1
 
             train_time = time.time() - start_time
             if self.gpu_id == 0:
@@ -397,6 +402,8 @@ def parse_args() -> argparse.Namespace:
                         help="Model encoder to use. Defaults to ResNet50.")
     parser.add_argument("--pretrained", action='store_true',
                         help="Flag to use pretrained weights.")
+    parser.add_argument("--temp-scaling", action='store_true',
+                        help="Flag to scale the raw model logits using temperature scalar.")
     parser.add_argument("--distributed", action='store_true',
                         help="Flag to enable distributed training.")
     parser.add_argument("--amp", action='store_true',
@@ -447,9 +454,9 @@ def load_train_objs(
     Returns:
         tuple: Training objects consisting of the datasets, dataloaders, the model, and the performance metric.
     '''
-    data_dict, label_df = DatasetPreprocessor(data_dir=args.data_dir).load_data(modalities=args.mod_list)
-    train, val_test = GroupStratifiedSplit(split_ratio=0.75).split_dataset(label_df)
-    test, val = GroupStratifiedSplit(split_ratio=0.9).split_dataset(val_test)
+    data_dict, label_df = DatasetPreprocessor(data_dir=args.data_dir).load_data(modalities=['DWI_b0'])
+    train, val_test = GroupStratifiedSplit(split_ratio=args.train_ratio).split_dataset(label_df)
+    val, test = GroupStratifiedSplit(split_ratio=0.6).split_dataset(val_test)
     split_dict = convert_to_dict(train, val, test, data_dict)
     label_dict = {x: [patient['label'] for patient in split_dict[x]] for x in ['train', 'val']}
 
@@ -474,13 +481,13 @@ def load_train_objs(
         data=split_dict[x], 
         transform=data_transforms(
             dataset=x, 
-            modalities=args.mod_list, 
+            modalities=['DWI_b0'], 
             device=device_id), 
         num_workers=4,
         copy_cache=False) for x in ['train','val']}
     dataloader = {x: ThreadDataLoader(
         datasets[x], 
-        batch_size=(args.batch_size if x == 'train' else 1), 
+        batch_size=(args.batch_size if x == 'train' else int(args.batch_size / 4)), 
         shuffle=(True if x == 'train' else False), 
         num_workers=0) for x in ['train','val']}
 
@@ -505,26 +512,29 @@ def data_transforms(
         LoadImaged(keys=modalities, image_only=True),
         EnsureChannelFirstd(keys=modalities),
         Orientationd(keys=modalities, axcodes='RAS'),
-        Spacingd(keys=modalities, pixdim=(1.5, 1.5, 2.0), mode=('bilinear')),
-        ResampleToMatchd(keys=modalities, key_dst='T2W_TES', mode=('bilinear')),
+        Spacingd(keys=modalities, pixdim=(1.5, 1.5, 1.75), mode=('bilinear')),
+        # ResampleToMatchd(keys=modalities, key_dst='T2W_TES', mode=('bilinear')),
         SpatialCropPercentiled(keys=modalities, roi_center=(0.5, 0.5, 0.5), roi_size=(256, -1, -1)),
         CropForegroundd(
             keys=modalities, 
-            source_key='T2W_TES', 
-            select_fn=lambda x: x > torch.mean(x),
-            allow_smaller=True,
-            margin=32),
+            source_key='DWI_b0', 
+            select_fn=lambda x: x > torch.median(x),
+            allow_smaller=True),
         ResizeWithPadOrCropd(keys=modalities, spatial_size=(256, 256, -1)),
-        SpatialCropPercentiled(keys=modalities, roi_center=(0.7, 0.5, 0.55), roi_size=(96, 96, 96)),
+        SpatialCropPercentiled(keys=modalities, roi_center=(0.7, 0.5, 0.5), roi_size=(96, 96, 96)),
         ConcatItemsd(keys='DWI_b0', name='image'),
         DeleteItemsd(keys=modalities),
         ScaleIntensityd(keys='image', minv=0.0, maxv=1.0),
-        NormalizeIntensityd(keys='image', subtrahend=0.0677, divisor=0.0821)
+        NormalizeIntensityd(keys='image', subtrahend=0.0666, divisor=0.0769)
     ]
 
     train = [
         EnsureTyped(keys='image', track_meta=False, device=device),
-        RandSpatialCropd(keys='image', roi_size=(64, 64, 64), random_size=False),
+        RandSpatialCropd(
+            keys='image', 
+            roi_size=(64, 64, 64), 
+            random_size=False, 
+            random_center=True),
         RandFlipd(keys='image', prob=0.1, spatial_axis=0),
         RandFlipd(keys='image', prob=0.1, spatial_axis=1),
         RandFlipd(keys='image', prob=0.1, spatial_axis=2),
@@ -572,6 +582,8 @@ def main(
     '''
     # Set a seed for reproducibility.
     set_determinism(seed=args.seed)
+    print(args.mod_list)
+    # args.mod_list = ['DWI_b0']
     # Setup distributed training.
     if args.distributed:
         setup()
@@ -597,7 +609,7 @@ def main(
     #     mil_mode=args.mil_mode,
     #     truncate_layer=None,
     #     pretrained=args.pretrained)
-    # model = CalibratedModel(model)
+    model = CalibratedModel(model) if args.temp_scaling else model
     model.metric = metric
     if args.distributed:
         model = nn.SyncBatchNorm.convert_sync_batchnorm(model) if args.backbone != 'swinvit' else model
@@ -608,7 +620,7 @@ def main(
     else:
         model = model.to(device_id)
     # Train the model using the training data and validate the model on the validation data following each epoch.
-    trainer = Trainer(model, args.backbone, args.amp, dataloader, learning_rate, args.weight_decay, weights, args.results_dir)
+    trainer = Trainer(model, args.backbone, args.amp, args.temp_scaling, dataloader, learning_rate, args.weight_decay, weights, args.results_dir)
     trainer.training_loop(metric, args.min_epochs, args.val_interval, args.batch_size, accum_steps, args.patience)
     # Cleanup distributed training.
     if args.distributed:

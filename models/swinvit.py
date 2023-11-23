@@ -243,7 +243,7 @@ def _swinvit(
         num_heads=(3, 6, 12, 24),
         **kwargs)
     if pretrained:
-        _load_pretrained_weights(model, '/Users/noltinho/thesis/sensitive_data/weights/ssl_pretrained_weights.pth', verbose=progress)
+        _load_pretrained_weights(model, '/home/x3007104/thesis/pretrained_models/ssl_pretrained_weights.pth', verbose=progress)
     return model
 
 def swinvit_small(pretrained: bool = False, progress: bool = False, **kwargs: Any) -> SwinTransformer:
