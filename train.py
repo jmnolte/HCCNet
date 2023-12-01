@@ -32,22 +32,29 @@ from monai.transforms import (
     ScaleIntensityd,
     DeleteItemsd,
     ScaleIntensityd,
-    Resized
+    CenterSpatialCropd,
+    Resized,
+    ScaleIntensityRangePercentilesd
 )
 from monai import transforms
 from monai.data import (
     ThreadDataLoader,
     CacheDataset,
     set_track_meta,
-    partition_dataset_classes
+    partition_dataset_classes,
+    list_data_collate
 )
 from monai.utils import set_determinism
 
 from data.transforms import SpatialCropPercentiled
 from data.splits import GroupStratifiedSplit
-from data.utils import DatasetPreprocessor, convert_to_dict
-from models.resnet3d import resnet10
+from data.datasets import CacheSeqDataset
+from data.utils import DatasetPreprocessor, convert_to_dict, convert_to_seqdict, collate_sequence_batch
+from models.resnet3d import resnet10, resnet50
 from models.swinvit import swinvit_base
+from models.sequencenet import SequenceNet
+from losses.focalloss import FocalLoss
+from losses.recallloss import RecallLoss
 
 class Trainer:
     
@@ -84,16 +91,18 @@ class Trainer:
         self.amp = amp
         self.temp_scaling = temp_scaling
         self.scaler = GradScaler(enabled=amp)
+        self.val_scaler = GradScaler(enabled=amp)
         self.backbone = backbone
         self.dataloaders = dataloaders
         self.output_dir = output_dir
-        params = self.model.parameters() if not self.temp_scaling else self.model.module.model.parameters()
+        params = self.model.parameters()
         self.optimizer = optim.AdamW(params, lr=learning_rate, weight_decay=weight_decay)
         if self.temp_scaling:
-            self.temperature = self.model.module.temperature
+            self.temperature = nn.Parameter(torch.ones(1) * 1.5)
             self.temp_optimizer = optim.LBFGS([self.temperature], lr=0.01, max_iter=50)
-        self.criterion = nn.CrossEntropyLoss(weight=weights, ignore_index=99).to(self.gpu_id)
-        self.val_criterion = nn.CrossEntropyLoss(ignore_index=99).to(self.gpu_id)
+        self.m = nn.Sigmoid()
+        self.criterion = RecallLoss().to(self.gpu_id)
+        self.val_criterion = RecallLoss().to(self.gpu_id)
 
     def save_output(
             self, 
@@ -162,26 +171,26 @@ class Trainer:
             print('-' * 10)
 
         for step, batch_data in enumerate(self.dataloaders['train']):
-            # inputs, labels, pos_encodings = batch_data['image'].to(self.gpu_id), batch_data['label'].to(self.gpu_id), batch_data['age'].type(torch.float32).to(self.gpu_id)
+            # inputs, labels, encodings = batch_data['image'].to(self.gpu_id), batch_data['label'].to(self.gpu_id), batch_data['age'].type(torch.float32).to(self.gpu_id)
             inputs, labels = batch_data['image'].to(self.gpu_id), batch_data['label'].to(self.gpu_id)
 
             # input_mask = (labels == 99).bool()
-            # input_mask = input_mask.view(batch_size, -1)
-
-            # pos_encodings = (pos_encodings - 64.214) / 11.826
+            # encodings = (encodings - 64.214) / 11.826
 
             with autocast(enabled=self.amp):
                 # logits = self.model(
                 #     x=inputs, 
                 #     x_mask=input_mask,
-                #     pos_encodings=pos_encodings,
+                #     encodings=encodings,
                 #     batch_size=batch_size)
                 logits = self.model(inputs)
+                if self.temp_scaling:
+                    logits = self.scale_logits(logits)
                 loss = self.criterion(logits, labels)
-                loss /= accum_steps
+                loss = loss / accum_steps
             
-            running_loss += loss.item()
             self.scaler.scale(loss).backward()
+            running_loss += loss.item()
             preds = torch.argmax(logits, 1)
             batch_f1score = metric(preds, labels)
     
@@ -222,64 +231,56 @@ class Trainer:
         running_loss = 0.0
         self.model.eval()
 
-        with torch.set_grad_enabled(self.temp_scaling):
+        with torch.no_grad():
             for step, batch_data in enumerate(self.dataloaders['val']):
-                # inputs, labels, pos_encodings = batch_data['image'].to(self.gpu_id), batch_data['label'].to(self.gpu_id), batch_data['age'].type(torch.float32).to(self.gpu_id)
+                # inputs, labels, encodings = batch_data['image'].to(self.gpu_id), batch_data['label'].to(self.gpu_id), batch_data['age'].type(torch.float32)
                 inputs, labels = batch_data['image'].to(self.gpu_id), batch_data['label'].to(self.gpu_id)
 
+                # encodings = (encodings - 64.214) / 11.826
+
                 with autocast(enabled=self.amp):
-                    # pos_encodings = (pos_encodings - 64.214) / 11.826
                     # logits = self.model(
                     #     x=inputs,
-                    #     pos_encodings=pos_encodings,
+                    #     encodings=encodings,
                     #     batch_size=1)
                     logits = self.model(inputs)
-                    loss = self.criterion(logits, labels)
+                    loss = self.val_criterion(logits, labels)
 
-                if self.temp_scaling:
-                    labels_list.append(labels) 
-                    logits_list.append(logits)
-                else:
-                    running_loss += loss.item()
-                    preds = torch.argmax(logits, 1)
-                    metric.update(preds, labels)
+                    if self.temp_scaling:
+                        logits_list.append(logits)
+                        labels_list.append(labels)
 
-            if self.temp_scaling:
-                logits = torch.cat(logits_list).to(self.gpu_id)
-                labels = torch.cat(labels_list).to(self.gpu_id)
-                unscaled_ce = self.val_criterion(logits, labels)
-                self.temp_optimizer.step(self.closure(logits, labels))
-                epoch_loss = self.val_criterion(logits, labels)
-                
-                if self.gpu_id == 0:
-                    print(f'Validation loss after temperature scaling: {unscaled_ce:.4f}')
-                    print(f'Validation loss before temperature scaling: {epoch_loss:.4f}')
-                    print(epoch_loss)
-                    print(f'Optimal temperature: {self.temperature.item():.4f}')
-
+                running_loss += loss.item()
                 preds = torch.argmax(logits, 1)
                 metric.update(preds, labels)
-            else:
-                epoch_loss = running_loss / len(self.dataloaders['val'])
 
-            epoch_f1score = metric.compute()
-            metric.reset()
-            print(f"[GPU {self.gpu_id}] Epoch {epoch}, Validation Loss: {epoch_loss:.4f}, and F1-Score: {epoch_f1score:.4f}")
+            unscaled_ce = running_loss / len(self.dataloaders['val'])
+
+        if self.temp_scaling:
+            logits = torch.cat(logits_list)
+            labels = torch.cat(labels_list)
+
+            def closure():
+                self.temp_optimizer.zero_grad()
+                loss = self.val_criterion(self.scale_logits(logits), labels)
+                loss.backward()
+                dist.all_reduce(loss, op=dist.ReduceOp.AVG)
+                return loss
+
+            self.temp_optimizer.step(closure)
+            scaled_ce = self.val_criterion(self.scale_logits(logits), labels)
+            
+            if self.gpu_id == 0:
+                print(f'Loss before temperature scaling: {unscaled_ce}')
+                print(f'Loss after temperature scaling: {scaled_ce}')
+                print(f'Optimal temperature: {self.temperature.item()}')
+
+        epoch_loss = unscaled_ce if not self.temp_scaling else scaled_ce
+        epoch_f1score = metric.compute()
+        metric.reset()
+        print(f"[GPU {self.gpu_id}] Epoch {epoch}, Validation Loss: {epoch_loss:.4f}, and F1-Score: {epoch_f1score:.4f}")
 
         return epoch_loss, epoch_f1score
-
-    def closure(
-            self, 
-            logits: torch.Tensor, 
-            labels: torch.Tensor
-        ) -> torch.Tensor:
-
-        self.temp_optimizer.zero_grad()
-        loss = self.val_criterion(logits, labels)
-        loss.backward()
-        dist.all_reduce(loss, op=dist.ReduceOp.AVG)
-        return loss
-
     
     def training_loop(
             self, 
@@ -345,6 +346,48 @@ class Trainer:
             print('Loss {:.4f} and F1-Score {:.4f} of best model configuration:'.format(best_loss, f1score.item()))
             self.save_output(best_weights, 'weights')
             self.save_output(history, 'history')
+
+    def scale_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        temperature = self.temperature.unsqueeze(1).expand(logits.size(0), logits.size(1))
+        return logits / temperature.to(self.gpu_id)
+
+    # def extract_activations(self):
+
+    #     activation = {}
+    #     def get_activation(name):
+    #         def hook(model, input, output):
+    #             activation[name] = output.detach()
+    #         return hook
+
+    #     self.model.activations.register_forward_hook(get_activation('fc'))
+
+    #     labels_list, activations_list = [], []
+
+    #     for phase in ['train', 'val', 'test']:
+    #         for batch_data in self.dataloaders[phase]:
+    #             name = batch_data["image_meta_dict"]["filename_or_obj"]
+    #             inputs = batch_data["image"].to(device)
+    #             labels = batch_data["label"].to(device)
+                
+    #             _ = self.model(inputs)
+                
+    #             img_path.extend(name)
+    #             labels_list.append(labels.detach().cpu().numpy())
+    #             activations_list.append(activation['fc'].cpu().numpy())
+
+    #     features = np.concatenate(activations_list)
+    #     labels = np.concatenate(labels_list)
+
+    #     id_df = pd.DataFrame(img_path, columns=['id'])
+    #     labels_df = pd.DataFrame(labels, columns=['HCC'])
+    #     feats_df = pd.DataFrame(features, 
+    #                             columns = ["var%d" % (i + 1) 
+    #                             for i in range(features.shape[1])])
+
+    #     deep_feats = pd.concat([id_df.reset_index(drop=True), labels_df, feats_df], axis=1)
+
+    #     # write dataframe to csv
+    #     deep_feats.to_csv(os.path.join('/home/x3007104/thesis/results', 'DeepFeatures.csv'), index=False, header=True, sep=',')
 
 
     def visualize_training(
@@ -454,9 +497,9 @@ def load_train_objs(
     Returns:
         tuple: Training objects consisting of the datasets, dataloaders, the model, and the performance metric.
     '''
-    data_dict, label_df = DatasetPreprocessor(data_dir=args.data_dir).load_data(modalities=['DWI_b0'])
+    data_dict, label_df = DatasetPreprocessor(data_dir=args.data_dir).load_data(modalities=args.mod_list)
     train, val_test = GroupStratifiedSplit(split_ratio=args.train_ratio).split_dataset(label_df)
-    val, test = GroupStratifiedSplit(split_ratio=0.6).split_dataset(val_test)
+    val, test = GroupStratifiedSplit(split_ratio=0.5).split_dataset(val_test)
     split_dict = convert_to_dict(train, val, test, data_dict)
     label_dict = {x: [patient['label'] for patient in split_dict[x]] for x in ['train', 'val']}
 
@@ -470,26 +513,38 @@ def load_train_objs(
             num_partitions=dist.get_world_size(),
             shuffle=True,
             even_divisible=(True if x == 'train' else False))[dist.get_rank()] for x in ['train','val']}
-    # seq_class_dict = {x: [max(patient['label']) for patient in seq_split_dict[x][0]] for x in ['train', 'val', 'test']}
+
+    # seq_split_dict = convert_to_seqdict(split_dict, ['train', 'val'])
+    # seq_class_dict = {x: [max(patient['label']) for patient in seq_split_dict[x][0]] for x in ['train', 'val']}
     # seq_split_dict = {x: partition_dataset_classes(
     #     data=seq_split_dict[x][0],
     #     classes=seq_class_dict[x],
     #     num_partitions=dist.get_world_size(),
     #     shuffle=True,
     #     even_divisible=(True if x == 'train' else False))[dist.get_rank()] for x in ['train','val']}
+
     datasets = {x: CacheDataset(
         data=split_dict[x], 
         transform=data_transforms(
             dataset=x, 
-            modalities=['DWI_b0'], 
+            modalities=args.mod_list, 
             device=device_id), 
-        num_workers=4,
+        num_workers=8,
         copy_cache=False) for x in ['train','val']}
+    # datasets = {x: CacheSeqDataset(
+    #     data=seq_split_dict[x], 
+    #     transform=data_transforms(
+    #         dataset=x, 
+    #         modalities=args.mod_list,
+    #         device=device_id), 
+    #     num_workers=8,
+    #     copy_cache=False) for x in ['train','val']}
     dataloader = {x: ThreadDataLoader(
         datasets[x], 
-        batch_size=(args.batch_size if x == 'train' else int(args.batch_size / 4)), 
-        shuffle=(True if x == 'train' else False), 
-        num_workers=0) for x in ['train','val']}
+        batch_size=(args.batch_size if x == 'train' else 1), 
+        shuffle=(True if x == 'train' else False),   
+        num_workers=0,
+        drop_last=(True if x == 'train' else False)) for x in ['train','val']}
 
     return dataloader, metric, weights
 
@@ -512,20 +567,38 @@ def data_transforms(
         LoadImaged(keys=modalities, image_only=True),
         EnsureChannelFirstd(keys=modalities),
         Orientationd(keys=modalities, axcodes='RAS'),
-        Spacingd(keys=modalities, pixdim=(1.5, 1.5, 1.75), mode=('bilinear')),
-        # ResampleToMatchd(keys=modalities, key_dst='T2W_TES', mode=('bilinear')),
-        SpatialCropPercentiled(keys=modalities, roi_center=(0.5, 0.5, 0.5), roi_size=(256, -1, -1)),
-        CropForegroundd(
-            keys=modalities, 
-            source_key='DWI_b0', 
-            select_fn=lambda x: x > torch.median(x),
-            allow_smaller=True),
-        ResizeWithPadOrCropd(keys=modalities, spatial_size=(256, 256, -1)),
-        SpatialCropPercentiled(keys=modalities, roi_center=(0.7, 0.5, 0.5), roi_size=(96, 96, 96)),
-        ConcatItemsd(keys='DWI_b0', name='image'),
+        Spacingd(keys=modalities, pixdim=(2.0, 2.0, 1.5), mode='bilinear'),
+        ResampleToMatchd(keys=modalities, key_dst='DWI_b0', mode='bilinear'),
+        ConcatItemsd(keys=modalities, name='image'),
         DeleteItemsd(keys=modalities),
-        ScaleIntensityd(keys='image', minv=0.0, maxv=1.0),
-        NormalizeIntensityd(keys='image', subtrahend=0.0666, divisor=0.0769)
+        Resized(keys='image', spatial_size=(200, 200, 151)),
+        ScaleIntensityRangePercentilesd(
+            keys='image', lower=0.5, upper=99.5, b_min=0.0, b_max=1.0, 
+            channel_wise=True, clip=True),
+        NormalizeIntensityd(
+            keys='image', 
+            subtrahend=(0.0885, 0.0953, 0.1020), 
+            divisor=(0.1548, 0.1473, 0.1439),
+            channel_wise=True),
+        # NormalizeIntensityd(
+        #     keys='image', 
+        #     subtrahend=(0.0252, 0.0302, 0.0279, 1.314, 1.596, 1.475), 
+        #     divisor=(0.0488, 0.0549, 0.0492, 0.1620, 0.1819, 0.1738),
+        #     channel_wise=True),
+        SpatialCropPercentiled(keys='image', roi_center=(0.5, 0.5, 0.6), roi_size=(160, -1, 96)),
+        CropForegroundd(
+            keys='image', 
+            source_key='image', 
+            select_fn=lambda x: x > torch.mean(x) * 2,
+            allow_smaller=False),
+        ResizeWithPadOrCropd(keys='image', spatial_size=(160, 128, -1)),
+        SpatialCropPercentiled(keys='image', roi_center=(0.65, 0.5, 0.5), roi_size=(96, 96, -1)),
+        NormalizeIntensityd(
+            keys='image', 
+            subtrahend=(0.6518, 0.5352, 0.5237), 
+            divisor=(1.0, 1.0, 1.0),
+            channel_wise=True),
+        # ScaleIntensityd(keys='image', minv=0.0, maxv=1.0)
     ]
 
     train = [
@@ -582,8 +655,6 @@ def main(
     '''
     # Set a seed for reproducibility.
     set_determinism(seed=args.seed)
-    print(args.mod_list)
-    # args.mod_list = ['DWI_b0']
     # Setup distributed training.
     if args.distributed:
         setup()
@@ -599,17 +670,19 @@ def main(
     dataloader, metric, weights = load_train_objs(device_id, args)
     set_track_meta(False)
     if args.backbone == 'resnet10':
-        model = resnet10(pretrained=True, n_input_channels=1, num_classes=args.num_classes, shortcut_type='B')
+        model = resnet10(pretrained=True, n_input_channels=len(args.mod_list), num_classes=args.num_classes, shortcut_type='B')
+    elif args.backbone == 'resnet50':
+        model = resnet50(pretrained=True, n_input_channels=len(args.mod_list), num_classes=args.num_classes, shortcut_type='B')
     elif args.backbone == 'swinvit':
-        model = swinvit_base(pretrained=True, in_chans=1, num_classes=args.num_classes)
-    # else:
-    #     model = MILNet(
-    #     backbone=args.backbone,
-    #     num_channels=1,
-    #     mil_mode=args.mil_mode,
-    #     truncate_layer=None,
-    #     pretrained=args.pretrained)
-    model = CalibratedModel(model) if args.temp_scaling else model
+        model = swinvit_base(pretrained=True, in_chans=len(args.mod_list), num_classes=args.num_classes)
+    else:
+        model = MILNet(
+            backbone=args.backbone,
+            num_channels=len(args.mod_list),
+            mil_mode=args.mil_mode,
+            truncate_layer=None,
+            pretrained=args.pretrained)
+    # model = SequenceNet(model, num_classes=2, dropout=0.1)
     model.metric = metric
     if args.distributed:
         model = nn.SyncBatchNorm.convert_sync_batchnorm(model) if args.backbone != 'swinvit' else model

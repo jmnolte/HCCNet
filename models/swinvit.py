@@ -181,10 +181,10 @@ class SwinTransformer(nn.Module):
         out = self.head(x)
         return out
     
-def _load_pretrained_weights(model: nn.Module, path: str, verbose: bool = False):
+def _load_pretrained_weights(model: nn.Module, path: str, num_channels: int = 1, verbose: bool = False):
 
     print("Loading Weights from the Path {}".format(path))
-    ssl_dict = torch.load(path, map_location=torch.device("cpu"))
+    ssl_dict = torch.load(path)
     ssl_weights = ssl_dict["model"]
 
     # Generate new state dict so it can be loaded to MONAI SwinUNETR Model
@@ -208,9 +208,16 @@ def _load_pretrained_weights(model: nn.Module, path: str, verbose: bool = False)
         else:
             monai_loadable_state_dict[key] = value
 
+    if num_channels > 1:
+        monai_loadable_state_dict["patch_embed.proj.weight"] = monai_loadable_state_dict[
+            "patch_embed.proj.weight"
+            ].repeat(1, num_channels, 1, 1, 1)
+
     model_update_dict.update(monai_loadable_state_dict)
     model.load_state_dict(model_update_dict, strict=False)
     model_final_loaded_dict = model.state_dict()
+
+    print("Pretrained Weights Succesfully Loaded !")
 
     if verbose:
         layer_counter = 0
@@ -228,10 +235,9 @@ def _load_pretrained_weights(model: nn.Module, path: str, verbose: bool = False)
                 if diff == 0.0:
                     print("Warning: No difference found for layer {}".format(k))
         print("Total updated layers {} / {}".format(layer_counter, len(model_prior_dict)))
-        print("Pretrained Weights Succesfully Loaded !")
 
 def _swinvit(
-        pretrained: bool = False,
+        pretrained,
         progress: bool = False,
         **kwargs: Any
     ) -> SwinTransformer:
@@ -243,7 +249,7 @@ def _swinvit(
         num_heads=(3, 6, 12, 24),
         **kwargs)
     if pretrained:
-        _load_pretrained_weights(model, '/home/x3007104/thesis/pretrained_models/ssl_pretrained_weights.pth', verbose=progress)
+        _load_pretrained_weights(model, '/home/x3007104/thesis/pretrained_models/ssl_pretrained_weights.pth', num_channels=kwargs['in_chans'], verbose=progress)
     return model
 
 def swinvit_small(pretrained: bool = False, progress: bool = False, **kwargs: Any) -> SwinTransformer:
