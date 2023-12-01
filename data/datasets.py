@@ -57,13 +57,11 @@ class SeqDataset(_TorchDataset):
         """
         Fetch single data item from `self.data`.
         """
-        time_points = len(self.data[index]['T1D'])
+        time_points = len(self.data[index]['DWI_b0'])
         seq_data = []
 
         for i in range(time_points):
             new_dict = {
-                'T1D': [self.data[index]['T1D'][i]],
-                'T2W_TES': [self.data[index]['T2W_TES'][i]],
                 'DWI_b0': [self.data[index]['DWI_b0'][i]],
                 'label': self.data[index]['label'][i],
                 'age': self.data[index]['age'][i]
@@ -286,12 +284,10 @@ class CacheSeqDataset(SeqDataset):
             lambda t: isinstance(t, RandomizableTrait) or not isinstance(t, Transform)
         )
 
-        time_points = len(self.data[idx]['T1D'])
+        time_points = len(self.data[idx]['DWI_b0'])
         item_seq = []
         for i in range(time_points):
             new_dict = {
-                'T1D': [self.data[idx]['T1D'][i]],
-                'T2W_TES': [self.data[idx]['T2W_TES'][i]],
                 'DWI_b0': [self.data[idx]['DWI_b0'][i]],
                 'label': self.data[idx]['label'][i],
                 'age': self.data[idx]['age'][i]

@@ -105,7 +105,7 @@ class DatasetPreprocessor:
         Returns:
             data_dict (dict): Dictionary containing the paths to the images and corresponding labels.
         ''' 
-        self.nifti_dir = os.path.join(data_dir, 'images')
+        self.nifti_dir = os.path.join(data_dir, 'nifti')
         self.nifti_patients = glob(os.path.join(self.nifti_dir, '*'), recursive = True)
         self.label_dir = os.path.join(data_dir, 'labels')
 
