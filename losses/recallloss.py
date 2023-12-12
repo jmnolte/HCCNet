@@ -4,38 +4,37 @@ import torch.nn.functional as F
 
 
 class RecallLoss(nn.Module):
-    def __init__(self, n_classes: int = 2, ignore_index: int = 99):
+    def __init__(self, ignore_index: int = 99):
         super().__init__()
-        self.n_classes = n_classes
         self.ignore_index = ignore_index
 
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor): 
-        # input (batch,n_classes,H,W)
-        # target (batch,H,W)
-        pred = logits.argmax(1)
-        index = (pred != targets).view(-1) 
-        
-        #calculate ground truth counts
-        gt_counter = torch.ones((self.n_classes,)).to(targets.device)
-        gt_idx, gt_count = torch.unique(targets, return_counts=True)
-        
-        # map ignored label to an exisiting one
-        gt_count[gt_idx==self.ignore_index] = gt_count[1]
-        gt_idx[gt_idx==self.ignore_index] = 1 
-        gt_counter[gt_idx] = gt_count.float()
-        
-        #calculate false negative counts
-        fn_counter = torch.ones((self.n_classes)).to(targets.device)
-        fn = targets.view(-1)[index]
-        fn_idx, fn_count = torch.unique(fn, return_counts=True)
-        
-        # map ignored label to an exisiting one
-        fn_count[fn_idx==self.ignore_index] = fn_count[1]
-        fn_idx[fn_idx==self.ignore_index] = 1 
-        fn_counter[fn_idx] = fn_count.float()
+    def forward(self, logits: torch.Tensor, labels: torch.Tensor): 
 
-        weight = fn_counter / gt_counter
-        
-        ce_loss = F.cross_entropy(logits, targets, reduction='none', ignore_index=self.ignore_index)
-        loss = weight[targets] * ce_loss
-        return loss.mean()
+        if logits.shape[1] == 1:
+            sigmoid = nn.Sigmoid()
+            preds = sigmoid(logits) > 0.5
+            if labels.dim() == 1:
+                labels = labels.unsqueeze(1)
+        elif logits.shape[1] > 1:
+            preds = logits.argmax(1)
+
+        preds = preds > 0.5
+        neg_idx, pos_idx = (labels == 0), (labels == 1)
+        neg_count, pos_count = neg_idx.sum(), pos_idx.sum()
+        fn_count = (preds != labels)[pos_idx].sum()
+        fp_count = (preds != labels)[neg_idx].sum()
+        fpr = fp_count / neg_count
+        fnr = fn_count / pos_count
+        weights = labels.float().clone()
+        weights[neg_idx] = fpr.item()
+        weights[pos_idx] = fnr.item()
+
+        if logits.shape[1] == 1:
+            ce_loss = F.binary_cross_entropy_with_logits(logits, labels.float(), reduction='none')
+            recall_ce = weights.squeeze(1) * ce_loss.squeeze(1)
+            return recall_ce.mean()
+
+        elif logits.shape[1] > 1:
+            ce_loss = F.cross_entropy(logits, labels, reduction='none')
+            recall_ce = weights * ce_loss
+            return recall_ce.mean()

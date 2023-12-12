@@ -23,18 +23,23 @@ from monai.transforms import (
     CropForegroundd,
     ConcatItemsd,
     RandScaleIntensityd,
+    ScaleIntensityd,
     NormalizeIntensityd,
     RandSpatialCropd,
     ResampleToMatchd,
     RandStdShiftIntensityd,
     RandFlipd,
     EnsureTyped,
-    ScaleIntensityd,
     DeleteItemsd,
-    ScaleIntensityd,
+    ScaleIntensityRangePercentilesd,
     CenterSpatialCropd,
     Resized,
-    ScaleIntensityRangePercentilesd
+    Lambdad,
+    KeepLargestConnectedComponentd,
+    RandGridPatchd,
+    GridPatchd,
+    ForegroundMaskd,
+    MaskIntensityd
 )
 from monai import transforms
 from monai.data import (
@@ -45,25 +50,26 @@ from monai.data import (
     list_data_collate
 )
 from monai.utils import set_determinism
+from scipy.ndimage import binary_closing
 
-from data.transforms import SpatialCropPercentiled
+from data.transforms import DivisiblePercentileCropd, ResizeToMatchd
 from data.splits import GroupStratifiedSplit
 from data.datasets import CacheSeqDataset
 from data.utils import DatasetPreprocessor, convert_to_dict, convert_to_seqdict, collate_sequence_batch
-from models.resnet3d import resnet10, resnet50
-from models.swinvit import swinvit_base
+from models.milnet import MILNet
 from models.sequencenet import SequenceNet
 from losses.focalloss import FocalLoss
 from losses.recallloss import RecallLoss
+from losses.ccloss import ContrastiveCenterBCELoss
 
 class Trainer:
     
     def __init__(
             self, 
             model: nn.Module, 
+            loss_fn: nn.Module,
             backbone: str, 
             amp: bool,
-            temp_scaling: bool,
             dataloaders: dict, 
             learning_rate: float, 
             weight_decay: float,
@@ -89,20 +95,16 @@ class Trainer:
         self.gpu_id = int(os.environ['LOCAL_RANK'])
         self.model = model
         self.amp = amp
-        self.temp_scaling = temp_scaling
         self.scaler = GradScaler(enabled=amp)
         self.val_scaler = GradScaler(enabled=amp)
         self.backbone = backbone
         self.dataloaders = dataloaders
         self.output_dir = output_dir
-        params = self.model.parameters()
-        self.optimizer = optim.AdamW(params, lr=learning_rate, weight_decay=weight_decay)
-        if self.temp_scaling:
-            self.temperature = nn.Parameter(torch.ones(1) * 1.5)
-            self.temp_optimizer = optim.LBFGS([self.temperature], lr=0.01, max_iter=50)
-        self.m = nn.Sigmoid()
-        self.criterion = RecallLoss().to(self.gpu_id)
-        self.val_criterion = RecallLoss().to(self.gpu_id)
+        self.loss_fn = loss_fn
+
+        model_params, loss_params = self.model.parameters(), self.loss_fn.parameters()
+        self.optimizer = optim.AdamW(model_params, lr=learning_rate, weight_decay=weight_decay)
+        self.loss_optimizer = optim.AdamW(loss_params, lr=learning_rate * 10)
 
     def save_output(
             self, 
@@ -164,6 +166,7 @@ class Trainer:
         running_loss = 0.0
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
+        self.loss_optimizer.zero_grad(set_to_none=True)
 
         if self.gpu_id == 0:
             print('-' * 10)
@@ -183,21 +186,21 @@ class Trainer:
                 #     x_mask=input_mask,
                 #     encodings=encodings,
                 #     batch_size=batch_size)
-                logits = self.model(inputs)
-                if self.temp_scaling:
-                    logits = self.scale_logits(logits)
-                loss = self.criterion(logits, labels)
+                feats, logits = self.model(inputs)
+                loss = self.loss_fn(logits, feats, labels)
                 loss = loss / accum_steps
             
             self.scaler.scale(loss).backward()
             running_loss += loss.item()
-            preds = torch.argmax(logits, 1)
-            batch_f1score = metric(preds, labels)
+            batch_f1score = metric(logits.squeeze(1), labels)
     
             if ((step + 1) % accum_steps == 0) or (step + 1 == len(self.dataloaders['train'])):
                 self.scaler.step(self.optimizer)
+                self.scaler.step(self.loss_optimizer)
                 self.scaler.update()
+
                 self.optimizer.zero_grad(set_to_none=True)
+                self.loss_optimizer.zero_grad(set_to_none=True)
                 # self.scheduler.step()
 
                 if self.gpu_id == 0:
@@ -235,7 +238,6 @@ class Trainer:
             for step, batch_data in enumerate(self.dataloaders['val']):
                 # inputs, labels, encodings = batch_data['image'].to(self.gpu_id), batch_data['label'].to(self.gpu_id), batch_data['age'].type(torch.float32)
                 inputs, labels = batch_data['image'].to(self.gpu_id), batch_data['label'].to(self.gpu_id)
-
                 # encodings = (encodings - 64.214) / 11.826
 
                 with autocast(enabled=self.amp):
@@ -243,39 +245,13 @@ class Trainer:
                     #     x=inputs,
                     #     encodings=encodings,
                     #     batch_size=1)
-                    logits = self.model(inputs)
-                    loss = self.val_criterion(logits, labels)
-
-                    if self.temp_scaling:
-                        logits_list.append(logits)
-                        labels_list.append(labels)
+                    feats, logits = self.model(inputs)
+                    loss = self.loss_fn(logits, feats, labels)
 
                 running_loss += loss.item()
-                preds = torch.argmax(logits, 1)
-                metric.update(preds, labels)
+                metric.update(logits.squeeze(1), labels)
 
-            unscaled_ce = running_loss / len(self.dataloaders['val'])
-
-        if self.temp_scaling:
-            logits = torch.cat(logits_list)
-            labels = torch.cat(labels_list)
-
-            def closure():
-                self.temp_optimizer.zero_grad()
-                loss = self.val_criterion(self.scale_logits(logits), labels)
-                loss.backward()
-                dist.all_reduce(loss, op=dist.ReduceOp.AVG)
-                return loss
-
-            self.temp_optimizer.step(closure)
-            scaled_ce = self.val_criterion(self.scale_logits(logits), labels)
-            
-            if self.gpu_id == 0:
-                print(f'Loss before temperature scaling: {unscaled_ce}')
-                print(f'Loss after temperature scaling: {scaled_ce}')
-                print(f'Optimal temperature: {self.temperature.item()}')
-
-        epoch_loss = unscaled_ce if not self.temp_scaling else scaled_ce
+        epoch_loss = running_loss / len(self.dataloaders['val'])
         epoch_f1score = metric.compute()
         metric.reset()
         print(f"[GPU {self.gpu_id}] Epoch {epoch}, Validation Loss: {epoch_loss:.4f}, and F1-Score: {epoch_f1score:.4f}")
@@ -310,6 +286,7 @@ class Trainer:
         best_loss = 10.0
         f1score = 0.0
         counter = 0
+        stop_criterion = torch.zeros(1).to(self.gpu_id)
         history = {'train_loss': [], 'train_f1score': [], 'val_loss': [], 'val_f1score': []}
 
         for epoch in range(max_epochs):
@@ -332,13 +309,17 @@ class Trainer:
                         best_weights = copy.deepcopy(self.model.state_dict())
                     else:
                         counter += 1
+                        if counter >= patience and epoch >= min_epochs:
+                            stop_criterion += 1
+                
+                dist.all_reduce(stop_criterion, op=dist.ReduceOp.SUM)
+                if stop_criterion == 1:
+                    break
+
 
             train_time = time.time() - start_time
             if self.gpu_id == 0:
                 print(f'Epoch {epoch} complete in {train_time // 60:.0f}min {train_time % 60:.0f}sec')
-                
-            if counter >= patience and epoch >= min_epochs:
-                break
 
         if self.gpu_id == 0:
             time_elapsed = time.time() - since
@@ -347,9 +328,6 @@ class Trainer:
             self.save_output(best_weights, 'weights')
             self.save_output(history, 'history')
 
-    def scale_logits(self, logits: torch.Tensor) -> torch.Tensor:
-        temperature = self.temperature.unsqueeze(1).expand(logits.size(0), logits.size(1))
-        return logits / temperature.to(self.gpu_id)
 
     # def extract_activations(self):
 
@@ -503,7 +481,7 @@ def load_train_objs(
     split_dict = convert_to_dict(train, val, test, data_dict)
     label_dict = {x: [patient['label'] for patient in split_dict[x]] for x in ['train', 'val']}
 
-    metric = torchmetrics.F1Score(task=('multiclass' if args.num_classes > 2 else 'binary'), num_classes=args.num_classes, ignore_index=99)
+    metric = torchmetrics.F1Score(task=('multiclass' if args.num_classes > 2 else 'binary'), num_classes=2, ignore_index=99)
     values, counts = np.unique(label_dict['train'], return_counts=True)
     weights = len(label_dict['train']) / (args.num_classes * torch.Tensor([class_count for class_count in counts]))
     if args.distributed:
@@ -566,56 +544,55 @@ def data_transforms(
     prep = [
         LoadImaged(keys=modalities, image_only=True),
         EnsureChannelFirstd(keys=modalities),
-        Orientationd(keys=modalities, axcodes='RAS'),
-        Spacingd(keys=modalities, pixdim=(2.0, 2.0, 1.5), mode='bilinear'),
+        Orientationd(keys=modalities, axcodes='PLI'),
+        Spacingd(keys=modalities, pixdim=(1.5, 1.5, 1.75), mode='bilinear'),
         ResampleToMatchd(keys=modalities, key_dst='DWI_b0', mode='bilinear'),
-        ConcatItemsd(keys=modalities, name='image'),
-        DeleteItemsd(keys=modalities),
-        Resized(keys='image', spatial_size=(200, 200, 151)),
-        ScaleIntensityRangePercentilesd(
-            keys='image', lower=0.5, upper=99.5, b_min=0.0, b_max=1.0, 
-            channel_wise=True, clip=True),
-        NormalizeIntensityd(
-            keys='image', 
-            subtrahend=(0.0885, 0.0953, 0.1020), 
-            divisor=(0.1548, 0.1473, 0.1439),
-            channel_wise=True),
-        # NormalizeIntensityd(
-        #     keys='image', 
-        #     subtrahend=(0.0252, 0.0302, 0.0279, 1.314, 1.596, 1.475), 
-        #     divisor=(0.0488, 0.0549, 0.0492, 0.1620, 0.1819, 0.1738),
-        #     channel_wise=True),
-        SpatialCropPercentiled(keys='image', roi_center=(0.5, 0.5, 0.6), roi_size=(160, -1, 96)),
+        ConcatItemsd(keys='DWI_b0', name='image'),
+        ScaleIntensityRangePercentilesd(keys='T1W_OOP', lower=33.0, upper=99.0, b_min=0.0, b_max=1.0, clip=True),
+        ForegroundMaskd(keys='T1W_OOP', invert=True, new_key_prefix='MASK_', threshold=0.95),
+        Lambdad(keys='MASK_T1W_OOP', func=lambda x: x[:, :, :, -(x.shape[3] // 10):]),
+        KeepLargestConnectedComponentd(keys='MASK_T1W_OOP', connectivity=1),
+        # Lambdad(keys='MASK_T1W_OOP', func=lambda x: binary_closing(x, structure=np.ones((1, 16, 16, 1)))),
+        ResizeToMatchd(keys='MASK_T1W_OOP', dst_key='image', mode='nearest'),
+        # MaskIntensityd(keys='image', mask_key='MASK_T1W_OOP', select_fn=lambda x: x > 0),
         CropForegroundd(
             keys='image', 
-            source_key='image', 
-            select_fn=lambda x: x > torch.mean(x) * 2,
-            allow_smaller=False),
-        ResizeWithPadOrCropd(keys='image', spatial_size=(160, 128, -1)),
-        SpatialCropPercentiled(keys='image', roi_center=(0.65, 0.5, 0.5), roi_size=(96, 96, -1)),
-        NormalizeIntensityd(
-            keys='image', 
-            subtrahend=(0.6518, 0.5352, 0.5237), 
-            divisor=(1.0, 1.0, 1.0),
-            channel_wise=True),
-        # ScaleIntensityd(keys='image', minv=0.0, maxv=1.0)
+            source_key='MASK_T1W_OOP', 
+            select_fn=lambda x: x > 0,
+            k_divisible=(1, 1, 1),
+            mode='reflect',
+            allow_smaller=True),
+        DeleteItemsd(keys=modalities + ['MASK_T1W_OOP']),
+        NormalizeIntensityd(keys='image', channel_wise=True),
+        DivisiblePercentileCropd(keys='image', roi_center=(0.5, 0.35, 0.5), k_divisible=16),
+        CenterSpatialCropd(keys='image', roi_size=(176, 160, -1))
     ]
 
     train = [
         EnsureTyped(keys='image', track_meta=False, device=device),
-        RandSpatialCropd(
-            keys='image', 
-            roi_size=(64, 64, 64), 
-            random_size=False, 
-            random_center=True),
         RandFlipd(keys='image', prob=0.1, spatial_axis=0),
         RandFlipd(keys='image', prob=0.1, spatial_axis=1),
         RandFlipd(keys='image', prob=0.1, spatial_axis=2),
         RandStdShiftIntensityd(keys='image', prob=0.5, factors=0.1),
-        RandScaleIntensityd(keys='image', prob=0.5, factors=0.1)
+        RandScaleIntensityd(keys='image', prob=0.5, factors=0.1),
+        RandGridPatchd(
+            keys='image',
+            patch_size=(32, 32, 32),
+            min_offset=(2, 2, 2),
+            max_offset=(6, 6, 6),
+            num_patches=32,
+            sort_fn='random',
+            overlap=0.25),
+        ScaleIntensityd(keys='image', minv=0.0, maxv=1.0, channel_wise=False)
     ]
 
     val = [
+        GridPatchd(
+            keys='image', 
+            patch_size=(32, 32, 32),
+            offset=(4, 4, 4),
+            overlap=0.25),
+        ScaleIntensityd(keys='image', minv=0.0, maxv=1.0, channel_wise=False),
         EnsureTyped(keys='image', track_meta=False, device=device)
     ]
 
@@ -669,31 +646,38 @@ def main(
 
     dataloader, metric, weights = load_train_objs(device_id, args)
     set_track_meta(False)
-    if args.backbone == 'resnet10':
-        model = resnet10(pretrained=True, n_input_channels=len(args.mod_list), num_classes=args.num_classes, shortcut_type='B')
-    elif args.backbone == 'resnet50':
-        model = resnet50(pretrained=True, n_input_channels=len(args.mod_list), num_classes=args.num_classes, shortcut_type='B')
-    elif args.backbone == 'swinvit':
-        model = swinvit_base(pretrained=True, in_chans=len(args.mod_list), num_classes=args.num_classes)
-    else:
-        model = MILNet(
-            backbone=args.backbone,
-            num_channels=len(args.mod_list),
-            mil_mode=args.mil_mode,
-            truncate_layer=None,
-            pretrained=args.pretrained)
+    # if args.backbone == 'resnet10':
+    #     model = resnet10(pretrained=True, n_input_channels=len(args.mod_list), num_classes=args.num_classes, shortcut_type='B')
+    # elif args.backbone == 'resnet50':
+    #     model = resnet50(pretrained=True, n_input_channels=len(args.mod_list), num_classes=args.num_classes, shortcut_type='B')
+    # elif args.backbone == 'swinvit':
+    #     model = swinvit_base(pretrained=True, in_chans=len(args.mod_list), num_classes=args.num_classes)
+    # else:
+    model = MILNet(
+        backbone=args.backbone,
+        num_channels=1,
+        num_spatial_dims=3,
+        num_classes=1,
+        mil_mode=args.mil_mode,
+        truncate_layer=None,
+        pretrained=args.pretrained)
     # model = SequenceNet(model, num_classes=2, dropout=0.1)
     model.metric = metric
+    feat_dim = 512 if args.backbone == 'resnet10' else 2048 if args.backbone == 'resnet50' else 384
+    loss_fn = ContrastiveCenterBCELoss(feat_dim=feat_dim, num_classes=args.num_classes, lambda_c=0.1, pos_weight=3.0)
     if args.distributed:
         model = nn.SyncBatchNorm.convert_sync_batchnorm(model) if args.backbone != 'swinvit' else model
-        model = model.to(device_id)
+        model, loss_fn = model.to(device_id), loss_fn.to(device_id)
         model = nn.parallel.DistributedDataParallel(
             model, 
+            device_ids=[device_id])
+        loss_fn = nn.parallel.DistributedDataParallel(
+            loss_fn, 
             device_ids=[device_id])
     else:
         model = model.to(device_id)
     # Train the model using the training data and validate the model on the validation data following each epoch.
-    trainer = Trainer(model, args.backbone, args.amp, args.temp_scaling, dataloader, learning_rate, args.weight_decay, weights, args.results_dir)
+    trainer = Trainer(model, loss_fn, args.backbone, args.amp, dataloader, learning_rate, args.weight_decay, weights, args.results_dir)
     trainer.training_loop(metric, args.min_epochs, args.val_interval, args.batch_size, accum_steps, args.patience)
     # Cleanup distributed training.
     if args.distributed:
