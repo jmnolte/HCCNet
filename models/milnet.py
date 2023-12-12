@@ -5,6 +5,11 @@ import torch
 import torch.nn as nn
 import numpy as np
 from models.resnet import resnet18, resnet34, resnet50
+from models.resnet3d import resnet10 as resnet10_3d
+from models.resnet3d import resnet18 as resnet18_3d
+from models.resnet3d import resnet34 as resnet34_3d
+from models.resnet3d import resnet50 as resnet50_3d
+from models.swinvit import swinvit_base
 
 class MILNet(nn.Module):
 
@@ -14,6 +19,7 @@ class MILNet(nn.Module):
             mil_mode: str = 'att',
             pretrained: bool = True,
             num_channels: int = 3,
+            num_spatial_dims: int = 2,
             num_classes: int = 2,
             truncate_layer: int | None = None,
             trans_blocks: int = 4,
@@ -41,17 +47,36 @@ class MILNet(nn.Module):
         self.attention = nn.Sequential()
         self.transformer: nn.Module | None = None
 
-        if backbone.lower() == 'resnet18':
-            net = resnet18(pretrained=pretrained, num_channels=num_channels, truncate_layer=truncate_layer)
-        elif backbone.lower() == 'resnet34':
-            net = resnet34(pretrained=pretrained, num_channels=num_channels, truncate_layer=truncate_layer)
-        elif backbone.lower() == 'resnet50':
-            net = resnet50(pretrained=pretrained, num_channels=num_channels, truncate_layer=truncate_layer)
+        if num_spatial_dims == 2:
+            if backbone.lower() == 'resnet18':
+                net = resnet18(pretrained=pretrained, num_channels=num_channels, truncate_layer=truncate_layer)
+            elif backbone.lower() == 'resnet34':
+                net = resnet34(pretrained=pretrained, num_channels=num_channels, truncate_layer=truncate_layer)
+            elif backbone.lower() == 'resnet50':
+                net = resnet50(pretrained=pretrained, num_channels=num_channels, truncate_layer=truncate_layer)
+            else:
+                raise ValueError('Unsupported backbone model selected.')
+        elif num_spatial_dims == 3:
+            if backbone.lower() == 'resnet10':
+                net = resnet10_3d(pretrained=pretrained, n_input_channels=num_channels, shortcut_type='B')
+            elif backbone.lower() == 'resnet18':
+                net = resnet18_3d(pretrained=pretrained, n_input_channels=num_channels, shortcut_type='A')
+            elif backbone.lower() == 'resnet34':
+                net = resnet34_3d(pretrained=pretrained, n_input_channels=num_channels, shortcut_type='A')
+            elif backbone.lower() == 'resnet50':
+                net = resnet50_3d(pretrained=pretrained, n_input_channels=num_channels, shortcut_type='B')
+            elif backbone.lower() == 'swinvit':
+                net = swinvit_base(pretrained=pretrained, in_chans=num_channels, num_classes=num_classes)
+            else:
+                raise ValueError('Unsupported backbone model selected.')
         else:
-            raise ValueError('Unsupported backbone model selected.')
+            raise ValueError('Unsupported number of spatial dimensions selected. Please choose from: 2, 3')
 
-        nfc = net.fc.in_features
-        net.fc = nn.Identity()
+        nfc = net.fc.in_features if backbone.lower() != 'swinvit' else net.head.in_features
+        if backbone.lower() != 'swinvit':
+            net.fc = nn.Identity()
+        else:
+            net.head = nn.Identity()
 
         if self.mil_mode in ["mean", "max"]:
             pass
@@ -118,17 +143,17 @@ class MILNet(nn.Module):
 
         if self.mil_mode == "mean":
             x = self.myfc(x)
-            x = torch.mean(x, dim=1)
+            out = torch.mean(x, dim=1)
 
         elif self.mil_mode == "max":
             x = self.myfc(x)
-            x, _ = torch.max(x, dim=1)
+            out, _ = torch.max(x, dim=1)
 
         elif self.mil_mode == "att":
             a = self.attention(x)
             a = torch.softmax(a, dim=1)
             x = torch.sum(x * a, dim=1)
-            x = self.myfc(x)
+            out = self.myfc(x)
 
         elif self.mil_mode == "att_trans" and self.transformer is not None:
             x = x.permute(1, 0, 2)
@@ -138,7 +163,7 @@ class MILNet(nn.Module):
             a = self.attention(x)
             a = torch.softmax(a, dim=1)
             x = torch.sum(x * a, dim=1)
-            x = self.myfc(x)
+            out = self.myfc(x)
 
         elif self.mil_mode == "att_trans_pyramid" and self.transformer is not None:
             l1 = torch.mean(self.extra_outputs["layer1"], dim=(2, 3)).reshape(sh[0], sh[1], -1).permute(1, 0, 2)
@@ -158,21 +183,24 @@ class MILNet(nn.Module):
             a = self.attention(x)
             a = torch.softmax(a, dim=1)
             x = torch.sum(x * a, dim=1)
-            x = self.myfc(x)
+            out = self.myfc(x)
 
         else:
             raise ValueError("Wrong model mode" + str(self.mil_mode))
 
-        return x
+        return x, out
 
     def forward(self, x: torch.Tensor, no_head: bool = False) -> torch.Tensor:
         sh = x.shape
-        x = x.reshape(sh[0] * sh[1], sh[2], sh[3], sh[4])
+        if len(sh) == 5:
+            x = x.reshape(sh[0] * sh[1], sh[2], sh[3], sh[4])
+        elif len(sh) == 6:
+            x = x.reshape(sh[0] * sh[1], sh[2], sh[3], sh[4], sh[5])
 
         x = self.net(x)
         x = x.reshape(sh[0], sh[1], -1)
 
         if not no_head:
-            x = self.calc_head(x)
+            feats, logits = self.calc_head(x)
 
-        return x
+        return feats, logits
