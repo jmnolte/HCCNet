@@ -67,13 +67,12 @@ class Trainer:
     def __init__(
             self, 
             model: nn.Module, 
-            loss_fn: nn.Module,
             backbone: str, 
             amp: bool,
             dataloaders: dict, 
             learning_rate: float, 
             weight_decay: float,
-            weights: torch.Tensor,
+            pos_weight: float,
             output_dir: str,
             ) -> None:
 
@@ -102,9 +101,11 @@ class Trainer:
         self.output_dir = output_dir
         self.loss_fn = loss_fn
 
-        model_params, loss_params = self.model.parameters(), self.loss_fn.parameters()
+        model_params = self.model.parameters()
         self.optimizer = optim.AdamW(model_params, lr=learning_rate, weight_decay=weight_decay)
-        self.loss_optimizer = optim.AdamW(loss_params, lr=learning_rate * 10)
+
+        self.bce_loss = nn.BCEWithLogitsLoss(pos_weight=torch.Tensor([pos_weight])).to(self.gpu_id)
+        self.kl_loss = nn.KLDivLoss(reduction='batchmean', log_target=True).to(self.gpu_id)
 
     def save_output(
             self, 
@@ -186,8 +187,8 @@ class Trainer:
                 #     x_mask=input_mask,
                 #     encodings=encodings,
                 #     batch_size=batch_size)
-                feats, logits = self.model(inputs)
-                loss = self.loss_fn(logits, feats, labels)
+                logits, euc_log, att_log = self.model(inputs)
+                loss = self.bce_loss(logits.squeeze(1), labels.float()) + self.kl_loss(euc_log, att_log)
                 loss = loss / accum_steps
             
             self.scaler.scale(loss).backward()
@@ -196,11 +197,8 @@ class Trainer:
     
             if ((step + 1) % accum_steps == 0) or (step + 1 == len(self.dataloaders['train'])):
                 self.scaler.step(self.optimizer)
-                self.scaler.step(self.loss_optimizer)
                 self.scaler.update()
-
                 self.optimizer.zero_grad(set_to_none=True)
-                self.loss_optimizer.zero_grad(set_to_none=True)
                 # self.scheduler.step()
 
                 if self.gpu_id == 0:
@@ -245,8 +243,8 @@ class Trainer:
                     #     x=inputs,
                     #     encodings=encodings,
                     #     batch_size=1)
-                    feats, logits = self.model(inputs)
-                    loss = self.loss_fn(logits, feats, labels)
+                    logits, euc_log, att_log = self.model(inputs)
+                    loss = self.bce_loss(logits.squeeze(1), labels.float()) + self.kl_loss(euc_log, att_log)
 
                 running_loss += loss.item()
                 metric.update(logits.squeeze(1), labels)
@@ -482,8 +480,9 @@ def load_train_objs(
     label_dict = {x: [patient['label'] for patient in split_dict[x]] for x in ['train', 'val']}
 
     metric = torchmetrics.F1Score(task=('multiclass' if args.num_classes > 2 else 'binary'), num_classes=2, ignore_index=99)
-    values, counts = np.unique(label_dict['train'], return_counts=True)
-    weights = len(label_dict['train']) / (args.num_classes * torch.Tensor([class_count for class_count in counts]))
+    # values, counts = np.unique(label_dict['train'], return_counts=True)
+    # weights = len(label_dict['train']) / (args.num_classes * torch.Tensor([class_count for class_count in counts]))
+    pos_weight = 3.0
     if args.distributed:
         split_dict = {x: partition_dataset_classes(
             data=split_dict[x],
@@ -524,7 +523,7 @@ def load_train_objs(
         num_workers=0,
         drop_last=(True if x == 'train' else False)) for x in ['train','val']}
 
-    return dataloader, metric, weights
+    return dataloader, metric, pos_weight
 
 def data_transforms(
         dataset: str,
@@ -644,7 +643,7 @@ def main(
         device_id = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         accum_steps = args.total_batch_size / args.batch_size
 
-    dataloader, metric, weights = load_train_objs(device_id, args)
+    dataloader, metric, pos_weight = load_train_objs(device_id, args)
     set_track_meta(False)
     # if args.backbone == 'resnet10':
     #     model = resnet10(pretrained=True, n_input_channels=len(args.mod_list), num_classes=args.num_classes, shortcut_type='B')
@@ -657,27 +656,22 @@ def main(
         backbone=args.backbone,
         num_channels=1,
         num_spatial_dims=3,
-        num_classes=1,
+        num_classes=args.num_classes,
         mil_mode=args.mil_mode,
         truncate_layer=None,
         pretrained=args.pretrained)
     # model = SequenceNet(model, num_classes=2, dropout=0.1)
     model.metric = metric
-    feat_dim = 512 if args.backbone == 'resnet10' else 2048 if args.backbone == 'resnet50' else 384
-    loss_fn = ContrastiveCenterBCELoss(feat_dim=feat_dim, num_classes=args.num_classes, lambda_c=0.1, pos_weight=3.0)
     if args.distributed:
         model = nn.SyncBatchNorm.convert_sync_batchnorm(model) if args.backbone != 'swinvit' else model
-        model, loss_fn = model.to(device_id), loss_fn.to(device_id)
+        model = model.to(device_id)
         model = nn.parallel.DistributedDataParallel(
             model, 
-            device_ids=[device_id])
-        loss_fn = nn.parallel.DistributedDataParallel(
-            loss_fn, 
             device_ids=[device_id])
     else:
         model = model.to(device_id)
     # Train the model using the training data and validate the model on the validation data following each epoch.
-    trainer = Trainer(model, loss_fn, args.backbone, args.amp, dataloader, learning_rate, args.weight_decay, weights, args.results_dir)
+    trainer = Trainer(model, args.backbone, args.amp, dataloader, learning_rate, args.weight_decay, pos_weight, args.results_dir)
     trainer.training_loop(metric, args.min_epochs, args.val_interval, args.batch_size, accum_steps, args.patience)
     # Cleanup distributed training.
     if args.distributed:

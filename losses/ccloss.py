@@ -28,7 +28,7 @@ class ContrastiveCenterLoss(nn.Module):
 
 class ContrastiveCenterBCELoss(ContrastiveCenterLoss):
 
-    def __init__(self, feat_dim, num_classes, lambda_c=1.0, pos_weight=3.0):
+    def __init__(self, feat_dim: int, num_classes: int, lambda_c: float = 1.0, pos_weight: float | None = None):
         super().__init__(
             feat_dim=feat_dim,
             num_classes=num_classes,
@@ -37,6 +37,7 @@ class ContrastiveCenterBCELoss(ContrastiveCenterLoss):
         self.pos_weight = torch.Tensor([pos_weight])
 
     def forward(self, logits, feats, labels):
+
         cc_loss = super().forward(feats, labels)
-        bce_loss = F.binary_cross_entropy_with_logits(logits.squeeze(1), labels.float(), pos_weight=self.pos_weight)
+        bce_loss = F.binary_cross_entropy_with_logits(logits.squeeze(1), labels.float(), pos_weight=self.pos_weight.to(feats.device))
         return bce_loss + cc_loss
