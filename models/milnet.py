@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import cast
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 from models.resnet import resnet18, resnet34, resnet50
 from models.resnet3d import resnet10 as resnet10_3d
@@ -128,7 +129,9 @@ class MILNet(nn.Module):
         else:
             raise ValueError("Unsupported mil_mode: " + str(mil_mode))
 
-        self.myfc = nn.Linear(nfc, num_classes)
+        fc_classes = num_classes if num_classes > 2 else 1
+        self.myfc = nn.Linear(nfc, fc_classes)
+        self.prototype = nn.Parameter(torch.randn(num_classes, nfc))
         self.net = net
         self.nfc = nfc
             
@@ -143,17 +146,20 @@ class MILNet(nn.Module):
 
         if self.mil_mode == "mean":
             x = self.myfc(x)
-            out = torch.mean(x, dim=1)
+            x = torch.mean(x, dim=1)
+            return x
 
         elif self.mil_mode == "max":
             x = self.myfc(x)
-            out, _ = torch.max(x, dim=1)
+            x, _ = torch.max(x, dim=1)
+            return x
 
         elif self.mil_mode == "att":
             a = self.attention(x)
             a = torch.softmax(a, dim=1)
             x = torch.sum(x * a, dim=1)
-            out = self.myfc(x)
+            x = self.myfc(x)
+            return x, a
 
         elif self.mil_mode == "att_trans" and self.transformer is not None:
             x = x.permute(1, 0, 2)
@@ -163,7 +169,8 @@ class MILNet(nn.Module):
             a = self.attention(x)
             a = torch.softmax(a, dim=1)
             x = torch.sum(x * a, dim=1)
-            out = self.myfc(x)
+            x = self.myfc(x)
+            return x, a 
 
         elif self.mil_mode == "att_trans_pyramid" and self.transformer is not None:
             l1 = torch.mean(self.extra_outputs["layer1"], dim=(2, 3)).reshape(sh[0], sh[1], -1).permute(1, 0, 2)
@@ -183,24 +190,40 @@ class MILNet(nn.Module):
             a = self.attention(x)
             a = torch.softmax(a, dim=1)
             x = torch.sum(x * a, dim=1)
-            out = self.myfc(x)
+            x = self.myfc(x)
+            return x, a
 
         else:
             raise ValueError("Wrong model mode" + str(self.mil_mode))
 
-        return x, out
+    def calc_euclidean(self, feats: torch.Tensor, att: torch.Tensor) -> torch.Tensor:
+        
+        sh = feats.shape
+        prototype = self.prototype.expand(sh[0] * sh[1], -1, -1).to(feats.device)
+        feats = feats.reshape(sh[0] * sh[1], -1)
+        att = att.reshape(sh[0] * sh[1], -1)
 
-    def forward(self, x: torch.Tensor, no_head: bool = False) -> torch.Tensor:
+        euc = torch.cdist(feats, prototype, p=2)
+        euc_log = F.log_softmax(euc[[0]].squeeze(0), dim=1)
+
+        att = torch.cat((1 - att, att), dim=1)
+        att_log = F.log_softmax(att, dim=1)
+        return euc_log, att_log
+
+    def forward(self, x: torch.Tensor, no_head: bool = False, no_euclidean: bool = False) -> torch.Tensor:
         sh = x.shape
         if len(sh) == 5:
             x = x.reshape(sh[0] * sh[1], sh[2], sh[3], sh[4])
         elif len(sh) == 6:
             x = x.reshape(sh[0] * sh[1], sh[2], sh[3], sh[4], sh[5])
 
-        x = self.net(x)
-        x = x.reshape(sh[0], sh[1], -1)
+        feats = self.net(x)
+        feats = feats.reshape(sh[0], sh[1], -1)
 
         if not no_head:
-            feats, logits = self.calc_head(x)
+            out, att = self.calc_head(feats)
 
-        return feats, logits
+        if not no_euclidean:
+            euc_log, att_log = self.calc_euclidean(feats, att)
+
+        return out, euc_log, att_log
