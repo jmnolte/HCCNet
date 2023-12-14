@@ -38,7 +38,7 @@ class DivisiblePercentileCropd(Transform):
             self,
             keys: str | list,
             roi_center: Sequence[float],
-            k_divisible: int = 1,
+            k_divisible: Sequence[int],
         ) -> None:
 
         self.keys = [keys] if isinstance(keys, str) else keys
@@ -52,10 +52,10 @@ class DivisiblePercentileCropd(Transform):
             for channel in image[key]:
                 shape = channel.shape
                 roi_center = [int(self.roi_center[i] * shape[i]) for i in range(len(shape))]
-                roi_size = [round(roi_center[i] / self.k_divisible * 2) / 2 for i in range(len(shape))]
-                roi_size = [roi_size[i] - 0.5 if roi_center[i] / roi_size[i] < self.k_divisible else roi_size[i] for i in range(len(shape))]
-                roi_start = [int(roi_center[i] - roi_size[i] * self.k_divisible) for i in range(len(shape))]
-                roi_end = [int(roi_center[i] + roi_size[i] * self.k_divisible) for i in range(len(shape))]
+                roi_size = [round(roi_center[i] / self.k_divisible[i] * 2) / 2 for i in range(len(shape))]
+                roi_size = [roi_size[i] - 0.5 if roi_center[i] / roi_size[i] < self.k_divisible[i] else roi_size[i] for i in range(len(shape))]
+                roi_start = [int(roi_center[i] - roi_size[i] * self.k_divisible[i]) for i in range(len(shape))]
+                roi_end = [int(roi_center[i] + roi_size[i] * self.k_divisible[i]) for i in range(len(shape))]
                 cropped_image.append(channel[roi_start[0]:roi_end[0], roi_start[1]:roi_end[1], roi_start[2]:roi_end[2]])
             image[key] = torch.stack(cropped_image)
         return image
