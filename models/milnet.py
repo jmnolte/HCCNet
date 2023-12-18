@@ -129,10 +129,10 @@ class MILNet(nn.Module):
         else:
             raise ValueError("Unsupported mil_mode: " + str(mil_mode))
 
-        fc_classes = num_classes if num_classes > 2 else 1
-        self.myfc = nn.Linear(nfc, fc_classes)
-        self.inst_fc = nn.Linear(nfc, fc_classes)
-        self.prototype = nn.Parameter(torch.zeros(fc_classes, nfc))
+        num_classes = num_classes if num_classes > 2 else 1
+        self.bag_head = nn.Linear(nfc, num_classes)
+        self.inst_head = nn.Linear(nfc, num_classes)
+        self.register_buffer('prototype', torch.zeros(num_classes, nfc))
         self.net = net
         self.nfc = nfc
             
@@ -142,22 +142,22 @@ class MILNet(nn.Module):
             self.extra_outputs[layer_name] = output
         return hook
 
-    def calc_head(self, x: torch.Tensor) -> torch.Tensor:
+    def calc_bag_head(self, x: torch.Tensor) -> torch.Tensor:
         sh = x.shape
 
         if self.mil_mode == "mean":
-            x = self.myfc(x)
+            x = self.bag_head(x)
             x = torch.mean(x, dim=1)
 
         elif self.mil_mode == "max":
-            x = self.myfc(x)
+            x = self.bag_head(x)
             x, _ = torch.max(x, dim=1)
 
         elif self.mil_mode == "att":
             a = self.attention(x)
             a = torch.softmax(a, dim=1)
             x = torch.sum(x * a, dim=1)
-            x = self.myfc(x)
+            x = self.bag_head(x)
 
         elif self.mil_mode == "att_trans" and self.transformer is not None:
             x = x.permute(1, 0, 2)
@@ -167,7 +167,7 @@ class MILNet(nn.Module):
             a = self.attention(x)
             a = torch.softmax(a, dim=1)
             x = torch.sum(x * a, dim=1)
-            x = self.myfc(x)
+            x = self.bag_head(x)
 
         elif self.mil_mode == "att_trans_pyramid" and self.transformer is not None:
             l1 = torch.mean(self.extra_outputs["layer1"], dim=(2, 3)).reshape(sh[0], sh[1], -1).permute(1, 0, 2)
@@ -187,36 +187,49 @@ class MILNet(nn.Module):
             a = self.attention(x)
             a = torch.softmax(a, dim=1)
             x = torch.sum(x * a, dim=1)
-            x = self.myfc(x)
+            x = self.bag_head(x)
 
         else:
             raise ValueError("Wrong model mode" + str(self.mil_mode))
 
         return x
 
-    def calc_prototype(self, feats: torch.Tensor, topk: int, alpha: float) -> torch.Tensor:
-        
-        sh = feats.shape
-        feats = feats.reshape(sh[0] * sh[1], -1)
-        logits = self.inst_fc(feats)
-        sig = F.sigmoid(logits)
-        top10 = torch.topk(sig.flatten(), topk).indices
-        prototype = alpha * self.prototype + (1 - alpha) * feats[top10]
-        pseudo_labels = torch.argmax(torch.mm(prototype, feats.transpose(1, 0)), dim=0)
-        return logits.squeeze(1), pseudo_labels
+    def calc_inst_head(self, x: torch.Tensor) -> torch.Tensor:
 
-    def forward(self, x: torch.Tensor, alpha: float = 0.95, no_head: bool = False) -> torch.Tensor:
+        x = self.inst_head(x)
+        return x.squeeze(-1)
+
+    def update_prototype(self, x: torch.Tensor, logits: torch.Tensor, alpha: float = 0.95) -> torch.Tensor:
+        
+        topk = x.shape[0] // 10
+        proba = F.sigmoid(logits)
+        topk_idx = torch.topk(proba, topk).indices
+        self.prototype = alpha * self.prototype + (1 - alpha) * x[topk_idx]
+        return self.prototype.detach().clone()
+
+    @staticmethod
+    def update_soft_labels(x: torch.Tensor, prototype: torch.Tensor, curr_labels: torch.Tensor, beta: float = 0.9) -> torch.Tensor:
+
+        logits = torch.mm(prototype, x.transpose(1, 0))
+        proba = F.softmax(logits, dim=0)
+        labels = torch.round(torch.max(proba, dim=0).values)
+        return beta * curr_labels.reshape(-1) + (1 - beta) * labels
+
+    def forward(self, x: torch.Tensor, alpha: float = 0.95) -> torch.Tensor:
         sh = x.shape
         if len(sh) == 5:
             x = x.reshape(sh[0] * sh[1], sh[2], sh[3], sh[4])
         elif len(sh) == 6:
             x = x.reshape(sh[0] * sh[1], sh[2], sh[3], sh[4], sh[5])
 
-        feats = self.net(x)
-        feats = feats.reshape(sh[0], sh[1], -1)
+        x = self.net(x)
+        curr_labels = torch.randint(0, 2, (4, 32))
 
-        if not no_head:
-            bag_logits = self.calc_head(feats)
-        inst_logits, pseudo_labels = self.calc_prototype(feats, topk=10, alpha=alpha)
+        logits_inst = self.calc_inst_head(x)
+        prototype = self.update_prototype(x, logits_inst, alpha)
+        soft_labels = self.update_soft_labels(x, prototype, curr_labels)
 
-        return bag_logits, inst_logits.reshape(sh[0], sh[1]), pseudo_labels.reshape(sh[0], sh[1])
+        x = x.reshape(sh[0], sh[1], -1)
+        logits_bag = self.calc_bag_head(x)
+
+        return logits_inst, logits_bag, soft_labels

@@ -171,7 +171,7 @@ class DatasetPreprocessor:
         Returns:
             label_dict (dict): Dictionary containing the labels.
         '''
-        label_dict = {'uid': [], 'label': [], 'age': []}
+        label_dict = {'uid': [], 'label': []}
         labels_df = pd.read_csv(label_path)
         for idx, row in labels_df.iterrows():
             if labels_df.loc[idx, 'observation'] < 10:
@@ -184,10 +184,10 @@ class DatasetPreprocessor:
                 continue
             else:
                 label = labels_df.loc[labels_df['uid'] == observation_id, 'label'].values.item()
-                age = labels_df.loc[labels_df['uid'] == observation_id, 'age'].values.item()
+                # age = labels_df.loc[labels_df['uid'] == observation_id, 'age'].values.item()
             label_dict['label'].append(label)
             label_dict['uid'].append(observation_id)
-            label_dict['age'].append(age)
+            # label_dict['age'].append(age)
         return [dict(zip(label_dict.keys(), vals)) for vals in zip(*(label_dict[k] for k in label_dict.keys()))]
     
     @staticmethod
@@ -234,10 +234,10 @@ class DatasetPreprocessor:
         for idx, patient in enumerate(data_dict):
             if patient['uid'] in [label['uid'] for label in label_dict]:
                 data_dict[idx][label_column] = label_dict[[label['uid'] for label in label_dict].index(patient['uid'])][label_column]
-                data_dict[idx]['age'] = label_dict[[label['uid'] for label in label_dict].index(patient['uid'])]['age']
+                # data_dict[idx]['age'] = label_dict[[label['uid'] for label in label_dict].index(patient['uid'])]['age']
             else:
                 data_dict[idx][label_column] = None
-                data_dict[idx]['age'] = None
+                # data_dict[idx]['age'] = None
         data_dict = [patient for patient in data_dict if not (patient[label_column] == None)]
 
         return data_dict, label_df
