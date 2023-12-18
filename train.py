@@ -147,7 +147,7 @@ class Trainer:
     def train(
             self, 
             metric: torchmetrics, 
-            soft_labels: dict,
+            labels_dict: dict,
             epoch: int, 
             batch_size: int,
             accum_steps: int
@@ -175,18 +175,19 @@ class Trainer:
 
         for step, batch_data in enumerate(self.dataloaders['train']):
             # inputs, labels, encodings = batch_data['image'].to(self.gpu_id), batch_data['label'].to(self.gpu_id), batch_data['age'].type(torch.float32).to(self.gpu_id)
-            inputs, labels, uid = batch_data['image'].to(self.gpu_id), batch_data['label'].to(self.gpu_id), batch_data['uid']
-            sh = inputs.shape
+            inputs, labels, identifiers = batch_data['image'].to(self.gpu_id), batch_data['label'].to(self.gpu_id), batch_data['uid']
+
             alpha = 0.8 if (0.95 - epoch * 0.01) < 0.8 else 0.95 - epoch * 0.01
             labels = labels.unsqueeze(1).float()
 
             if epoch == 0:
-                expanded_labels = labels.repeat(1, sh[1])
-                soft_labels['id'].append(uid)
-                soft_labels['soft_label'].append(expanded_labels)
+                sh = inputs.shape
+                soft_labels = labels.repeat(1, sh[1])
+                labels_dict['id'].extend(identifiers)
+                labels_dict['soft_label'].append(soft_labels)
             else:
-                indices = [soft_labels['id'].index(element) for element in uid]
-                soft_labels = soft_labels['soft_label'][indices]
+                indices = [labels_dict['id'].index(element) for element in identifiers]
+                soft_labels = labels_dict['soft_label'][indices]
 
             # input_mask = (labels == 99).bool()
             # encodings = (encodings - 64.214) / 11.826
@@ -197,21 +198,17 @@ class Trainer:
                 #     x_mask=input_mask,
                 #     encodings=encodings,
                 #     batch_size=batch_size)
-                bag_logits, inst_logits, pseudo_labels = self.model(inputs, alpha.to(inputs.device))
-                if epoch == 0:
-                    soft_labels = 0.99 * expanded_labels + (1 - 0.99) * pseudo_labels
-                else:
-                    soft_labels = 0.99 * soft_labels.to(pseudo_labels.device) + (1 - 0.99) * pseudo_labels
+                inst_logits, bag_logits, upd_soft_labels = self.model(inputs, soft_labels.to(inputs.device), alpha)
 
-                loss = self.bag_loss(bag_logits, labels) + self.inst_loss(inst_logits, soft_labels)
+                loss = self.bag_loss(bag_logits, labels) + self.inst_loss(inst_logits, upd_soft_labels)
                 loss = loss / accum_steps
 
-            if epoch >= 10:
-                soft_labels['soft_label'][indices] = soft_labels
+            if epoch >= 5:
+                labels_dict['soft_label'][indices] = upd_soft_labels
             
             self.scaler.scale(loss).backward()
             running_loss += loss.item()
-            batch_f1score = metric(logits.squeeze(1), labels)
+            batch_f1score = metric(bag_logits, labels)
     
             if ((step + 1) % accum_steps == 0) or (step + 1 == len(self.dataloaders['train'])):
                 self.scaler.step(self.optimizer)
@@ -223,19 +220,18 @@ class Trainer:
                     print(f"{step + 1}/{len(self.dataloaders['train'])}, Batch Loss: {loss.item() * accum_steps:.4f}")
 
         if epoch == 0:
-            soft_labels['id'] = [element for id_list in soft_labels['id'] for element in id_list]
-            soft_labels['soft_label'] = torch.cat(soft_labels['soft_label'], dim=0)
+            labels_dict['soft_label'] = torch.cat(labels_dict['soft_label'], dim=0)
 
         epoch_loss = running_loss / (len(self.dataloaders['train']) // accum_steps)
         epoch_f1score = metric.compute()
         metric.reset()
         print(f"[GPU {self.gpu_id}] Epoch {epoch}, Training Loss: {epoch_loss:.4f}, and F1-Score: {epoch_f1score:.4f}")
-        return epoch_loss, epoch_f1score, soft_labels
+        return epoch_loss, epoch_f1score, labels_dict
 
     def evaluate(
             self, 
             metric: torchmetrics, 
-            soft_labels: dict,
+            labels_dict: dict,
             epoch: int,
             ) -> tuple:
 
@@ -258,51 +254,45 @@ class Trainer:
         with torch.no_grad():
             for step, batch_data in enumerate(self.dataloaders['val']):
                 # inputs, labels, encodings = batch_data['image'].to(self.gpu_id), batch_data['label'].to(self.gpu_id), batch_data['age'].type(torch.float32)
-                inputs, labels, uid = batch_data['image'].to(self.gpu_id), batch_data['label'].to(self.gpu_id), batch_data['uid']
+                inputs, labels, identifiers = batch_data['image'].to(self.gpu_id), batch_data['label'].to(self.gpu_id), batch_data['uid']
                 # encodings = (encodings - 64.214) / 11.826
 
-                sh = inputs.shape
                 alpha = 0.8 if (0.95 - epoch * 0.01) < 0.8 else 0.95 - epoch * 0.01
                 labels = labels.unsqueeze(1).float()
 
                 if epoch == 0:
-                    expanded_labels = labels.repeat(1, sh[1])
-                    soft_labels['id'].append(uid)
-                    soft_labels['soft_label'].append(expanded_labels)
+                    sh = inputs.shape
+                    soft_labels = labels.repeat(1, sh[1])
+                    labels_dict['id'].extend(identifiers)
+                    labels_dict['soft_label'].append(soft_labels)
                 else:
-                    indices = [soft_labels['id'].index(element) for element in uid]
-                    soft_labels = soft_labels['soft_label'][indices]
+                    indices = [labels_dict['id'].index(element) for element in identifiers]
+                    soft_labels = labels_dict['soft_label'][indices]
 
                 with autocast(enabled=self.amp):
                     # logits = self.model(
                     #     x=inputs,
                     #     encodings=encodings,
                     #     batch_size=1)
-                    bag_logits, inst_logits, pseudo_labels = self.model(inputs, alpha.to(inputs.device))
-                    if epoch == 0:
-                        soft_labels = 0.99 * expanded_labels + (1 - 0.99) * pseudo_labels
-                    else:
-                        soft_labels = 0.99 * soft_labels.to(pseudo_labels.device) + (1 - 0.99) * pseudo_labels
+                    inst_logits, bag_logits, upd_soft_labels = self.model(inputs, soft_labels.to(inputs.device), alpha)
 
-                    loss = self.bag_loss(bag_logits, labels) + self.inst_loss(inst_logits, soft_labels)
-                    loss = loss / accum_steps
+                    loss = self.bag_loss(bag_logits, labels) + self.inst_loss(inst_logits, upd_soft_labels)
 
-                if epoch >= 10:
-                    soft_labels['soft_label'][indices] = soft_labels
+                if epoch >= 5:
+                    labels_dict['soft_label'][indices] = upd_soft_labels
 
                 running_loss += loss.item()
-                metric.update(logits.squeeze(1), labels)
+                metric.update(bag_logits, labels)
 
         if epoch == 0:
-            soft_labels['id'] = [element for id_list in soft_labels['id'] for element in id_list]
-            soft_labels['soft_label'] = torch.cat(soft_labels['soft_label'], dim=0)
+            labels_dict['soft_label'] = torch.cat(labels_dict['soft_label'], dim=0)
 
         epoch_loss = running_loss / len(self.dataloaders['val'])
         epoch_f1score = metric.compute()
         metric.reset()
         print(f"[GPU {self.gpu_id}] Epoch {epoch}, Validation Loss: {epoch_loss:.4f}, and F1-Score: {epoch_f1score:.4f}")
 
-        return epoch_loss, epoch_f1score, soft_labels
+        return epoch_loss, epoch_f1score, labels_dict
     
     def training_loop(
             self, 
@@ -570,7 +560,7 @@ def load_train_objs(
         batch_size=(args.batch_size if x == 'train' else 1), 
         shuffle=(True if x == 'train' else False),   
         num_workers=0,
-        drop_last=(True if x == 'train' else False)) for x in ['train','val']}
+        drop_last=False) for x in ['train','val']}
 
     return dataloader, metric, pos_weight
 
@@ -606,10 +596,11 @@ def data_transforms(
             keys='image', 
             source_key='MASK_T1W_OOP', 
             select_fn=lambda x: x > 0,
+            k_divisible=(1, 1, 96),
             allow_smaller=True),
         DeleteItemsd(keys=modalities + ['MASK_T1W_OOP']),
-        DivisiblePercentileCropd(keys='image', roi_center=(0.5, 0.35, 0.5), k_divisible=(48, 48, 48)),
-        CenterSpatialCropd(keys='image', roi_size=(144, 144, 96))
+        DivisiblePercentileCropd(keys='image', roi_center=(0.55, 0.4, 0.5), k_divisible=(1, 1, 1)),
+        ResizeWithPadOrCropd(keys='image', spatial_size=(144, 144, 96), mode='reflect')
     ]
 
     train = [
@@ -623,7 +614,7 @@ def data_transforms(
         RandGridPatchd(
             keys='image',
             patch_size=(48, 48, 48),
-            num_patches=18),
+            max_offset=(0, 0, 0)),
         RandSpatialCropd(keys='image', roi_size=(18, 32, 32, 32), random_size=False)
     ]
 
