@@ -199,23 +199,21 @@ class MILNet(nn.Module):
         x = self.inst_head(x)
         return x.squeeze(-1)
 
-    def update_prototype(self, x: torch.Tensor, logits: torch.Tensor, alpha: float = 0.95) -> torch.Tensor:
+    def update_prototype(self, x: torch.Tensor, logits: torch.Tensor, alpha: float = 0.95) -> None:
         
-        topk = x.shape[0] // 10
-        proba = F.sigmoid(logits)
-        topk_idx = torch.topk(proba, topk).indices
-        self.prototype = alpha * self.prototype + (1 - alpha) * x[topk_idx]
-        return self.prototype.detach().clone()
+        proba = F.softmax(logits, dim=0)
+        weighted_feats = torch.sum(x * proba.unsqueeze(-1), dim=0)
+        self.prototype = alpha * self.prototype + (1 - alpha) * weighted_feats
 
     @staticmethod
-    def update_soft_labels(x: torch.Tensor, prototype: torch.Tensor, curr_labels: torch.Tensor, beta: float = 0.9) -> torch.Tensor:
+    def update_soft_labels(x: torch.Tensor, prototype: torch.Tensor, curr_labels: torch.Tensor, beta: float = 0.99) -> torch.Tensor:
 
-        logits = torch.mm(prototype, x.transpose(1, 0))
-        proba = F.softmax(logits, dim=0)
-        labels = torch.round(torch.max(proba, dim=0).values)
-        return beta * curr_labels.reshape(-1) + (1 - beta) * labels
+        logits = F.cosine_similarity(prototype, x, dim=1)
+        new_labels = torch.round((logits.squeeze(0) + 1) / 2)
+        soft_labels = beta * curr_labels.reshape(-1) + (1 - beta) * new_labels
+        return soft_labels.detach().clone()
 
-    def forward(self, x: torch.Tensor, alpha: float = 0.95) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, curr_labels: torch.Tensor, no_update: bool = False, alpha: float = 0.95) -> torch.Tensor:
         sh = x.shape
         if len(sh) == 5:
             x = x.reshape(sh[0] * sh[1], sh[2], sh[3], sh[4])
@@ -223,11 +221,11 @@ class MILNet(nn.Module):
             x = x.reshape(sh[0] * sh[1], sh[2], sh[3], sh[4], sh[5])
 
         x = self.net(x)
-        curr_labels = torch.randint(0, 2, (4, 32))
 
         logits_inst = self.calc_inst_head(x)
-        prototype = self.update_prototype(x, logits_inst, alpha)
-        soft_labels = self.update_soft_labels(x, prototype, curr_labels)
+        if not no_update:
+            self.update_prototype(x, logits_inst, alpha)
+        soft_labels = self.update_soft_labels(x, self.prototype, curr_labels)
 
         x = x.reshape(sh[0], sh[1], -1)
         logits_bag = self.calc_bag_head(x)
