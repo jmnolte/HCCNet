@@ -179,9 +179,9 @@ class Trainer:
 
             alpha = 0.8 if (0.95 - epoch * 0.01) < 0.8 else 0.95 - epoch * 0.01
             labels = labels.unsqueeze(1).float()
+            sh = inputs.shape
 
             if epoch == 0:
-                sh = inputs.shape
                 soft_labels = labels.repeat(1, sh[1])
                 labels_dict['id'].extend(identifiers)
                 labels_dict['soft_label'].append(soft_labels)
@@ -198,13 +198,13 @@ class Trainer:
                 #     x_mask=input_mask,
                 #     encodings=encodings,
                 #     batch_size=batch_size)
-                inst_logits, bag_logits, upd_soft_labels = self.model(inputs, soft_labels.to(inputs.device), alpha)
+                inst_logits, bag_logits, upd_soft_labels = self.model(inputs, soft_labels.to(inputs.device), alpha=alpha)
 
-                loss = self.bag_loss(bag_logits, labels) + self.inst_loss(inst_logits, upd_soft_labels)
+                loss = 0.1 * self.bag_loss(bag_logits, labels) + self.inst_loss(inst_logits, upd_soft_labels)
                 loss = loss / accum_steps
 
-            if epoch >= 5:
-                labels_dict['soft_label'][indices] = upd_soft_labels
+            if epoch >= 10:
+                labels_dict['soft_label'][indices] = upd_soft_labels.reshape(sh[0], -1)
             
             self.scaler.scale(loss).backward()
             running_loss += loss.item()
@@ -257,11 +257,10 @@ class Trainer:
                 inputs, labels, identifiers = batch_data['image'].to(self.gpu_id), batch_data['label'].to(self.gpu_id), batch_data['uid']
                 # encodings = (encodings - 64.214) / 11.826
 
-                alpha = 0.8 if (0.95 - epoch * 0.01) < 0.8 else 0.95 - epoch * 0.01
                 labels = labels.unsqueeze(1).float()
+                sh = inputs.shape
 
                 if epoch == 0:
-                    sh = inputs.shape
                     soft_labels = labels.repeat(1, sh[1])
                     labels_dict['id'].extend(identifiers)
                     labels_dict['soft_label'].append(soft_labels)
@@ -274,12 +273,12 @@ class Trainer:
                     #     x=inputs,
                     #     encodings=encodings,
                     #     batch_size=1)
-                    inst_logits, bag_logits, upd_soft_labels = self.model(inputs, soft_labels.to(inputs.device), alpha)
+                    inst_logits, bag_logits, upd_soft_labels = self.model(inputs, soft_labels.to(inputs.device), no_update=True)
 
-                    loss = self.bag_loss(bag_logits, labels) + self.inst_loss(inst_logits, upd_soft_labels)
+                    loss = 0.1 * self.bag_loss(bag_logits, labels) + self.inst_loss(inst_logits, upd_soft_labels)
 
-                if epoch >= 5:
-                    labels_dict['soft_label'][indices] = upd_soft_labels
+                if epoch >= 10:
+                    labels_dict['soft_label'][indices] = upd_soft_labels.reshape(sh[0], -1)
 
                 running_loss += loss.item()
                 metric.update(bag_logits, labels)
@@ -337,8 +336,8 @@ class Trainer:
                 history['val_loss'].append(val_loss)
                 history['val_f1score'].append(val_f1score.cpu().item())
 
-                if self.gpu_id == 1:
-                    if val_loss < best_loss:
+                if self.gpu_id == 0:
+                    if val_f1score > f1score:
                         best_loss = val_loss
                         f1score = val_f1score
                         counter = 0
@@ -361,7 +360,7 @@ class Trainer:
         if self.gpu_id == 0:
             time_elapsed = time.time() - since
             print('Training complete in {:.0f}m {:.0f}s'.format(time_elapsed // 60, time_elapsed % 60))
-            print('Loss {:.4f} and F1-Score {:.4f} of best model configuration:'.format(best_loss, f1score.item()))
+            print('Loss {:.4f} and F1-Score {:.4f} of best model configuration:'.format(best_loss, f1score))
             self.save_output(best_weights, 'weights')
             self.save_output(history, 'history')
 
