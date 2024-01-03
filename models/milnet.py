@@ -209,11 +209,11 @@ class MILNet(nn.Module):
     def update_soft_labels(x: torch.Tensor, prototype: torch.Tensor, curr_labels: torch.Tensor, beta: float = 0.99) -> torch.Tensor:
 
         logits = F.cosine_similarity(prototype, x, dim=1)
-        new_labels = torch.round((logits.squeeze(0) + 1) / 2)
+        new_labels = (logits + 1) / 2
         soft_labels = beta * curr_labels.reshape(-1) + (1 - beta) * new_labels
         return soft_labels.detach().clone()
 
-    def forward(self, x: torch.Tensor, curr_labels: torch.Tensor, no_update: bool = False, alpha: float = 0.95) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, curr_labels: torch.Tensor, no_update: bool = False, alpha: float = 0.95, beta: float = 0.99) -> torch.Tensor:
         sh = x.shape
         if len(sh) == 5:
             x = x.reshape(sh[0] * sh[1], sh[2], sh[3], sh[4])
@@ -225,7 +225,7 @@ class MILNet(nn.Module):
         logits_inst = self.calc_inst_head(x)
         if not no_update:
             self.update_prototype(x, logits_inst, alpha)
-        soft_labels = self.update_soft_labels(x, self.prototype, curr_labels)
+        soft_labels = self.update_soft_labels(x, self.prototype, curr_labels, beta)
 
         x = x.reshape(sh[0], sh[1], -1)
         logits_bag = self.calc_bag_head(x)
