@@ -178,6 +178,7 @@ class Trainer:
             inputs, labels, identifiers = batch_data['image'].to(self.gpu_id), batch_data['label'].to(self.gpu_id), batch_data['uid']
 
             alpha = 0.8 if (0.95 - epoch * 0.01) < 0.8 else 0.95 - epoch * 0.01
+            beta = 0.8 if (0.99 - (epoch - 10) * 0.01) < 0.8 else 0.99 if epoch < 10 else 0.99 - (epoch - 10) * 0.01
             labels = labels.unsqueeze(1).float()
             sh = inputs.shape
 
@@ -198,12 +199,12 @@ class Trainer:
                 #     x_mask=input_mask,
                 #     encodings=encodings,
                 #     batch_size=batch_size)
-                inst_logits, bag_logits, upd_soft_labels = self.model(inputs, soft_labels.to(inputs.device), alpha=alpha)
+                inst_logits, bag_logits, upd_soft_labels = self.model(inputs, soft_labels.to(inputs.device), alpha=alpha, beta=beta)
 
                 loss = 0.1 * self.bag_loss(bag_logits, labels) + self.inst_loss(inst_logits, upd_soft_labels)
                 loss = loss / accum_steps
 
-            if epoch >= 10:
+            if epoch > 0:
                 labels_dict['soft_label'][indices] = upd_soft_labels.reshape(sh[0], -1)
             
             self.scaler.scale(loss).backward()
@@ -257,6 +258,7 @@ class Trainer:
                 inputs, labels, identifiers = batch_data['image'].to(self.gpu_id), batch_data['label'].to(self.gpu_id), batch_data['uid']
                 # encodings = (encodings - 64.214) / 11.826
 
+                beta = 0.8 if (0.99 - (epoch - 10) * 0.01) < 0.8 else 0.99 if epoch < 10 else 0.99 - (epoch - 10) * 0.01
                 labels = labels.unsqueeze(1).float()
                 sh = inputs.shape
 
@@ -273,11 +275,11 @@ class Trainer:
                     #     x=inputs,
                     #     encodings=encodings,
                     #     batch_size=1)
-                    inst_logits, bag_logits, upd_soft_labels = self.model(inputs, soft_labels.to(inputs.device), no_update=True)
+                    inst_logits, bag_logits, upd_soft_labels = self.model(inputs, soft_labels.to(inputs.device), no_update=True, beta=beta)
 
                     loss = 0.1 * self.bag_loss(bag_logits, labels) + self.inst_loss(inst_logits, upd_soft_labels)
 
-                if epoch >= 10:
+                if epoch > 0:
                     labels_dict['soft_label'][indices] = upd_soft_labels.reshape(sh[0], -1)
 
                 running_loss += loss.item()
@@ -518,9 +520,9 @@ def load_train_objs(
     label_dict = {x: [patient['label'] for patient in split_dict[x]] for x in ['train', 'val']}
 
     metric = torchmetrics.F1Score(task=('multiclass' if args.num_classes > 2 else 'binary'), num_classes=2, ignore_index=99)
-    # values, counts = np.unique(label_dict['train'], return_counts=True)
+    values, counts = np.unique(label_dict['train'], return_counts=True)
     # weights = len(label_dict['train']) / (args.num_classes * torch.Tensor([class_count for class_count in counts]))
-    pos_weight = 3.0
+    pos_weight = counts[0] / counts[1]
     if args.distributed:
         split_dict = {x: partition_dataset_classes(
             data=split_dict[x],
@@ -582,7 +584,7 @@ def data_transforms(
         LoadImaged(keys=modalities, image_only=True),
         EnsureChannelFirstd(keys=modalities),
         Orientationd(keys=modalities, axcodes='PLI'),
-        Spacingd(keys=modalities, pixdim=(1.5, 1.5, 1.75), mode='bilinear'),
+        Spacingd(keys=modalities, pixdim=(1.5, 1.5, 2.0), mode='bilinear'),
         ResampleToMatchd(keys=modalities, key_dst='T1W_OOP', mode='bilinear'),
         ConcatItemsd(keys='DWI_b0', name='image'),
         NormalizeIntensityd(keys='image', channel_wise=True),
@@ -595,11 +597,11 @@ def data_transforms(
             keys='image', 
             source_key='MASK_T1W_OOP', 
             select_fn=lambda x: x > 0,
-            k_divisible=(1, 1, 96),
-            allow_smaller=True),
+            k_divisible=(144, 192, 96),
+            allow_smaller=False),
         DeleteItemsd(keys=modalities + ['MASK_T1W_OOP']),
-        DivisiblePercentileCropd(keys='image', roi_center=(0.55, 0.4, 0.5), k_divisible=(1, 1, 1)),
-        ResizeWithPadOrCropd(keys='image', spatial_size=(144, 144, 96), mode='reflect')
+        ResizeWithPadOrCropd(keys='image', spatial_size=(144, 192, 96), mode='constant'),
+        DivisiblePercentileCropd(keys='image', roi_center=(0.5, 0.4, 0.5), k_divisible=(144, 144, 96))
     ]
 
     train = [
