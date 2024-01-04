@@ -179,6 +179,7 @@ class Trainer:
 
             alpha = 0.8 if (0.95 - epoch * 0.01) < 0.8 else 0.95 - epoch * 0.01
             beta = 0.8 if (0.99 - (epoch - 10) * 0.01) < 0.8 else 0.99 if epoch < 10 else 0.99 - (epoch - 10) * 0.01
+            no_update = True if torch.sum(labels) == 0 else False
             labels = labels.unsqueeze(1).float()
             sh = inputs.shape
 
@@ -199,7 +200,8 @@ class Trainer:
                 #     x_mask=input_mask,
                 #     encodings=encodings,
                 #     batch_size=batch_size)
-                inst_logits, bag_logits, upd_soft_labels = self.model(inputs, soft_labels.to(inputs.device), alpha=alpha, beta=beta)
+                inst_logits, bag_logits, upd_soft_labels = self.model(
+                    inputs, soft_labels.to(inputs.device), no_update=no_update, alpha=alpha, beta=beta)
 
                 loss = 0.1 * self.bag_loss(bag_logits, labels) + self.inst_loss(inst_logits, upd_soft_labels)
                 loss = loss / accum_steps
@@ -339,7 +341,7 @@ class Trainer:
                 history['val_f1score'].append(val_f1score.cpu().item())
 
                 if self.gpu_id == 0:
-                    if val_f1score > f1score:
+                    if val_loss < best_loss:
                         best_loss = val_loss
                         f1score = val_f1score
                         counter = 0
@@ -353,7 +355,6 @@ class Trainer:
                 dist.all_reduce(stop_criterion, op=dist.ReduceOp.SUM)
                 if stop_criterion == 1:
                     break
-
 
             train_time = time.time() - start_time
             if self.gpu_id == 0:

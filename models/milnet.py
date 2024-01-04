@@ -133,6 +133,7 @@ class MILNet(nn.Module):
         self.bag_head = nn.Linear(nfc, num_classes)
         self.inst_head = nn.Linear(nfc, num_classes)
         self.register_buffer('prototype', torch.zeros(num_classes, nfc))
+        self.inst_attention = nn.Sequential(nn.Linear(nfc, nfc), nn.Tanh(), nn.Linear(nfc, 1))
         self.net = net
         self.nfc = nfc
             
@@ -199,16 +200,21 @@ class MILNet(nn.Module):
         x = self.inst_head(x)
         return x.squeeze(-1)
 
-    def update_prototype(self, x: torch.Tensor, logits: torch.Tensor, alpha: float = 0.95) -> None:
+    def weigh_topk_features(self, x: torch.Tensor, logits: torch.Tensor, topk: int = 8) -> torch.Tensor:
         
-        proba = F.softmax(logits, dim=0)
-        weighted_feats = torch.sum(x * proba.unsqueeze(-1), dim=0)
+        proba = F.sigmoid(logits)
+        idx = torch.topk(proba, topk).indices
+        att = self.inst_attention(x[idx])
+        att = F.softmax(att, dim=0)
+        return torch.sum(x[idx] * att, dim=0)
+
+    def update_prototype(self, weighted_feats: torch.Tensor, alpha: float = 0.95) -> None:
+
         self.prototype = alpha * self.prototype + (1 - alpha) * weighted_feats
 
-    @staticmethod
-    def update_soft_labels(x: torch.Tensor, prototype: torch.Tensor, curr_labels: torch.Tensor, beta: float = 0.99) -> torch.Tensor:
+    def update_soft_labels(self, x: torch.Tensor, curr_labels: torch.Tensor, beta: float = 0.99) -> torch.Tensor:
 
-        logits = F.cosine_similarity(prototype, x, dim=1)
+        logits = F.cosine_similarity(self.prototype, x, dim=1)
         new_labels = (logits + 1) / 2
         soft_labels = beta * curr_labels.reshape(-1) + (1 - beta) * new_labels
         return soft_labels.detach().clone()
@@ -223,9 +229,10 @@ class MILNet(nn.Module):
         x = self.net(x)
 
         logits_inst = self.calc_inst_head(x)
+        weighted_feats = self.weigh_topk_features(x, logits_inst, sh[0] * 2)
         if not no_update:
-            self.update_prototype(x, logits_inst, alpha)
-        soft_labels = self.update_soft_labels(x, self.prototype, curr_labels, beta)
+            self.update_prototype(weighted_feats, alpha)
+        soft_labels = self.update_soft_labels(x, curr_labels, beta)
 
         x = x.reshape(sh[0], sh[1], -1)
         logits_bag = self.calc_bag_head(x)
