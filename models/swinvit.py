@@ -252,6 +252,9 @@ def _swinvit(
         _load_pretrained_weights(model, '/home/x3007104/thesis/pretrained_models/ssl_pretrained_weights.pth', num_channels=kwargs['in_chans'], verbose=progress)
     return model
 
+def swinvit_tiny(pretrained: bool = False, progress: bool = False, **kwargs: Any) -> SwinTransformer:
+    return _swinvit(embed_dim=12, pretrained=pretrained, progress=progress, **kwargs)
+
 def swinvit_small(pretrained: bool = False, progress: bool = False, **kwargs: Any) -> SwinTransformer:
     return _swinvit(embed_dim=24, pretrained=pretrained, progress=progress, **kwargs)
 
