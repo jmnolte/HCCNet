@@ -7,7 +7,7 @@ import numpy as np
 from scipy.interpolate import interp1d
 
 
-class PercentileSpatialCropd(Transform):
+class SpatialCropPercentiled(Transform):
 
     def __init__(
             self,
@@ -185,4 +185,84 @@ class NyulNormalized(Transform):
             else:
                 interp = interp1d(image_landmarks, standard_landmarks, kind='linear', fill_value='extrapolate')
             image[key] = torch.from_numpy(interp(image[key]))
+        return image
+
+
+class SoftClipIntensityd(Transform):
+
+    def __init__(
+            self,
+            keys: str | list,
+            min_value: float | None = None,
+            max_value: float | None = None,
+            channel_wise: bool = False
+        ) -> None:
+
+        self.keys = [keys] if isinstance(keys, str) else keys
+        self.min_value = min_value
+        self.max_value = max_value
+        self.channel_wise = channel_wise
+
+    @staticmethod
+    def softplus(x: torch.Tensor):
+
+        return np.log(1 + np.exp(-np.abs(x))) + np.maximum(x, 0)
+    
+    def softminus(self, x: torch.Tensor):
+
+        return -self.softplus(-x)
+    
+    def softclip(self, x: torch.Tensor):
+
+        # tanh = 1 - np.tanh(1)
+        # const = np.log(2) / tanh
+        const = np.pi ** 0.25
+
+        if self.min_value is not None and self.max_value is not None:
+            const /= (self.max_value - self.min_value) / 2
+
+        v = x
+        if self.min_value is not None:
+            v = v - self.softminus(const * (x - self.min_value)) / const
+        if self.max_value is not None:
+            v = v - self.softplus(const * (x - self.max_value)) / const
+        return v
+
+    
+    def __call__(self, image: torch.Tensor):
+
+        for key in self.keys:
+            if self.channel_wise:
+                for channel in range(image[key].shape[0]):
+                    image[key][channel] = torch.from_numpy(self.softclip(image[key][channel]))
+            else:
+                image[key] = torch.from_numpy(self.softclip(image[key]))
+        return image
+
+
+class GaussianSmoothOutliersd(Transform):
+
+    def __init__(
+            self,
+            keys: str | list,
+            max_value: float,
+            channel_wise: bool = False
+        ) -> None:
+
+        self.keys = [keys] if isinstance(keys, str) else keys
+        self.max_value = max_value
+        self.channel_wise = channel_wise
+
+    def __call__(self, image: torch.Tensor):
+
+        for key in self.keys:
+            if self.channel_wise:
+                for channel in range(image[key].shape[0]):
+                    mask = image[key][channel] > self.max_value
+                    randn_tensor = torch.normal(self.max_value, 0.02, image[key][channel].shape)
+                    image[key][channel][mask] = randn_tensor[mask].type(image[key][channel].dtype)
+            else:
+                mask = image[key] > self.max_value
+                randn_tensor = torch.normal(self.max_value, 0.02, image[key].shape)
+                image[key][mask] = randn_tensor[mask].type(image[key].dtype)
         return image
