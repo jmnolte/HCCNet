@@ -47,7 +47,7 @@ from monai.data import (
 from monai.utils import set_determinism
 from monai.utils.misc import ensure_tuple_rep
 from scipy.ndimage import binary_closing
-from data.transforms import PercentileSpatialCropd, CorrectBiasFieldd, NyulNormalized
+from data.transforms import SpatialCropPercentiled, NyulNormalized, SoftClipIntensityd, GaussianSmoothOutliersd
 from data.splits import GroupStratifiedSplit
 from data.datasets import CacheSeqDataset
 from data.utils import DatasetPreprocessor, convert_to_dict, convert_to_seqdict, collate_sequence_batch
@@ -545,7 +545,7 @@ def load_train_objs(
     #     num_workers=8,
     #     copy_cache=False) for x in ['train','val']}
     dataloader = {x: ThreadDataLoader(
-        datasets[x], 
+        dataset=datasets[x], 
         batch_size=(args.batch_size if x == 'train' else 1), 
         shuffle=(True if x == 'train' else False),   
         num_workers=0,
@@ -587,50 +587,46 @@ def data_transforms(
             k_divisible=1,
             allow_smaller=False),
         MedianSmoothd(keys=modalities, radius=1),
-        CorrectBiasFieldd(keys=modalities, shrink_factor=4),
         NyulNormalized(
             keys=modalities, 
             standard_hist=landmarks, 
             min_perc=0.01, 
-            max_perc=0.96, 
-            step_size=1, 
-            clip=True),
+            max_perc=0.95),
+        Lambdad(keys=modalities, func=lambda x: torch.where(torch.isnan(x), 1.0, x)),
         ConcatItemsd(keys=modalities, name='image'),
-        PercentileSpatialCropd(
+        SoftClipIntensityd(keys='image', max_value=1.0, channel_wise=True),
+        GaussianSmoothOutliersd(keys='image', max_value=0.99, channel_wise=True),
+        SpatialCropPercentiled(
             keys='image',
-            roi_center=(0.5, 0.35, 0.45),
-            roi_size=(0.85, 0.65, 0.8),
-            min_size=(96, 96, 96)),
-        Lambdad(
-            keys='image', 
-            func=lambda x: torch.where(torch.sum(x) == len(modalities), 0.0, x)),
-        DeleteItemsd(keys=modalities + ['MASK']),
+            roi_center=(0.45, 0.3, 0.45),
+            roi_size=(0.7, 0.45, 0.6),
+            min_size=(80, 80, 80)),
+        DeleteItemsd(keys=modalities + ['MASK'])
     ]
 
     train = [
-        EnsureTyped(keys='image', track_meta=False, device=device),
-        RandSpatialCropSamplesd(keys='image', roi_size=(96, 96, 96), random_size=False, num_samples=1),
+        CenterSpatialCropd(keys='image', roi_size=(96, 96, 96)),
+        EnsureTyped(keys='image', track_meta=False, device=device, dtype=torch.float),
+        RandSpatialCropSamplesd(keys='image', roi_size=(64, 64, 64), random_size=False, num_samples=1),
         RandFlipd(keys='image', prob=0.2, spatial_axis=0),
         RandFlipd(keys='image', prob=0.2, spatial_axis=1),
         RandFlipd(keys='image', prob=0.2, spatial_axis=2),
-        RandStdShiftIntensityd(keys='image', prob=0.5, factors=0.1, channel_wise=True),
         NormalizeIntensityd(
             keys='image', 
-            subtrahend=(0.3043, 0.2643, 0.2611, 0.2619),
-            divisor=(0.2418, 0.2165, 0.2051, 0.1919),
-            nonzero=True, 
-            channel_wise=True)
+            subtrahend=(0.3067, 0.2962, 0.3115, 0.3346),
+            divisor=(0.2268, 0.2088, 0.2013, 0.1911),
+            channel_wise=True),
+        RandStdShiftIntensityd(keys='image', prob=0.5, factors=0.1, channel_wise=True)
     ]
 
     val = [
-        CenterSpatialCropd(keys='image', roi_size=(96, 96, 96)),
+        CenterSpatialCropd(keys='image', roi_size=(80, 80, 80)),
         NormalizeIntensityd(
             keys='image', 
-            subtrahend=(0.3043, 0.2643, 0.2611, 0.2619),
-            divisor=(0.2418, 0.2165, 0.2051, 0.1919),
-            nonzero=True, 
+            subtrahend=(0.3067, 0.2962, 0.3115, 0.3346),
+            divisor=(0.2268, 0.2088, 0.2013, 0.1911),
             channel_wise=True),
-        EnsureTyped(keys='image', track_meta=False, device=device)
+        EnsureTyped(keys='image', track_meta=False, device=device, dtype=torch.float)
     ]
 
     if dataset == 'train':
