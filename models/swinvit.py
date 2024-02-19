@@ -244,22 +244,24 @@ def _swinvit(
         
     model = SwinTransformer(
         window_size=(7, 7, 7),
-        patch_size=(2, 2, 2),
-        depths=(2, 2, 2, 2),
+        patch_size=(4, 4, 4),
         num_heads=(3, 6, 12, 24),
+        mlp_ratio=4,
+        drop_path_rate=0.1,
+        patch_norm=True,
         **kwargs)
     if pretrained:
         _load_pretrained_weights(model, '/home/x3007104/thesis/pretrained_models/ssl_pretrained_weights.pth', num_channels=kwargs['in_chans'], verbose=progress)
     return model
 
 def swinvit_tiny(pretrained: bool = False, progress: bool = False, **kwargs: Any) -> SwinTransformer:
-    return _swinvit(embed_dim=12, pretrained=pretrained, progress=progress, **kwargs)
+    return _swinvit(embed_dim=48, depths=(2, 2, 6, 2), pretrained=pretrained, progress=progress, **kwargs)
 
 def swinvit_small(pretrained: bool = False, progress: bool = False, **kwargs: Any) -> SwinTransformer:
-    return _swinvit(embed_dim=24, pretrained=pretrained, progress=progress, **kwargs)
+    return _swinvit(embed_dim=48, depths=(2, 2, 18, 2), pretrained=pretrained, progress=progress, **kwargs)
 
 def swinvit_base(pretrained: bool = False, progress: bool = False, **kwargs: Any) -> SwinTransformer:
-    return _swinvit(embed_dim=48, pretrained=pretrained, progress=progress, **kwargs)
+    return _swinvit(embed_dim=96, depths=(2, 2, 6, 2), pretrained=pretrained, progress=progress, **kwargs)
 
 def swinvit_large(pretrained: bool = False, progress: bool = False, **kwargs: Any) -> SwinTransformer:
-    return _swinvit(embed_dim=96, pretrained=pretrained, progress=progress, **kwargs)
+    return _swinvit(embed_dim=96, depths=(2, 2, 18, 2), pretrained=pretrained, progress=progress, **kwargs)

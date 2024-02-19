@@ -142,7 +142,6 @@ class NyulNormalized(Transform):
             min_perc: float = 0.01,
             max_perc: float = 0.99,
             step_size: int = 1,
-            background_perc: float = 0.1,
             clip: bool = False,
         ) -> None:
 
@@ -151,7 +150,6 @@ class NyulNormalized(Transform):
         self.min_perc = min_perc * 100
         self.max_perc = max_perc * 100
         self.step_size = step_size
-        self.background_perc = background_perc
         self.clip = clip
 
     def set_standard_hist(self, standard_hist: dict):
@@ -176,7 +174,7 @@ class NyulNormalized(Transform):
     def __call__(self, image: torch.Tensor):
 
         for key in self.keys:
-            mask = image[key] > torch.quantile(image[key], self.background_perc)
+            mask = (image[key] > torch.mean(image[key]) - 0.25 * torch.std(image[key])) & (image[key] < torch.mean(image[key]) + 2.75 * torch.std(image[key]))
             masked_image = image[key][mask > 0]
             standard_landmarks = self.set_standard_hist(self.standard_hist[key])
             image_landmarks = self.get_image_landmarks(masked_image)
@@ -214,9 +212,8 @@ class SoftClipIntensityd(Transform):
     
     def softclip(self, x: torch.Tensor):
 
-        # tanh = 1 - np.tanh(1)
-        # const = np.log(2) / tanh
-        const = np.pi ** 0.25
+        tanh = 1 - np.tanh(1)
+        const = np.log(2) / tanh
 
         if self.min_value is not None and self.max_value is not None:
             const /= (self.max_value - self.min_value) / 2
@@ -240,17 +237,15 @@ class SoftClipIntensityd(Transform):
         return image
 
 
-class GaussianSmoothOutliersd(Transform):
+class RobustNormalized(Transform):
 
     def __init__(
             self,
             keys: str | list,
-            max_value: float,
             channel_wise: bool = False
         ) -> None:
 
         self.keys = [keys] if isinstance(keys, str) else keys
-        self.max_value = max_value
         self.channel_wise = channel_wise
 
     def __call__(self, image: torch.Tensor):
@@ -258,11 +253,11 @@ class GaussianSmoothOutliersd(Transform):
         for key in self.keys:
             if self.channel_wise:
                 for channel in range(image[key].shape[0]):
-                    mask = image[key][channel] > self.max_value
-                    randn_tensor = torch.normal(self.max_value, 0.02, image[key][channel].shape)
-                    image[key][channel][mask] = randn_tensor[mask].type(image[key][channel].dtype)
+                    median = torch.median(image[key][channel])
+                    mad = torch.median(torch.abs(image[key][channel] - median))
+                    image[key][channel] = (image[key][channel] - median) / mad
             else:
-                mask = image[key] > self.max_value
-                randn_tensor = torch.normal(self.max_value, 0.02, image[key].shape)
-                image[key][mask] = randn_tensor[mask].type(image[key].dtype)
+                median = torch.median(image[key])
+                mad = torch.median(torch.abs(image[key] - median))
+                image[key] = (image[key] - median) / mad
         return image
