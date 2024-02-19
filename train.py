@@ -47,7 +47,7 @@ from monai.data import (
 from monai.utils import set_determinism
 from monai.utils.misc import ensure_tuple_rep
 from scipy.ndimage import binary_closing
-from data.transforms import SpatialCropPercentiled, NyulNormalized, SoftClipIntensityd, GaussianSmoothOutliersd
+from data.transforms import SpatialCropPercentiled, NyulNormalized, SoftClipIntensityd, RobustNormalized
 from data.splits import GroupStratifiedSplit
 from data.datasets import CacheSeqDataset
 from data.utils import DatasetPreprocessor, convert_to_dict, convert_to_seqdict, collate_sequence_batch
@@ -155,7 +155,7 @@ class Trainer:
 
         running_loss = 0.0
         self.model.train()
-        self.optim.zero_grad(set_to_none=True)
+        self.optim.zero_grad()
 
         if self.gpu_id == 0:
             print('-' * 10)
@@ -187,9 +187,12 @@ class Trainer:
             self.train_auroc.update(preds, labels)
 
             if ((step + 1) % accum_steps == 0) or (step + 1 == len(self.dataloaders['train'])):
+                self.scaler.unscale_(self.optim)
+                nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0, norm_type=2)
+
                 self.scaler.step(self.optim)
                 self.scaler.update()
-                self.optim.zero_grad(set_to_none=True)
+                self.optim.zero_grad()
 
                 if self.gpu_id == 0:
                     print(f"{step + 1}/{len(self.dataloaders['train'])}, Batch Loss: {loss.item() * accum_steps:.4f}")
@@ -526,13 +529,12 @@ def load_train_objs(
     #     num_partitions=dist.get_world_size(),
     #     shuffle=True,
     #     even_divisible=(True if x == 'train' else False))[dist.get_rank()] for x in ['train','val']}
-    landmarks = {x: np.load(os.path.join(args.data_dir, 'landmarks', x + '.npy')) for x in args.mod_list}
+    # landmarks = {x: np.load(os.path.join(args.data_dir, 'landmarks', x + '.npy')) for x in args.mod_list}
     datasets = {x: CacheDataset(
         data=split_dict[x], 
         transform=data_transforms(
             dataset=x, 
             modalities=args.mod_list, 
-            landmarks=landmarks,
             device=device_id), 
         num_workers=8,
         copy_cache=False) for x in ['train','val']}
@@ -556,7 +558,6 @@ def load_train_objs(
 def data_transforms(
         dataset: str,
         modalities: list,
-        landmarks: dict,
         device: torch.device
         ) -> transforms:
     '''
@@ -568,71 +569,64 @@ def data_transforms(
     Returns:
         transforms (monai.transforms): Data transformations to be applied.
     '''
-
+    lambda_val = 0.15
     prep = [
         LoadImaged(keys=modalities, image_only=True),
         EnsureChannelFirstd(keys=modalities),
         Orientationd(keys=modalities, axcodes='PLI'),
         Spacingd(keys=modalities, pixdim=(1.5, 1.5, 1.5), mode='bilinear'),
-        ResampleToMatchd(keys=modalities, key_dst=modalities[0], mode='bilinear'),
-        CopyItemsd(keys=modalities[0], names='MASK'),
+        ResampleToMatchd(
+            keys=modalities, 
+            key_dst=modalities[0], 
+            mode='bilinear'),
+        PercentileSpatialCropd(
+            keys=modalities,
+            roi_center=(0.5, 0.5, 0.5),
+            roi_size=(0.85, 0.8, 0.99),
+            min_size=(80, 80, 80)),
+        CopyItemsd(keys=modalities[0], names='mask'),
         Lambdad(
-            keys='MASK', 
-            func=lambda x: torch.where(x > torch.quantile(x, 0.85), 1, 0)),
-        KeepLargestConnectedComponentd(keys='MASK', connectivity=1),
+            keys='mask', 
+            func=lambda x: np.where(x > np.mean(x), 1, 0)),
+        KeepLargestConnectedComponentd(keys='mask', connectivity=1),
         CropForegroundd(
             keys=modalities,
-            source_key='MASK',
+            source_key='mask',
             select_fn=lambda x: x > 0,
             k_divisible=1,
             allow_smaller=False),
-        MedianSmoothd(keys=modalities, radius=1),
-        NyulNormalized(
+        Lambdad(
             keys=modalities, 
-            standard_hist=landmarks, 
-            min_perc=0.01, 
-            max_perc=0.95),
-        Lambdad(keys=modalities, func=lambda x: torch.where(torch.isnan(x), 1.0, x)),
+            func=lambda x: ((x + 1) ** lambda_val - 1) / lambda_val),
         ConcatItemsd(keys=modalities, name='image'),
-        SoftClipIntensityd(keys='image', max_value=1.0, channel_wise=True),
-        GaussianSmoothOutliersd(keys='image', max_value=0.99, channel_wise=True),
-        SpatialCropPercentiled(
+        DeleteItemsd(keys=modalities),
+        RobustNormalized(keys='image', channel_wise=True),
+        SoftClipIntensityd(keys='image', min_value=-4.0, max_value=4.0, channel_wise=True),
+        PercentileSpatialCropd(
             keys='image',
-            roi_center=(0.45, 0.3, 0.45),
-            roi_size=(0.7, 0.45, 0.6),
-            min_size=(80, 80, 80)),
-        DeleteItemsd(keys=modalities + ['MASK'])
+            roi_center=(0.45, 0.3, 0.3),
+            roi_size=(0.6, 0.45, 0.4),
+            min_size=(80, 80, 80))
     ]
 
     train = [
-        CenterSpatialCropd(keys='image', roi_size=(96, 96, 96)),
         EnsureTyped(keys='image', track_meta=False, device=device, dtype=torch.float),
         RandSpatialCropSamplesd(keys='image', roi_size=(64, 64, 64), random_size=False, num_samples=1),
         RandFlipd(keys='image', prob=0.2, spatial_axis=0),
         RandFlipd(keys='image', prob=0.2, spatial_axis=1),
         RandFlipd(keys='image', prob=0.2, spatial_axis=2),
-        NormalizeIntensityd(
-            keys='image', 
-            subtrahend=(0.3067, 0.2962, 0.3115, 0.3346),
-            divisor=(0.2268, 0.2088, 0.2013, 0.1911),
-            channel_wise=True),
         RandStdShiftIntensityd(keys='image', prob=0.5, factors=0.1, channel_wise=True)
     ]
 
-    val = [
+    test = [
         CenterSpatialCropd(keys='image', roi_size=(80, 80, 80)),
-        NormalizeIntensityd(
-            keys='image', 
-            subtrahend=(0.3067, 0.2962, 0.3115, 0.3346),
-            divisor=(0.2268, 0.2088, 0.2013, 0.1911),
-            channel_wise=True),
         EnsureTyped(keys='image', track_meta=False, device=device, dtype=torch.float)
     ]
 
     if dataset == 'train':
         return Compose(prep + train)
     elif dataset in ['val', 'test']:
-        return Compose(prep + val)
+        return Compose(prep + test)
     else:
         raise ValueError ("Dataset must be 'train', 'val' or 'test'.")
 
