@@ -10,6 +10,7 @@ from monai.transforms import (
     apply_transform,
     convert_to_contiguous
 )
+from monai.data import CacheDataset
 from copy import deepcopy
 from monai.data.utils import pickle_hashing
 from multiprocessing.managers import ListProxy
@@ -26,24 +27,23 @@ has_tqdm = True
 
 class SeqDataset(_TorchDataset):
     """
-    A generic dataset with a length property and an optional callable data transform
-    when fetching a data sample.
-    If passing slicing indices, will return a PyTorch Subset, for example: `data: Subset = dataset[1:4]`,
-    for more details, please check: https://pytorch.org/docs/stable/data.html#torch.utils.data.Subset
+    A generic dataset for longitudinal imaging data that has a length property and an 
+    optional callable data transform when fetching a data sample.
 
     For example, typical input data can be a list of dictionaries::
 
-        [{                            {                            {
-             'img': 'image1.nii.gz',      'img': 'image2.nii.gz',      'img': 'image3.nii.gz',
-             'seg': 'label1.nii.gz',      'seg': 'label2.nii.gz',      'seg': 'label3.nii.gz',
-             'extra': 123                 'extra': 456                 'extra': 789
-         },                           },                           }]
+        [{                                                                      {
+             'img': ['image1_1.nii.gz', 'image1_2.nii.gz', 'image1_3.nii.gz'],      'img': ['image2_1.nii.gz', 'image2_2.nii.gz', 'image2_3.nii.gz']
+             'seg': ['seg1_1.nii.gz', 'seg1_2.nii.gz', 'seg1_3.nii.gz'],            'seg': ['seg2_1.nii.gz', 'seg2_2.nii.gz', 'seg2_3.nii.gz']
+             'extra': [123, 456, 789]                                               'extra': [123, 456, 789]
+         },                                                                     }]
     """
 
     def __init__(self, data: Sequence, image_keys: str | list, transform: Callable | None = None) -> None:
         """
         Args:
             data: input data to load and transform to generate dataset for model.
+            image_keys: keys to create imaging data from (e.g., 'T1' or 'T2').
             transform: a callable data transform on input data.
 
         """
@@ -88,9 +88,9 @@ class SeqDataset(_TorchDataset):
         return data
     
 
-class CacheSeqDataset(SeqDataset):
+class CacheSeqDataset(SeqDataset, CacheDataset):
     """
-    Dataset with cache mechanism that can load data and cache deterministic transforms' result during training.
+    Dataset for longitudinal imaging data with cache mechanism that can load data and cache deterministic transforms' result during training.
 
     By caching the results of non-random preprocessing transforms, it accelerates the training data pipeline.
     If the requested data is not in the cache, all transforms will run normally
@@ -162,6 +162,7 @@ class CacheSeqDataset(SeqDataset):
         """
         Args:
             data: input data to load and transform to generate dataset for model.
+            image_keys: keys to create imaging data from (e.g., 'T1' or 'T2').
             transform: transforms to execute operations on input data.
             cache_num: number of items to be cached. Default is `sys.maxsize`.
                 will take the minimum of (cache_num, data_length x cache_rate, data_length).
@@ -203,81 +204,24 @@ class CacheSeqDataset(SeqDataset):
         if not isinstance(transform, Compose):
             transform = Compose(transform)
         self.image_keys = [image_keys] if isinstance(image_keys, str) else image_keys
-        # super(CacheDataset, self).__init__(data=data, transform=transform)
-        super().__init__(data=data, image_keys=self.image_keys, transform=transform)
-        self.set_num = cache_num  # tracking the user-provided `cache_num` option
-        self.set_rate = cache_rate  # tracking the user-provided `cache_rate` option
-        self.progress = progress
-        self.copy_cache = copy_cache
-        self.as_contiguous = as_contiguous
-        self.hash_as_key = hash_as_key
-        self.hash_func = hash_func
-        self.num_workers = num_workers
-        if self.num_workers is not None:
-            self.num_workers = max(int(self.num_workers), 1)
-        self.runtime_cache = runtime_cache
-        self.cache_num = 0
-        self._cache: list | ListProxy = []
-        self._hash_keys: list = []
-        self.set_data(data)
-
-
-    def set_data(self, data: Sequence) -> None:
-        """
-        Set the input data and run deterministic transforms to generate cache content.
-
-        Note: should call this func after an entire epoch and must set `persistent_workers=False`
-        in PyTorch DataLoader, because it needs to create new worker processes based on new
-        generated cache content.
-
-        """
-        self.data = data
-
-        def _compute_cache_num(data_len: int):
-            self.cache_num = min(int(self.set_num), int(data_len * self.set_rate), data_len)
-
-        if self.hash_as_key:
-            # only compute cache for the unique items of dataset, and record the last index for duplicated items
-            mapping = {self.hash_func(v): i for i, v in enumerate(self.data)}
-            _compute_cache_num(len(mapping))
-            self._hash_keys = list(mapping)[: self.cache_num]
-            indices = list(mapping.values())[: self.cache_num]
-        else:
-            _compute_cache_num(len(self.data))
-            indices = list(range(self.cache_num))
-
-        if self.runtime_cache in (False, None):  # prepare cache content immediately
-            self._cache = self._fill_cache(indices)
-            return
-        if isinstance(self.runtime_cache, str) and "process" in self.runtime_cache:
-            # this must be in the main process, not in dataloader's workers
-            self._cache = Manager().list([None] * self.cache_num)
-            return
-        if (self.runtime_cache is True) or (isinstance(self.runtime_cache, str) and "thread" in self.runtime_cache):
-            self._cache = [None] * self.cache_num
-            return
-        self._cache = self.runtime_cache  # type: ignore
-        return
-
-    def _fill_cache(self, indices=None) -> list:
-        """
-        Compute and fill the cache content from data source.
-
-        Args:
-            indices: target indices in the `self.data` source to compute cache.
-                if None, use the first `cache_num` items.
-
-        """
-        if self.cache_num <= 0:
-            return []
-        if indices is None:
-            indices = list(range(self.cache_num))
-        if self.progress and not has_tqdm:
-            warnings.warn("tqdm is not installed, will not show the caching progress bar.")
-        with ThreadPool(self.num_workers) as p:
-            if self.progress and has_tqdm:
-                return list(tqdm(p.imap(self._load_cache_item, indices), total=len(indices), desc="Loading dataset"))
-            return list(p.imap(self._load_cache_item, indices))
+        SeqDataset.__init__(
+            self, 
+            data=data, 
+            image_keys=self.image_keys, 
+            transform=transform)
+        CacheDataset.__init__(
+            self,
+            data=data,
+            transform=transform,
+            cache_num=cache_num,
+            cache_rate=cache_rate,
+            num_workers=num_workers,
+            progress=progress,
+            copy_cache=copy_cache,
+            as_contiguous=as_contiguous,
+            hash_as_key=hash_as_key,
+            hash_func=hash_func,
+            runtime_cache=runtime_cache)
 
     def _load_cache_item(self, idx: int):
         """
@@ -315,7 +259,7 @@ class CacheSeqDataset(SeqDataset):
 
         if cache_index is None:
             # no cache for this index, execute all the transforms directly
-            return super()._transform(index)
+            return SeqDataset._transform(index)
 
         if self._cache is None:
             raise RuntimeError("cache buffer is not initialized, please call `set_data()` first.")

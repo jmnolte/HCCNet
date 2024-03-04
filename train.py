@@ -507,6 +507,7 @@ def load_train_objs(
             dataset=datasets[x], 
             batch_size=(args.batch_size if x == 'train' else 1), 
             shuffle=(True if x == 'train' else False),   
+            drop_last=(True if x == 'train' else False), 
             num_workers=0,
             drop_last=False,
             collate_fn=(SequenceBatchCollater(
