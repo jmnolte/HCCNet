@@ -42,7 +42,7 @@ class GroupStratifiedSplit(GroupShuffleSplit):
         for split in splits:
             set1, set2 = dataframe.iloc[split[0]], dataframe.iloc[split[1]]
             if abs(set1['label'].mean() - set2['label'].mean()) < label_ratio:
-                if len(set1) / (1 - self.test_ratio) > len(set2) / self.test_ratio * 0.9 and len(set1) / (1 - self.test_ratio) < len(set1) / self.test_ratio * 1.1:
+                if len(set1) / (1 - self.test_ratio) > len(set2) / self.test_ratio * 0.95 and len(set1) / (1 - self.test_ratio) < len(set1) / self.test_ratio * 1.05:
                     label_ratio = abs(set1['label'].mean() - set2['label'].mean())
                     best_split = split
         return best_split

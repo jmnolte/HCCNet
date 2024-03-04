@@ -180,64 +180,8 @@ class SwinTransformer(nn.Module):
         x = self.forward_features(x)
         out = self.head(x)
         return out
-    
-def _load_pretrained_weights(model: nn.Module, path: str, num_channels: int = 1, verbose: bool = False):
-
-    print("Loading Weights from the Path {}".format(path))
-    ssl_dict = torch.load(path)
-    ssl_weights = ssl_dict["model"]
-
-    # Generate new state dict so it can be loaded to MONAI SwinUNETR Model
-    monai_loadable_state_dict = OrderedDict()
-    model_prior_dict = model.state_dict()
-    model_update_dict = model_prior_dict
-
-    del ssl_weights["encoder.mask_token"]
-    del ssl_weights["encoder.norm.weight"]
-    del ssl_weights["encoder.norm.bias"]
-    del ssl_weights["out.conv.conv.weight"]
-    del ssl_weights["out.conv.conv.bias"]
-
-    for key, value in ssl_weights.items():
-        if key[:8] == "encoder.":
-            if key[8:19] == "patch_embed":
-                new_key = key[8:]
-            else:
-                new_key = key[8:18] + key[20:]
-            monai_loadable_state_dict[new_key] = value
-        else:
-            monai_loadable_state_dict[key] = value
-
-    if num_channels > 1:
-        monai_loadable_state_dict["patch_embed.proj.weight"] = monai_loadable_state_dict[
-            "patch_embed.proj.weight"
-            ].repeat(1, num_channels, 1, 1, 1)
-
-    model_update_dict.update(monai_loadable_state_dict)
-    model.load_state_dict(model_update_dict, strict=False)
-    model_final_loaded_dict = model.state_dict()
-
-    print("Pretrained Weights Succesfully Loaded !")
-
-    if verbose:
-        layer_counter = 0
-        for k, _v in model_final_loaded_dict.items():
-            if k in model_prior_dict:
-                layer_counter = layer_counter + 1
-
-                old_wts = model_prior_dict[k]
-                new_wts = model_final_loaded_dict[k]
-
-                old_wts = old_wts.to("cpu").numpy()
-                new_wts = new_wts.to("cpu").numpy()
-                diff = np.mean(np.abs(old_wts, new_wts))
-                print("Layer {}, the update difference is: {}".format(k, diff))
-                if diff == 0.0:
-                    print("Warning: No difference found for layer {}".format(k))
-        print("Total updated layers {} / {}".format(layer_counter, len(model_prior_dict)))
 
 def _swinvit(
-        pretrained,
         progress: bool = False,
         **kwargs: Any
     ) -> SwinTransformer:
@@ -250,18 +194,16 @@ def _swinvit(
         drop_path_rate=0.1,
         patch_norm=True,
         **kwargs)
-    if pretrained:
-        _load_pretrained_weights(model, '/home/x3007104/thesis/pretrained_models/ssl_pretrained_weights.pth', num_channels=kwargs['in_chans'], verbose=progress)
     return model
 
-def swinvit_tiny(pretrained: bool = False, progress: bool = False, **kwargs: Any) -> SwinTransformer:
+def swinvit_tiny(progress: bool = False, **kwargs: Any) -> SwinTransformer:
     return _swinvit(embed_dim=48, depths=(2, 2, 6, 2), pretrained=pretrained, progress=progress, **kwargs)
 
-def swinvit_small(pretrained: bool = False, progress: bool = False, **kwargs: Any) -> SwinTransformer:
+def swinvit_small(progress: bool = False, **kwargs: Any) -> SwinTransformer:
     return _swinvit(embed_dim=48, depths=(2, 2, 18, 2), pretrained=pretrained, progress=progress, **kwargs)
 
-def swinvit_base(pretrained: bool = False, progress: bool = False, **kwargs: Any) -> SwinTransformer:
+def swinvit_base(progress: bool = False, **kwargs: Any) -> SwinTransformer:
     return _swinvit(embed_dim=96, depths=(2, 2, 6, 2), pretrained=pretrained, progress=progress, **kwargs)
 
-def swinvit_large(pretrained: bool = False, progress: bool = False, **kwargs: Any) -> SwinTransformer:
+def swinvit_large(progress: bool = False, **kwargs: Any) -> SwinTransformer:
     return _swinvit(embed_dim=96, depths=(2, 2, 18, 2), pretrained=pretrained, progress=progress, **kwargs)
