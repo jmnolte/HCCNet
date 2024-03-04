@@ -22,10 +22,8 @@ def _load_pretrained_weights(
     weights_dict = torch.load(weights_path, map_location='cpu')
     weights_dict = {k.replace('module.', ''): v for k, v in weights_dict['state_dict'].items()}
     model_dict = model.state_dict()
-
     if num_channels > 1:
         weights_dict['conv1.weight'] = weights_dict['conv1.weight'].repeat(1, num_channels, 1, 1, 1)
-        
     model_dict.update(weights_dict)
     model.load_state_dict(model_dict)
 
@@ -54,7 +52,6 @@ def resnet10(
         progress: bool = True, 
         **kwargs: Any
     ) -> ResNet3D:
-
     return _resnet("resnet10", ResNetBlock, [1, 1, 1, 1], get_inplanes(), pretrained, progress, **kwargs)
 
 
@@ -63,7 +60,6 @@ def resnet18(
         progress: bool = True, 
         **kwargs: Any
     ) -> ResNet3D:
-    
     return _resnet("resnet18", ResNetBlock, [2, 2, 2, 2], get_inplanes(), pretrained, progress, **kwargs)
 
 
@@ -72,7 +68,6 @@ def resnet34(
         progress: bool = True, 
         **kwargs: Any
     ) -> ResNet3D:
-    
     return _resnet("resnet34", ResNetBlock, [3, 4, 6, 3], get_inplanes(), pretrained, progress, **kwargs)
 
 
@@ -81,7 +76,6 @@ def resnet50(
         progress: bool = True, 
         **kwargs: Any
     ) -> ResNet3D:
-    
     return _resnet("resnet50", ResNetBottleneck, [3, 4, 6, 3], get_inplanes(), pretrained, progress, **kwargs)
 
 

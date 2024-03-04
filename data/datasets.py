@@ -40,7 +40,7 @@ class SeqDataset(_TorchDataset):
          },                           },                           }]
     """
 
-    def __init__(self, data: Sequence, transform: Callable | None = None) -> None:
+    def __init__(self, data: Sequence, image_keys: str | list, transform: Callable | None = None) -> None:
         """
         Args:
             data: input data to load and transform to generate dataset for model.
@@ -48,28 +48,29 @@ class SeqDataset(_TorchDataset):
 
         """
         self.data = data
+        self.image_keys = [image_keys] if isinstance(image_keys, str) else image_keys
         self.transform: Any = transform
 
     def __len__(self) -> int:
         return len(self.data)
 
-    def _transform(self, index: int):
+    def _transform(self, idx: int):
         """
         Fetch single data item from `self.data`.
         """
-        time_points = len(self.data[index]['DWI_b0'])
-        seq_data = []
+    
+        data_keys = list(self.data[idx].keys())
+        data_keys = [key for key in data_keys if key not in self.image_keys]
+        seq_len = len(self.data[idx][self.image_keys[0]])
+        item_seq = []
+        for i in range(seq_len):
+            image_dict = {key: [self.data[idx][key][i]] for key in self.image_keys}
+            data_dict = {key: self.data[idx][key][i] for key in data_keys}
+            image_dict.update(data_dict) 
+            data = apply_transform(self.transform, image_dict)
+            item_seq.append(data)
 
-        for i in range(time_points):
-            new_dict = {
-                'DWI_b0': [self.data[index]['DWI_b0'][i]],
-                'label': self.data[index]['label'][i],
-                'age': self.data[index]['age'][i]
-            }
-            data = apply_transform(self.transform, new_dict)
-            seq_data.append(data)
-
-        return seq_data
+        return item_seq
 
     def __getitem__(self, index: int | slice | Sequence[int]):
         """
@@ -146,6 +147,7 @@ class CacheSeqDataset(SeqDataset):
     def __init__(
         self,
         data: Sequence,
+        image_keys: str | list,
         transform: Sequence[Callable] | Callable | None = None,
         cache_num: int = sys.maxsize,
         cache_rate: float = 1.0,
@@ -200,7 +202,9 @@ class CacheSeqDataset(SeqDataset):
         """
         if not isinstance(transform, Compose):
             transform = Compose(transform)
-        super().__init__(data=data, transform=transform)
+        self.image_keys = [image_keys] if isinstance(image_keys, str) else image_keys
+        # super(CacheDataset, self).__init__(data=data, transform=transform)
+        super().__init__(data=data, image_keys=self.image_keys, transform=transform)
         self.set_num = cache_num  # tracking the user-provided `cache_num` option
         self.set_rate = cache_rate  # tracking the user-provided `cache_rate` option
         self.progress = progress
@@ -284,15 +288,15 @@ class CacheSeqDataset(SeqDataset):
             lambda t: isinstance(t, RandomizableTrait) or not isinstance(t, Transform)
         )
 
-        time_points = len(self.data[idx]['DWI_b0'])
+        data_keys = list(self.data[idx].keys())
+        data_keys = [key for key in data_keys if key not in self.image_keys]
+        seq_len = len(self.data[idx][self.image_keys[0]])
         item_seq = []
-        for i in range(time_points):
-            new_dict = {
-                'DWI_b0': [self.data[idx]['DWI_b0'][i]],
-                'label': self.data[idx]['label'][i],
-                'age': self.data[idx]['age'][i]
-            }
-            data = self.transform(new_dict, end=first_random, threading=True)
+        for i in range(seq_len):
+            image_dict = {key: [self.data[idx][key][i]] for key in self.image_keys}
+            data_dict = {key: self.data[idx][key][i] for key in data_keys}
+            image_dict.update(data_dict) 
+            data = self.transform(image_dict, end=first_random, threading=True)
             item_seq.append(data)
 
         if self.as_contiguous:

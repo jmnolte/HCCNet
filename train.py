@@ -7,12 +7,14 @@ import torch.optim as optim
 import torch.distributed as dist
 from torch.cuda.amp import GradScaler, autocast
 from torchmetrics.classification import BinaryAveragePrecision, BinaryAUROC
+from sklearn.model_selection import StratifiedGroupKFold
 import argparse
 import os
 import time
 import copy
 import tempfile
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 
 from monai.transforms import (
@@ -25,16 +27,20 @@ from monai.transforms import (
     ConcatItemsd,
     CenterSpatialCropd,
     ResampleToMatchd,
-    RandFlipd,
+    RandAxisFlipd,
+    RandRotate90d,
     EnsureTyped,
     DeleteItemsd,
-    RandSpatialCropSamplesd,
-    NormalizeIntensityd,
+    RandSpatialCropd,
     RandStdShiftIntensityd,
+    RandGibbsNoised,
+    RandRicianNoised,
+    RandZoomd,
     CopyItemsd,
     KeepLargestConnectedComponentd,
     Lambdad,
-    MedianSmoothd
+    NormalizeIntensityd,
+    Resized
 )
 from monai import transforms
 from monai.data import (
@@ -45,15 +51,15 @@ from monai.data import (
     list_data_collate
 )
 from monai.utils import set_determinism
-from monai.utils.misc import ensure_tuple_rep
-from scipy.ndimage import binary_closing
-from data.transforms import SpatialCropPercentiled, NyulNormalized, SoftClipIntensityd, RobustNormalized
+from data.transforms import PercentileSpatialCropd, YeoJohnsond, SoftClipIntensityd, RobustNormalized
 from data.splits import GroupStratifiedSplit
 from data.datasets import CacheSeqDataset
-from data.utils import DatasetPreprocessor, convert_to_dict, convert_to_seqdict, collate_sequence_batch
-# from models.milnet import MILNet, IIBMIL
-from models.resnet3d import resnet10, resnet18, resnet34, resnet50
-from models.swinvit import swinvit_tiny, swinvit_small, swinvit_base
+from data.utils import DatasetPreprocessor, convert_to_dict, convert_to_seqdict, SequenceBatchCollater
+from handlers.slidingwindowinference import SlidingWindowInferer
+from models.mednet import MedNet
+from models.convnext3d import convnext3d_atto, convnext3d_femto, convnext3d_pico, convnext3d_nano, convnext3d_tiny
+from losses.focalloss import FocalLoss
+from optimizer.adams import AdamS
 
 
 class Trainer:
@@ -66,6 +72,8 @@ class Trainer:
             dataloaders: dict, 
             learning_rate: float, 
             weight_decay: float,
+            max_seq_length: int,
+            accum_steps: int,
             pos_weight: float,
             output_dir: str,
             ) -> None:
@@ -91,18 +99,18 @@ class Trainer:
         self.backbone = backbone
         self.dataloaders = dataloaders
         self.output_dir = output_dir
+        self.accum_steps = accum_steps
 
         self.scaler = GradScaler(enabled=amp)
-        # params = list(self.model.module.encoder.parameters()) + \
-        #     list(self.model.module.decoder.parameters()) + \
-        #     list(self.model.module.query_embed.parameters()) + \
-        #     list(self.model.module.ins_head.parameters()) + \
-        #     list(self.model.module.bag_head.parameters())
+        self.inferer = SlidingWindowInferer(self.model, self.gpu_id, max_length=max_seq_length)
+
         params = self.model.parameters()
         self.optim = optim.AdamW(params, lr=learning_rate, weight_decay=weight_decay)
 
-        self.train_bce = nn.BCEWithLogitsLoss(pos_weight=torch.Tensor([pos_weight])).to(self.gpu_id)
-        self.val_bce = nn.BCEWithLogitsLoss().to(self.gpu_id)
+        # self.train_bce = nn.BCEWithLogitsLoss(pos_weight=torch.Tensor([pos_weight]), reduction='none').to(self.gpu_id)
+        # self.val_bce = nn.BCEWithLogitsLoss(reduction='none').to(self.gpu_id)
+        self.train_bce = FocalLoss(gamma=2, alpha=pos_weight, label_smoothing=0.1, reduction=None).to(self.gpu_id)
+        self.val_bce = FocalLoss(gamma=2).to(self.gpu_id)
 
         self.train_auprc = BinaryAveragePrecision().to(self.gpu_id)
         self.train_auroc = BinaryAUROC().to(self.gpu_id)
@@ -112,7 +120,8 @@ class Trainer:
     def save_output(
             self, 
             output_dict: dict, 
-            output_type: str
+            output_type: str,
+            fold: int | None = None
             ) -> None:
 
         '''
@@ -131,7 +140,7 @@ class Trainer:
         if output_type == 'weights':
             folder_name = self.backbone + '_weights.pth'
         elif output_type == 'history':
-            folder_name = self.backbone + '_hist.npy'
+            folder_name = self.backbone + f'_hist_fold{fold}.npy'
         elif output_type == 'preds':
             folder_name = self.backbone + '_preds.npy'
         folder_path = os.path.join(self.output_dir, 'model_' + output_type, folder_name)
@@ -150,12 +159,12 @@ class Trainer:
     def train(
             self,
             epoch: int,
-            accum_steps: int
+            batch_size: int
             ) -> tuple:
 
         running_loss = 0.0
         self.model.train()
-        self.optim.zero_grad()
+        self.optim.zero_grad(set_to_none=True)
 
         if self.gpu_id == 0:
             print('-' * 10)
@@ -163,22 +172,13 @@ class Trainer:
             print('-' * 10)
 
         for step, batch_data in enumerate(self.dataloaders['train']):
-            inputs, labels, identifiers = batch_data['image'].to(self.gpu_id), batch_data['label'].to(self.gpu_id), batch_data['uid']
-            # alpha = 0.8 if (0.95 - epoch * 0.01) < 0.8 else 0.95 - epoch * 0.01
-            # warm_up = True if epoch - 10 < 0 else False
-
-            # if epoch == 0:
-            #     ins_labels = labels.unsqueeze(-1).float().repeat(1, inputs.shape[1])
-            #     labels_dict['id'].extend(identifiers)
-            #     labels_dict['ins_labels'].append(ins_labels)
-            # else:
-            #     indices = [labels_dict['id'].index(element) for element in identifiers]
-            #     ins_labels = labels_dict['ins_labels'][indices]
+            inputs, labels, pos_token, padding_mask = self.prep_batch(batch_data, batch_size=batch_size, device_id=self.gpu_id)
+            weight = self.calc_weight(pos_token)
 
             with autocast(enabled=self.amp):
-                logits = self.model(inputs)
+                logits = self.model(inputs, pos_token=pos_token, padding_mask=padding_mask)
                 loss = self.train_bce(logits.squeeze(-1), labels.float())
-                loss = loss / accum_steps
+                loss = torch.mean(torch.mul(weight, loss)) / self.accum_steps
 
             self.scaler.scale(loss).backward()
             running_loss += loss.item()
@@ -186,31 +186,25 @@ class Trainer:
             self.train_auprc.update(preds, labels)
             self.train_auroc.update(preds, labels)
 
-            if ((step + 1) % accum_steps == 0) or (step + 1 == len(self.dataloaders['train'])):
+            if ((step + 1) % self.accum_steps == 0) or (step + 1 == len(self.dataloaders['train'])):
                 self.scaler.unscale_(self.optim)
                 nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0, norm_type=2)
 
                 self.scaler.step(self.optim)
                 self.scaler.update()
-                self.optim.zero_grad()
+                self.optim.zero_grad(set_to_none=True)
 
                 if self.gpu_id == 0:
-                    print(f"{step + 1}/{len(self.dataloaders['train'])}, Batch Loss: {loss.item() * accum_steps:.4f}")
+                    print(f"{step + 1}/{len(self.dataloaders['train'])}, Batch Loss: {loss.item() * self.accum_steps:.4f}")
 
-        #     if epoch > 0:
-        #         labels_dict['ins_labels'][indices] = pseudo_labels.reshape(inputs.shape[0], -1)
-
-        # if epoch == 0:
-        #     labels_dict['ins_labels'] = torch.cat(labels_dict['ins_labels'], dim=0)
-
-        epoch_loss = running_loss / (len(self.dataloaders['train']) // accum_steps)
+        epoch_loss = running_loss / (len(self.dataloaders['train']) // self.accum_steps)
         epoch_auprc = self.train_auprc.compute()
         epoch_auroc = self.train_auroc.compute()
         self.train_auprc.reset()
         self.train_auroc.reset()
 
         if self.gpu_id == 0:
-            print(f"[GPU {self.gpu_id}] Epoch {epoch}, Training Head Loss: {epoch_loss:.4f}, AUPRC: {epoch_auprc:.4f}, and AUROC {epoch_auroc:.4f}")
+            print(f"[GPU {self.gpu_id}] Epoch {epoch}, Training Loss: {epoch_loss:.4f}, AUPRC: {epoch_auprc:.4f}, and AUROC {epoch_auroc:.4f}")
 
         return epoch_loss, epoch_auprc, epoch_auroc
 
@@ -223,9 +217,7 @@ class Trainer:
         Validate the model.
 
         Args:
-            metric (torchmetrics): Metric to assess model performance while validating.
             epoch (int): Current epoch.
-            num_patches (int): Number of patches to split the input into.
         
         Returns:
             tuple: Tuple containing the loss and F1-score.
@@ -234,19 +226,11 @@ class Trainer:
         self.model.eval()
         with torch.no_grad():
             for step, batch_data in enumerate(self.dataloaders['val']):
-                inputs, labels, identifiers = batch_data['image'].to(self.gpu_id), batch_data['label'].to(self.gpu_id), batch_data['uid']
-                # warm_up = True if epoch - 10 < 0 else False
-
-                # if epoch == 0:
-                #     ins_labels = labels.unsqueeze(-1).float().repeat(1, inputs.shape[1])
-                #     labels_dict['id'].extend(identifiers)
-                #     labels_dict['ins_labels'].append(ins_labels)
-                # else:
-                #     indices = [labels_dict['id'].index(element) for element in identifiers]
-                #     ins_labels = labels_dict['ins_labels'][indices]
+                inputs, labels, pos_token, padding_mask = self.prep_batch(batch_data, batch_size=1)
+                labels = labels.to(self.gpu_id)
 
                 with autocast(enabled=self.amp):
-                    logits = self.model(inputs)
+                    logits = self.inferer(inputs, pos_token=pos_token)
                     loss = self.val_bce(logits.squeeze(-1), labels.float())
 
                 running_loss += loss.item()
@@ -254,27 +238,23 @@ class Trainer:
                 self.val_auprc.update(preds, labels)
                 self.val_auroc.update(preds, labels)
 
-        #         if epoch > 0:
-        #             labels_dict['ins_labels'][indices] = pseudo_labels.reshape(inputs.shape[0], -1)
-
-        # if epoch == 0:
-        #     labels_dict['ins_labels'] = torch.cat(labels_dict['ins_labels'], dim=0)
-
-        epoch_loss = running_loss / len(self.dataloaders['val'])
+        epoch_loss = torch.Tensor([running_loss / len(self.dataloaders['val'])])
+        dist.reduce(epoch_loss.to(self.gpu_id), dst=0, op=dist.ReduceOp.AVG)
         epoch_auprc = self.val_auprc.compute()
         epoch_auroc = self.val_auroc.compute()
         self.val_auprc.reset()
         self.val_auroc.reset()
 
         if self.gpu_id == 0:
-            print(f"[GPU {self.gpu_id}] Epoch {epoch}, Validation Loss: {epoch_loss:.4f}, AUPRC: {epoch_auprc:.4f}, and AUROC {epoch_auroc:.4f}")
+            print(f"[GPU {self.gpu_id}] Epoch {epoch}, Validation Loss: {epoch_loss.item():.4f}, AUPRC: {epoch_auprc:.4f}, and AUROC {epoch_auroc:.4f}")
 
-        return epoch_loss, epoch_auprc, epoch_auroc
+        return epoch_loss.item(), epoch_auprc, epoch_auroc
     
     def training_loop(
             self, 
-            warm_up: int, 
-            accum_steps: int, 
+            fold: int,
+            batch_size: int,
+            max_epochs: int = 100,
             val_steps: int = 1,
             patience: int = 10
         ) -> None:
@@ -293,25 +273,23 @@ class Trainer:
             num_patches (int): Number of slice patches to use for training.
         '''
         since = time.time()
-        max_epochs = warm_up * 100
         best_loss = 10.0
         best_auprc = 0.0
         best_auroc = 0.0
         counter = 0
-        history = {'train_loss': [], 'train_f1score': [], 'val_loss': [], 'val_f1score': []}
-        labels_dict = {x: {'id': [], 'ins_labels': []} for x in ['train','val']}
+        log_book = {dataset: {log_type: [] for log_type in ['loss','metric']} for dataset in ['train','val']}
         stop_criterion = torch.zeros(1).to(self.gpu_id)
 
-        for epoch in range(max_epochs):
+        for epoch in range(0, max_epochs):
             start_time = time.time()
-            train_loss, train_auprc, train_auroc = self.train(epoch, accum_steps)
-            history['train_loss'].append(train_loss)
-            history['train_f1score'].append(train_auprc.cpu().item())
+            train_loss, train_auprc, train_auroc = self.train(epoch, batch_size)
+            log_book['train']['loss'].append(train_loss)
+            log_book['train']['metric'].append(train_auprc.cpu().item())
 
             if (epoch + 1) % val_steps == 0:
                 val_loss, val_auprc, val_auroc = self.evaluate(epoch)
-                history['val_loss'].append(val_loss)
-                history['val_f1score'].append(val_auprc.cpu().item())
+                log_book['val']['loss'].append(val_loss.cpu().item())
+                log_book['val']['metric'].append(val_auprc.cpu().item())
 
                 if self.gpu_id == 0:
                     if val_loss < best_loss:
@@ -323,7 +301,7 @@ class Trainer:
                         best_weights = copy.deepcopy(self.model.state_dict())
                     else:
                         counter += 1
-                        if counter >= patience and epoch >= warm_up:
+                        if counter >= patience and epoch >= max_epochs:
                             stop_criterion += 1
 
             train_time = time.time() - start_time
@@ -336,70 +314,58 @@ class Trainer:
 
         if self.gpu_id == 0:
             time_elapsed = time.time() - since
-            print('Training complete in {:.0f}m {:.0f}s'.format(time_elapsed // 60, time_elapsed % 60))
-            print('Loss: {:.4f}, AUPRC: {:.4f}, and {:.4f} of best model configuration.'.format(best_loss, best_auprc, best_auroc))
+            print(f'[Fold {fold}] Training complete in {time_elapsed // 60:.0f}min {time_elapsed % 60:.0f}sec')
+            print(f'[Fold {fold}] Loss: {best_loss:.4f}, AUPRC: {best_auprc:.4f}, and {best_auroc:.4f} of best model configuration.')
             self.save_output(best_weights, 'weights')
-            self.save_output(history, 'history')
+            self.save_output(log_book, 'history', fold)
             
     @staticmethod
-    def update_momentum(
-            counter: int,
-            upper_bound: float = 0.99,
-            lower_bound: float = 0.01,
-            warm_up: int = 10
-        ) -> float:
+    def prep_batch(data: dict, batch_size: int, device_id: torch.device | None = None, normalize: bool = True) -> tuple:
 
-        warm_up = warm_up - 1
-        if counter < warm_up:
-            x = upper_bound
-        elif (upper_bound - (counter - warm_up) * 0.01) < lower_bound:
-            x = lower_bound
+        stats_dict = {'mean': 63.3394, 'std': 11.2231}
+        B, C, H, W, D = data['image'].shape
+        for key in data:
+            if key == 'image':
+                data[key] = data[key].reshape(batch_size, B // batch_size, C, H, W, D)
+            elif not isinstance(data[key], list):
+                try:
+                    data[key] = data[key].reshape(batch_size, B // batch_size)
+                except:
+                    pass
+        data['label'] = torch.max(data['label'], dim=1).values
+        data['age'] = torch.where(data['age'] != 0.0, (data['age'] - stats_dict['mean']) / stats_dict['std'], 0.0) if normalize else data['age']
+        mask = torch.where(data['age'] == 0.0, 1, 0)
+
+        if device_id is not None:
+            return data['image'].to(device_id), data['label'].to(device_id, dtype=torch.int), data['age'].to(device_id, dtype=torch.float), mask.to(device_id, dtype=torch.float)
         else:
-            x = upper_bound - (counter - warm_up) * 0.01
-        return x
+            return data['image'], data['label'].to(torch.int), data['age'].to(torch.float), mask.to(torch.float)
 
-    # def extract_activations(self):
+    @staticmethod
+    def calc_weight(data: torch.Tensor, base: int = 3, dim: int = 1) -> torch.Tensor:
 
-    #     activation = {}
-    #     def get_activation(name):
-    #         def hook(model, input, output):
-    #             activation[name] = output.detach()
-    #         return hook
+        count = torch.count_nonzero(data, dim=dim)
+        base = torch.Tensor([base])
+        return torch.log(count + 1) / torch.log(base.to(count.device))
 
-    #     self.model.activations.register_forward_hook(get_activation('fc'))
-
-    #     labels_list, activations_list = [], []
-
-    #     for phase in ['train', 'val', 'test']:
-    #         for batch_data in self.dataloaders[phase]:
-    #             name = batch_data["image_meta_dict"]["filename_or_obj"]
-    #             inputs = batch_data["image"].to(device)
-    #             labels = batch_data["label"].to(device)
-                
-    #             _ = self.model(inputs)
-                
-    #             img_path.extend(name)
-    #             labels_list.append(labels.detach().cpu().numpy())
-    #             activations_list.append(activation['fc'].cpu().numpy())
-
-    #     features = np.concatenate(activations_list)
-    #     labels = np.concatenate(labels_list)
-
-    #     id_df = pd.DataFrame(img_path, columns=['id'])
-    #     labels_df = pd.DataFrame(labels, columns=['HCC'])
-    #     feats_df = pd.DataFrame(features, 
-    #                             columns = ["var%d" % (i + 1) 
-    #                             for i in range(features.shape[1])])
-
-    #     deep_feats = pd.concat([id_df.reset_index(drop=True), labels_df, feats_df], axis=1)
-
-    #     # write dataframe to csv
-    #     deep_feats.to_csv(os.path.join('/home/x3007104/thesis/results', 'DeepFeatures.csv'), index=False, header=True, sep=',')
-
-
+    @staticmethod
+    def get_wd_params(model: nn.Module):
+        decay = list()
+        no_decay = list()
+        for name, param in model.named_parameters():
+            if hasattr(param,'requires_grad') and not param.requires_grad:
+                continue
+            if 'weight' in name and 'norm' not in name and 'bn' not in name:
+                decay.append(param)
+            else:
+                no_decay.append(param)
+        return decay, no_decay
+    
     def visualize_training(
             self, 
-            metric: str
+            log_type: str,
+            epochs: int = 50,
+            k_folds: int = 10
             ) -> None:
 
         '''
@@ -408,23 +374,25 @@ class Trainer:
         Args:
             metric (str): String specifying the metric to be visualized. Can be 'loss' or 'f1score'.
         '''
-        try: 
-            assert any(metric == metric_item for metric_item in ['loss','f1score'])
-        except AssertionError:
-            print('Invalid input. Please choose from: loss or f1score.')
-            exit(1)
 
-        if metric == 'loss':
-            metric_label = 'Loss'
-        elif metric == 'f1score':
-            metric_label = 'AUPRC'
+        if log_type == 'loss':
+            axis_label = 'Loss'
+        elif log_type == 'metric':
+            axis_label = 'AUPRC'
+        plot_name = self.backbone + '_' + log_type + '.png'
 
-        file_name = self.backbone + '_hist.npy'
-        plot_name = self.backbone + '_' + metric + '.png'
-        history = np.load(os.path.join(self.output_dir, 'model_history', file_name), allow_pickle='TRUE').item()
-        plt.plot(history['train_' + metric], color='dimgray',)
-        plt.plot(history['val_' + metric], color='darkgray',)
-        plt.ylabel(metric_label, fontsize=20, labelpad=10)
+        for dataset in ['train','val']:
+            log_book = []
+            for fold in range(k_folds):
+                file_name = self.backbone + f'_hist_fold{fold}.npy'
+                fold_log = np.load(os.path.join(self.output_dir, 'model_history', file_name), allow_pickle='TRUE').item()
+                log_book.append(fold_log[dataset][log_type])
+                plt.plot(fold_log[dataset][log_type], color=('blue' if dataset == 'train' else 'orange'), alpha=0.2)
+            log_df = pd.DataFrame(log_book)
+            mean_log = log_df.mean(axis=0).tolist()
+            plt.plot(mean_log, color=('blue' if dataset == 'train' else 'orange'), alpha=1.0)
+            
+        plt.ylabel(axis_label, fontsize=20, labelpad=10)
         plt.xlabel('Training Epoch', fontsize=20, labelpad=10)
         plt.legend(['Training', 'Validation'], loc='lower right')
         file_path = os.path.join(self.output_dir, 'model_history/diagnostics', plot_name)
@@ -446,36 +414,38 @@ def parse_args() -> argparse.Namespace:
         argparse.Namespace: Command line arguments.
     '''
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--mil-mode", default='att', type=str,
-                        help="MIL pooling mode. Can be mean, max, att, att_trans, and att_trans_pyramid. Defaults to att.")
     parser.add_argument("--backbone", type=str, 
                         help="Model encoder to use. Defaults to ResNet50.")
+    parser.add_argument("--pooling-mode", default='cls', type=str,
+                        help="Pooling mode. Can be cls, mean, max, or att. Defaults to cls.")
     parser.add_argument("--pretrained", action='store_true',
                         help="Flag to use pretrained weights.")
-    parser.add_argument("--temp-scaling", action='store_true',
-                        help="Flag to scale the raw model logits using temperature scalar.")
     parser.add_argument("--distributed", action='store_true',
                         help="Flag to enable distributed training.")
     parser.add_argument("--amp", action='store_true',
                         help="Flag to enable automated mixed precision training.")
     parser.add_argument("--num-classes", default=2, type=int,
                         help="Number of output classes. Defaults to 2.")
-    parser.add_argument("--min-epochs", default=10, type=int, 
-                        help="Minimum number of epochs to train for. Defaults to 10.")
+    parser.add_argument("--epochs", default=100, type=int, 
+                        help="Number of epochs to train for. Defaults to 10.")
     parser.add_argument("--val-interval", default=1, type=int,
                         help="Number of epochs to wait before running validation. Defaults to 2.")
     parser.add_argument("--batch-size", default=4, type=int, 
                         help="Batch size to use for training. Defaults to 4.")
-    parser.add_argument("--total-batch-size", default=32, type=int,
+    parser.add_argument("--effective-batch-size", default=32, type=int,
                         help="Total batch size: batch size x number of devices x number of accumulations steps.")
+    parser.add_argument("--seq-length", default=4, type=int,
+                        help="Flag to scale the raw model logits using temperature scalar.")
     parser.add_argument("--num-workers", default=8, type=int,
                         help="Number of workers to use for training. Defaults to 4.")
-    parser.add_argument("--train-ratio", default=0.8, type=float, 
-                        help="Ratio of data to use for training. Defaults to 0.8.")
+    parser.add_argument("--k-folds", default=10, type=int, 
+                        help="Number of folds to use in cross validation. Defaults to 0.8.")
     parser.add_argument("--learning-rate", default=1e-4, type=float, 
                         help="Learning rate to use for training. Defaults to 1e-4.")
     parser.add_argument("--weight-decay", default=0, type=float, 
                         help="Weight decay to use for training. Defaults to 0.")
+    parser.add_argument("--dropout", default=0, type=float, 
+                        help="Dropout to use for training. Defaults to 0.")
     parser.add_argument("--patience", default=10, type=int, 
                         help="Patience to use for early stopping. Defaults to 10.")
     parser.add_argument("--mod-list", default=MODALITY_LIST, nargs='+', 
@@ -492,6 +462,7 @@ def parse_args() -> argparse.Namespace:
 
 def load_train_objs(
         device_id,
+        fold: int,
         args: argparse.Namespace
         ) -> tuple:
 
@@ -505,53 +476,66 @@ def load_train_objs(
         tuple: Training objects consisting of the datasets, dataloaders, the model, and the performance metric.
     '''
     data_dict, label_df = DatasetPreprocessor(data_dir=args.data_dir).load_data(modalities=args.mod_list)
-    train, val_test = GroupStratifiedSplit(split_ratio=args.train_ratio).split_dataset(label_df)
-    test, val = GroupStratifiedSplit(split_ratio=0.6).split_dataset(val_test)
-    split_dict = convert_to_dict(train, val, test, data_dict)
-    label_dict = {x: [patient['label'] for patient in split_dict[x]] for x in ['train', 'val']}
+    dev, test = GroupStratifiedSplit(split_ratio=0.8).split_dataset(label_df)
+    cv_folds = StratifiedGroupKFold(n_splits=args.k_folds).split(dev, y=dev['label'], groups=dev['patient_id'])
+    fold_idx = list(cv_folds)
+    train_idx, val_idx = fold_idx[fold]
+    split_dict = convert_to_dict(dev.iloc[train_idx], dev.iloc[val_idx], test, data_dict)
+    phases = ['train','val']
 
-    values, counts = np.unique(label_dict['train'], return_counts=True)
-    # weights = len(label_dict['train']) / (args.num_classes * torch.Tensor([class_count for class_count in counts]))
-    pos_weight = counts[0] / counts[1]
-    if args.distributed:
-        split_dict = {x: partition_dataset_classes(
-            data=split_dict[x],
-            classes=label_dict[x],
+    if args.seq_length > 0:
+        seq_split_dict = convert_to_seqdict(split_dict, args.mod_list, phases)
+        seq_class_dict = {x: [max(patient['label']) for patient in seq_split_dict[x][0]] for x in phases}
+        values, counts = np.unique(seq_class_dict['train'], return_counts=True)
+        pos_weight = counts[1] / counts.sum()
+        seq_split_dict = {x: partition_dataset_classes(
+            data=seq_split_dict[x][0],
+            classes=seq_class_dict[x],
             num_partitions=dist.get_world_size(),
             shuffle=True,
-            even_divisible=(True if x == 'train' else False))[dist.get_rank()] for x in ['train','val']}
-
-    # seq_split_dict = convert_to_seqdict(split_dict, ['train', 'val'])
-    # seq_class_dict = {x: [max(patient['label']) for patient in seq_split_dict[x][0]] for x in ['train', 'val']}
-    # seq_split_dict = {x: partition_dataset_classes(
-    #     data=seq_split_dict[x][0],
-    #     classes=seq_class_dict[x],
-    #     num_partitions=dist.get_world_size(),
-    #     shuffle=True,
-    #     even_divisible=(True if x == 'train' else False))[dist.get_rank()] for x in ['train','val']}
-    # landmarks = {x: np.load(os.path.join(args.data_dir, 'landmarks', x + '.npy')) for x in args.mod_list}
-    datasets = {x: CacheDataset(
-        data=split_dict[x], 
-        transform=data_transforms(
-            dataset=x, 
-            modalities=args.mod_list, 
-            device=device_id), 
-        num_workers=8,
-        copy_cache=False) for x in ['train','val']}
-    # datasets = {x: CacheSeqDataset(
-    #     data=seq_split_dict[x], 
-    #     transform=data_transforms(
-    #         dataset=x, 
-    #         modalities=args.mod_list,
-    #         device=device_id), 
-    #     num_workers=8,
-    #     copy_cache=False) for x in ['train','val']}
-    dataloader = {x: ThreadDataLoader(
-        dataset=datasets[x], 
-        batch_size=(args.batch_size if x == 'train' else 1), 
-        shuffle=(True if x == 'train' else False),   
-        num_workers=0,
-        drop_last=False) for x in ['train','val']}
+            even_divisible=(True if x == 'train' else False))[dist.get_rank()] for x in phases}
+        datasets = {x: CacheSeqDataset(
+            data=seq_split_dict[x], 
+            image_keys=args.mod_list,
+            transform=data_transforms(
+                dataset=x, 
+                modalities=args.mod_list,
+                device=device_id), 
+            num_workers=8,
+            copy_cache=False) for x in phases}
+        dataloader = {x: ThreadDataLoader(
+            dataset=datasets[x], 
+            batch_size=(args.batch_size if x == 'train' else 1), 
+            shuffle=(True if x == 'train' else False),   
+            num_workers=0,
+            drop_last=False,
+            collate_fn=(SequenceBatchCollater(
+                keys=['image','label','age'], 
+                seq_length=args.seq_length) if x == 'train' else list_data_collate)) for x in phases}
+    else:
+        class_dict = {x: [patient['label'] for patient in split_dict[x]] for x in phases}
+        values, counts = np.unique(class_dict['train'], return_counts=True)
+        pos_weight = counts[1] / counts.sum()
+        split_dict = {x: partition_dataset_classes(
+            data=split_dict[x],
+            classes=class_dict[x],
+            num_partitions=dist.get_world_size(),
+            shuffle=True,
+            even_divisible=(True if x == 'train' else False))[dist.get_rank()] for x in phases}
+        datasets = {x: CacheDataset(
+            data=split_dict[x], 
+            transform=data_transforms(
+                dataset=x, 
+                modalities=args.mod_list, 
+                device=device_id), 
+            num_workers=8,
+            copy_cache=False) for x in phases}
+        dataloader = {x: ThreadDataLoader(
+            dataset=datasets[x], 
+            batch_size=(args.batch_size if x == 'train' else 1), 
+            shuffle=(True if x == 'train' else False),   
+            num_workers=0,
+            drop_last=(True if x == 'train' else False)) for x in phases}
 
     return dataloader, pos_weight
 
@@ -560,6 +544,7 @@ def data_transforms(
         modalities: list,
         device: torch.device
         ) -> transforms:
+
     '''
     Perform data transformations on image and image labels.
 
@@ -569,25 +554,21 @@ def data_transforms(
     Returns:
         transforms (monai.transforms): Data transformations to be applied.
     '''
-    lambda_val = 0.15
     prep = [
         LoadImaged(keys=modalities, image_only=True),
         EnsureChannelFirstd(keys=modalities),
         Orientationd(keys=modalities, axcodes='PLI'),
-        Spacingd(keys=modalities, pixdim=(1.5, 1.5, 1.5), mode='bilinear'),
-        ResampleToMatchd(
-            keys=modalities, 
-            key_dst=modalities[0], 
-            mode='bilinear'),
+        Spacingd(keys=modalities, pixdim=(1.5, 1.5, 1.5), mode=3),
+        ResampleToMatchd(keys=modalities, key_dst=modalities[0], mode=3),
         PercentileSpatialCropd(
             keys=modalities,
             roi_center=(0.5, 0.5, 0.5),
             roi_size=(0.85, 0.8, 0.99),
-            min_size=(80, 80, 80)),
+            min_size=(96, 96, 96)),
         CopyItemsd(keys=modalities[0], names='mask'),
         Lambdad(
             keys='mask', 
-            func=lambda x: np.where(x > np.mean(x), 1, 0)),
+            func=lambda x: torch.where(x > torch.mean(x), 1, 0)),
         KeepLargestConnectedComponentd(keys='mask', connectivity=1),
         CropForegroundd(
             keys=modalities,
@@ -595,31 +576,35 @@ def data_transforms(
             select_fn=lambda x: x > 0,
             k_divisible=1,
             allow_smaller=False),
-        Lambdad(
-            keys=modalities, 
-            func=lambda x: ((x + 1) ** lambda_val - 1) / lambda_val),
+        YeoJohnsond(keys=modalities, lmbda=0.1),
         ConcatItemsd(keys=modalities, name='image'),
-        DeleteItemsd(keys=modalities),
+        DeleteItemsd(keys=modalities + ['mask']),
         RobustNormalized(keys='image', channel_wise=True),
-        SoftClipIntensityd(keys='image', min_value=-4.0, max_value=4.0, channel_wise=True),
         PercentileSpatialCropd(
             keys='image',
-            roi_center=(0.45, 0.3, 0.3),
+            roi_center=(0.45, 0.25, 0.3),
             roi_size=(0.6, 0.45, 0.4),
-            min_size=(80, 80, 80))
+            min_size=(96, 96, 96)),
+        SoftClipIntensityd(keys='image', min_value=-3.0, max_value=3.0, channel_wise=True),
+        NormalizeIntensityd(
+            keys='image',
+            subtrahend=(0.2907, 0.3094, 0.3167, 0.3051),
+            divisor=(0.7265, 0.7447, 0.7597, 0.7605),
+            channel_wise=True)
     ]
 
     train = [
         EnsureTyped(keys='image', track_meta=False, device=device, dtype=torch.float),
-        RandSpatialCropSamplesd(keys='image', roi_size=(64, 64, 64), random_size=False, num_samples=1),
-        RandFlipd(keys='image', prob=0.2, spatial_axis=0),
-        RandFlipd(keys='image', prob=0.2, spatial_axis=1),
-        RandFlipd(keys='image', prob=0.2, spatial_axis=2),
-        RandStdShiftIntensityd(keys='image', prob=0.5, factors=0.1, channel_wise=True)
+        RandSpatialCropd(keys='image', roi_size=(72, 72, 72), random_size=False),
+        RandAxisFlipd(keys='image', prob=0.25),
+        RandRotate90d(keys='image', prob=0.25),
+        RandGibbsNoised(keys='image', prob=0.1, alpha=(0.1, 0.9)),
+        RandRicianNoised(keys='image', prob=0.1, mean=0, std=0.5, sample_std=True, channel_wise=True),
+        RandStdShiftIntensityd(keys='image', prob=0.5, factors=0.2, channel_wise=True)
     ]
 
     test = [
-        CenterSpatialCropd(keys='image', roi_size=(80, 80, 80)),
+        CenterSpatialCropd(keys='image', roi_size=(96, 96, 96)),
         EnsureTyped(keys='image', track_meta=False, device=device, dtype=torch.float)
     ]
 
@@ -657,50 +642,49 @@ def main(
     Args:
         args (argparse.Namespace): Command line arguments.
     '''
-    # Set a seed for reproducibility.
     set_determinism(seed=args.seed)
-    # Setup distributed training.
     if args.distributed:
         setup()
-        rank = dist.get_rank()
-        num_devices = torch.cuda.device_count()
-        device_id = rank % num_devices
-        learning_rate = args.learning_rate * np.sqrt(num_devices)
-        accum_steps = args.total_batch_size / args.batch_size / num_devices
-    else:
-        device_id = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        accum_steps = args.total_batch_size / args.batch_size
-
-    dataloader, pos_weight = load_train_objs(device_id, args)
-    set_track_meta(False)
+    rank = dist.get_rank()
+    num_devices = torch.cuda.device_count()
+    device_id = rank % num_devices
+    accum_steps = args.effective_batch_size / args.batch_size / num_devices
+    batch_size_gpu = args.batch_size * accum_steps
+    alpha = 0.0001 if batch_size_gpu == 8 else 0.000141 if batch_size_gpu == 16 else 0.0002 if batch_size_gpu == 32 else 0.000282
+    learning_rate = (alpha * np.sqrt(batch_size_gpu) / np.sqrt(128)) * np.sqrt(num_devices)
     num_classes = args.num_classes if args.num_classes > 2 else 1
-    if args.backbone == 'resnet10':
-        model = resnet10(pretrained=args.pretrained, n_input_channels=len(args.mod_list), num_classes=num_classes, shortcut_type='B')
-    elif args.backbone == 'resnet50':
-        model = resnet50(pretrained=args.pretrained, n_input_channels=len(args.mod_list), num_classes=num_classes, shortcut_type='B')
-    elif args.backbone == 'swinvit_t':
-        model = swinvit_tiny(pretrained=False, in_chans=len(args.mod_list), num_classes=num_classes)
-    elif args.backbone == 'swinvit_s':
-        model = swinvit_small(pretrained=False, in_chans=len(args.mod_list), num_classes=num_classes)
-    elif args.backbone == 'swinvit_b':
-        model = swinvit_base(pretrained=True, in_chans=len(args.mod_list), num_classes=num_classes)
-    if args.distributed:
-        model = nn.SyncBatchNorm.convert_sync_batchnorm(model) if args.backbone != 'swinvit' else model
-        model = model.to(device_id)
-        model = nn.parallel.DistributedDataParallel(
-            model, 
-            device_ids=[device_id])
-    else:
-        model = model.to(device_id)
-    # Train the model using the training data and validate the model on the validation data following each epoch.
-    trainer = Trainer(model, args.backbone, args.amp, dataloader, learning_rate, args.weight_decay, pos_weight, args.results_dir)
-    trainer.training_loop(args.min_epochs, accum_steps, args.val_interval, args.patience)
-    # Cleanup distributed training.
+
+    for fold in range(args.k_folds):
+        dataloader, pos_weight = load_train_objs(device_id, fold, args)
+        backbone = convnext3d_femto(in_chans=len(args.mod_list), use_grn=True)
+        model = MedNet(backbone, num_classes=num_classes, pooling_mode=args.pooling_mode, dropout=args.dropout)
+        if args.distributed:
+            model = model.to(device_id)
+            model = nn.parallel.DistributedDataParallel(model, device_ids=[device_id])
+        else:
+            model = model.to(device_id)
+        set_track_meta(False)
+        trainer = Trainer(
+            model=model, 
+            backbone=args.backbone, 
+            amp=args.amp, 
+            dataloaders=dataloader, 
+            learning_rate=learning_rate, 
+            weight_decay=args.weight_decay, 
+            max_seq_length=args.seq_length * args.batch_size, 
+            accum_steps=accum_steps, 
+            pos_weight=pos_weight, 
+            output_dir=args.results_dir)
+        trainer.training_loop(
+            fold=fold,
+            max_epochs=args.epochs, 
+            batch_size=args.batch_size, 
+            val_steps=args.val_interval, 
+            patience=args.patience)
     if args.distributed:
         cleanup()
-    # Plot the training and validation loss and F1 score.
-    trainer.visualize_training('loss')
-    trainer.visualize_training('f1score')
+    trainer.visualize_training('loss', epochs=args.epochs, k_folds=args.k_folds)
+    trainer.visualize_training('metric', epochs=args.epochs, k_folds=args.k_folds)
     print('Script finished')
     
 

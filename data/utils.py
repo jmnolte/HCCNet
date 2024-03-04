@@ -8,39 +8,45 @@ from collections import defaultdict
 from monai.data.utils import collate_meta_tensor
 
 
-def pad_or_trunc_seq(data: list, seq_length: int) -> list:
+class SequenceBatchCollater:
 
-    sequences = {x: [seq[x] for seq in data] for x in ['image','label','age']}
-    zero_image = sequences['image'][0]
-    zero_label = torch.IntTensor([99])
-    zero_age = torch.FloatTensor([0])
-    if len(sequences['image']) < seq_length:
-        while len(sequences['image']) < seq_length:
-            sequences['image'].append(zero_image)
-            sequences['label'].append(zero_label)
-            sequences['age'].append(zero_age)
-    elif len(sequences['image']) > seq_length:
-        while len(sequences['image']) > seq_length:
-            idx_to_remove = np.random.choice(len(sequences['image']))
-            sequences['image'].pop(idx_to_remove)
-            sequences['label'].pop(idx_to_remove)
-            sequences['age'].pop(idx_to_remove)
+    def __init__(
+            self,
+            keys: list,
+            seq_length: int
+        ) -> None:
 
-    data = []
-    for i in range(seq_length):
-        data.append({'image': sequences['image'][i], 'label': sequences['label'][i], 'age': sequences['age'][i]})
+        self.keys = keys
+        self.seq_length = seq_length
 
-    return data
+    def pad_or_trunc_seq(self, data: list) -> list:
 
+        sequences = {x: [seq[x] for seq in data] for x in self.keys}
+        zero_values = {}
+        for key in self.keys:
+            if isinstance(sequences[key][0], torch.Tensor):
+                zero_values[key] = torch.clone(sequences[key][0])
+            else:
+                zero_values[key] = torch.zeros(1)
 
-def collate_sequence_batch(batch):
-    data = []
-    for patient in range(len(batch)):
-        elem = [i for k in [batch[patient]] for i in k]
-        data.append(pad_or_trunc_seq(elem, 4))
-    data = [i for k in data for i in k]
+        if len(sequences[self.keys[0]]) < self.seq_length:
+            while len(sequences[self.keys[0]]) < self.seq_length:
+                for key in self.keys:
+                    sequences[key].append(zero_values[key])
+        elif len(sequences[self.keys[0]]) > self.seq_length:
+            while len(sequences[self.keys[0]]) > self.seq_length:
+                idx_to_remove = np.random.choice(len(sequences[self.keys[0]]))
+                for key in self.keys:
+                    sequences[key].pop(idx_to_remove)
 
-    return collate_meta_tensor(data)
+        data = [{key: sequences[key][i] for key in self.keys} for i in range(self.seq_length)]
+
+        return data
+
+    def __call__(self, batch: list) -> list:
+
+        data = [self.pad_or_trunc_seq(patient) for patient in batch]
+        return collate_meta_tensor([item for sublist in data for item in sublist])
 
 
 def collate_shuffled_batch(batch):
@@ -69,6 +75,7 @@ def convert_to_dict(
 
 def convert_to_seqdict(
         split_dict: dict,
+        modalities: list,
         splits: list
     ) -> dict:
 
@@ -76,11 +83,9 @@ def convert_to_seqdict(
     for phase in splits:
         desired_split_dict = defaultdict(lambda: defaultdict(list))
         for entry in split_dict[phase]:
-            uid = entry['uid'].split('_')[1]  # Extract the common part of 'uid'
+            uid = entry['uid'].split('_')[1]
             for key, value in entry.items():
-                if key == 'uid':
-                    continue
-                elif key == 'label' or key == 'age':
+                if key not in modalities:
                     value = [value]
                 desired_split_dict[uid][key].extend(value)
 
@@ -104,7 +109,7 @@ class DatasetPreprocessor:
 
         Returns:
             data_dict (dict): Dictionary containing the paths to the images and corresponding labels.
-        ''' 
+        '''
         self.nifti_dir = os.path.join(data_dir, 'nifti')
         self.nifti_patients = glob(os.path.join(self.nifti_dir, '*'), recursive = True)
         self.label_dir = os.path.join(data_dir, 'labels')
@@ -127,11 +132,7 @@ class DatasetPreprocessor:
         observation_list = []
         for observation in natsorted(self.nifti_patients):
             images = [image for image in glob(os.path.join(observation, '*.nii.gz'))]
-            if len(images) == 1:
-                tail, _ = os.path.split(images[0])
-                common_prefix = tail + '/'
-            else:
-                common_prefix = os.path.commonprefix(images)
+            common_prefix = os.path.commonprefix(images)
             image_names = [image_name[len(common_prefix):] for image_name in images]
             if all(names in image_names for names in image_names_list):
                 observation_list.append(observation)
@@ -171,7 +172,7 @@ class DatasetPreprocessor:
         Returns:
             label_dict (dict): Dictionary containing the labels.
         '''
-        label_dict = {'uid': [], 'label': []}
+        label_dict = {x: [] for x in ['uid','label','age']}
         labels_df = pd.read_csv(label_path)
         for idx, row in labels_df.iterrows():
             if labels_df.loc[idx, 'observation'] < 10:
@@ -184,10 +185,10 @@ class DatasetPreprocessor:
                 continue
             else:
                 label = labels_df.loc[labels_df['uid'] == observation_id, 'label'].values.item()
-                # age = labels_df.loc[labels_df['uid'] == observation_id, 'age'].values.item()
+                age = labels_df.loc[labels_df['uid'] == observation_id, 'age'].values.item()
             label_dict['label'].append(label)
             label_dict['uid'].append(observation_id)
-            # label_dict['age'].append(age)
+            label_dict['age'].append(age)
         return [dict(zip(label_dict.keys(), vals)) for vals in zip(*(label_dict[k] for k in label_dict.keys()))]
     
     @staticmethod
@@ -234,10 +235,10 @@ class DatasetPreprocessor:
         for idx, patient in enumerate(data_dict):
             if patient['uid'] in [label['uid'] for label in label_dict]:
                 data_dict[idx][label_column] = label_dict[[label['uid'] for label in label_dict].index(patient['uid'])][label_column]
-                # data_dict[idx]['age'] = label_dict[[label['uid'] for label in label_dict].index(patient['uid'])]['age']
+                data_dict[idx]['age'] = label_dict[[label['uid'] for label in label_dict].index(patient['uid'])]['age']
             else:
                 data_dict[idx][label_column] = None
-                # data_dict[idx]['age'] = None
+                data_dict[idx]['age'] = None
         data_dict = [patient for patient in data_dict if not (patient[label_column] == None)]
 
         return data_dict, label_df
