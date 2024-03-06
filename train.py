@@ -27,12 +27,13 @@ from monai.transforms import (
     ConcatItemsd,
     CenterSpatialCropd,
     ResampleToMatchd,
-    RandAxisFlipd,
+    RandFlipd,
     RandRotate90d,
     EnsureTyped,
     DeleteItemsd,
     RandSpatialCropd,
-    RandStdShiftIntensityd,
+    RandShiftIntensityd,
+    RandScaleIntensityd,
     RandGibbsNoised,
     RandRicianNoised,
     RandZoomd,
@@ -59,6 +60,7 @@ from handlers.slidingwindowinference import SlidingWindowInferer
 from models.mednet import MedNet
 from models.convnext3d import convnext3d_atto, convnext3d_femto, convnext3d_pico, convnext3d_nano, convnext3d_tiny
 from losses.focalloss import FocalLoss
+from losses.binaryceloss import BinaryCELoss
 from optimizer.adams import AdamS
 
 
@@ -68,6 +70,7 @@ class Trainer:
             self, 
             model: nn.Module, 
             backbone: str, 
+            loss_fn: str,
             amp: bool,
             dataloaders: dict, 
             learning_rate: float, 
@@ -106,11 +109,18 @@ class Trainer:
 
         params = self.model.parameters()
         self.optim = optim.AdamW(params, lr=learning_rate, weight_decay=weight_decay)
+        self.schedule = optim.lr_scheduler.OneCycleLR(
+            optimizer=self.optim,
+            max_lr=learning_rate * 25,
+            epochs=50,
+            steps_per_epoch=int(len(dataloaders['train']) / accum_steps))
 
-        # self.train_bce = nn.BCEWithLogitsLoss(pos_weight=torch.Tensor([pos_weight]), reduction='none').to(self.gpu_id)
-        # self.val_bce = nn.BCEWithLogitsLoss(reduction='none').to(self.gpu_id)
-        self.train_bce = FocalLoss(gamma=2, alpha=pos_weight, label_smoothing=0.1, reduction=None).to(self.gpu_id)
-        self.val_bce = FocalLoss(gamma=2).to(self.gpu_id)
+        if loss_fn == 'focal':
+            self.train_bce = FocalLoss(gamma=2, alpha=pos_weight, label_smoothing=0.1).to(self.gpu_id)
+            self.val_bce = FocalLoss(gamma=0).to(self.gpu_id)
+        else:
+            self.train_bce = BinaryCELoss(weights=pos_weight, label_smoothing=0.1).to(self.gpu_id)
+            self.val_bce = BinaryCELoss().to(self.gpu_id)
 
         self.train_auprc = BinaryAveragePrecision().to(self.gpu_id)
         self.train_auroc = BinaryAUROC().to(self.gpu_id)
@@ -121,7 +131,8 @@ class Trainer:
             self, 
             output_dict: dict, 
             output_type: str,
-            fold: int | None = None
+            fold: int | None = None,
+            suffix: str | None = None
             ) -> None:
 
         '''
@@ -140,7 +151,7 @@ class Trainer:
         if output_type == 'weights':
             folder_name = self.backbone + '_weights.pth'
         elif output_type == 'history':
-            folder_name = self.backbone + f'_hist_fold{fold}.npy'
+            folder_name = self.backbone + f'_hist_fold{fold}' + suffix + '.npy'
         elif output_type == 'preds':
             folder_name = self.backbone + '_preds.npy'
         folder_path = os.path.join(self.output_dir, 'model_' + output_type, folder_name)
@@ -178,7 +189,8 @@ class Trainer:
             with autocast(enabled=self.amp):
                 logits = self.model(inputs, pos_token=pos_token, padding_mask=padding_mask)
                 loss = self.train_bce(logits.squeeze(-1), labels.float())
-                loss = torch.mean(torch.mul(weight, loss)) / self.accum_steps
+                # loss = torch.mean(torch.mul(weight, loss)) / self.accum_steps
+                loss /= self.accum_steps
 
             self.scaler.scale(loss).backward()
             running_loss += loss.item()
@@ -193,6 +205,7 @@ class Trainer:
                 self.scaler.step(self.optim)
                 self.scaler.update()
                 self.optim.zero_grad(set_to_none=True)
+                # self.schedule.step()
 
                 if self.gpu_id == 0:
                     print(f"{step + 1}/{len(self.dataloaders['train'])}, Batch Loss: {loss.item() * self.accum_steps:.4f}")
@@ -253,6 +266,7 @@ class Trainer:
     def training_loop(
             self, 
             fold: int,
+            suffix: str,
             batch_size: int,
             max_epochs: int = 100,
             val_steps: int = 1,
@@ -288,7 +302,7 @@ class Trainer:
 
             if (epoch + 1) % val_steps == 0:
                 val_loss, val_auprc, val_auroc = self.evaluate(epoch)
-                log_book['val']['loss'].append(val_loss.cpu().item())
+                log_book['val']['loss'].append(val_loss)
                 log_book['val']['metric'].append(val_auprc.cpu().item())
 
                 if self.gpu_id == 0:
@@ -317,7 +331,7 @@ class Trainer:
             print(f'[Fold {fold}] Training complete in {time_elapsed // 60:.0f}min {time_elapsed % 60:.0f}sec')
             print(f'[Fold {fold}] Loss: {best_loss:.4f}, AUPRC: {best_auprc:.4f}, and {best_auroc:.4f} of best model configuration.')
             self.save_output(best_weights, 'weights')
-            self.save_output(log_book, 'history', fold)
+            self.save_output(log_book, 'history', fold, suffix)
             
     @staticmethod
     def prep_batch(data: dict, batch_size: int, device_id: torch.device | None = None, normalize: bool = True) -> tuple:
@@ -365,7 +379,8 @@ class Trainer:
             self, 
             log_type: str,
             epochs: int = 50,
-            k_folds: int = 10
+            k_folds: int = 10,
+            suffix: str | None = None
             ) -> None:
 
         '''
@@ -379,12 +394,12 @@ class Trainer:
             axis_label = 'Loss'
         elif log_type == 'metric':
             axis_label = 'AUPRC'
-        plot_name = self.backbone + '_' + log_type + '.png'
+        plot_name = log_type + '_' + suffix + '.png' if suffix is not None else log_type + '.png'
 
         for dataset in ['train','val']:
             log_book = []
             for fold in range(k_folds):
-                file_name = self.backbone + f'_hist_fold{fold}.npy'
+                file_name = self.backbone + f'_hist_fold{fold}' + suffix + '.npy'
                 fold_log = np.load(os.path.join(self.output_dir, 'model_history', file_name), allow_pickle='TRUE').item()
                 log_book.append(fold_log[dataset][log_type])
                 plt.plot(fold_log[dataset][log_type], color=('blue' if dataset == 'train' else 'orange'), alpha=0.2)
@@ -414,8 +429,10 @@ def parse_args() -> argparse.Namespace:
         argparse.Namespace: Command line arguments.
     '''
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--backbone", type=str, 
+    parser.add_argument("--backbone", type=str, default='convnext',
                         help="Model encoder to use. Defaults to ResNet50.")
+    parser.add_argument("--loss-fn", type=str, default='bce',
+                        help="Loss function to use.")
     parser.add_argument("--pooling-mode", default='cls', type=str,
                         help="Pooling mode. Can be cls, mean, max, or att. Defaults to cls.")
     parser.add_argument("--pretrained", action='store_true',
@@ -437,21 +454,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seq-length", default=4, type=int,
                         help="Flag to scale the raw model logits using temperature scalar.")
     parser.add_argument("--num-workers", default=8, type=int,
-                        help="Number of workers to use for training. Defaults to 4.")
-    parser.add_argument("--k-folds", default=10, type=int, 
+                        help="Number of workers to use for training. Defaults to 8.")
+    parser.add_argument("--k-folds", default=0, type=int, 
                         help="Number of folds to use in cross validation. Defaults to 0.8.")
     parser.add_argument("--learning-rate", default=1e-4, type=float, 
                         help="Learning rate to use for training. Defaults to 1e-4.")
     parser.add_argument("--weight-decay", default=0, type=float, 
                         help="Weight decay to use for training. Defaults to 0.")
     parser.add_argument("--dropout", default=0, type=float, 
-                        help="Dropout to use for training. Defaults to 0.")
+                        help="Dropout rate to use for training. Defaults to 0.")
+    parser.add_argument("--stochastic-depth", default=0, type=float, 
+                        help="Stochastic depth rate to use for training. Defaults to 0.")
+    parser.add_argument("--epsilon", default=1e-5, type=float, 
+                        help="Epsilon value to use for norm layers. Defaults to 1e-5.")
     parser.add_argument("--patience", default=10, type=int, 
                         help="Patience to use for early stopping. Defaults to 10.")
     parser.add_argument("--mod-list", default=MODALITY_LIST, nargs='+', 
                         help="List of modalities to use for training")
     parser.add_argument("--seed", default=1234, type=int, 
                         help="Seed to use for reproducibility")
+    parser.add_argument("--suffix", default='MedNet', type=str, 
+                        help="File suffix for identification")
     parser.add_argument("--data-dir", default=DATA_DIR, type=str, 
                         help="Path to data directory")
     parser.add_argument("--weights-dir", default=WEIGHTS_DIR, type=str, 
@@ -462,8 +485,8 @@ def parse_args() -> argparse.Namespace:
 
 def load_train_objs(
         device_id,
-        fold: int,
-        args: argparse.Namespace
+        args: argparse.Namespace,
+        phases: list = ['train', 'val']
         ) -> tuple:
 
     '''
@@ -475,68 +498,76 @@ def load_train_objs(
     Returns:
         tuple: Training objects consisting of the datasets, dataloaders, the model, and the performance metric.
     '''
+    folds = range(args.k_folds)
     data_dict, label_df = DatasetPreprocessor(data_dir=args.data_dir).load_data(modalities=args.mod_list)
     dev, test = GroupStratifiedSplit(split_ratio=0.8).split_dataset(label_df)
-    cv_folds = StratifiedGroupKFold(n_splits=args.k_folds).split(dev, y=dev['label'], groups=dev['patient_id'])
-    fold_idx = list(cv_folds)
-    train_idx, val_idx = fold_idx[fold]
-    split_dict = convert_to_dict(dev.iloc[train_idx], dev.iloc[val_idx], test, data_dict)
-    phases = ['train','val']
+    if args.k_folds > 1:
+        cv_folds = StratifiedGroupKFold(n_splits=args.k_folds).split(dev, y=dev['label'], groups=dev['patient_id'])
+        indices = [(dev.iloc[train_idx], dev.iloc[val_idx]) for train_idx, val_idx in list(cv_folds)]
+        split_dict = [convert_to_dict([indices[k][0], indices[k][1]], data_dict=data_dict, split_names=phases) for k in folds]
+    elif args.k_folds == 1:
+        train, val = GroupStratifiedSplit(split_ratio=0.85).split_dataset(dev)
+        split_dict = [convert_to_dict([train, val], data_dict=data_dict, split_names=phases, verbose=True) for k in folds]
+    else:
+        phases = ['train']
+        folds = range(1)
+        split_dict = [convert_to_dict([dev], data_dict=data_dict, split_names=phases, verbose=True) for k in folds]
 
     if args.seq_length > 0:
-        seq_split_dict = convert_to_seqdict(split_dict, args.mod_list, phases)
-        seq_class_dict = {x: [max(patient['label']) for patient in seq_split_dict[x][0]] for x in phases}
-        values, counts = np.unique(seq_class_dict['train'], return_counts=True)
-        pos_weight = counts[1] / counts.sum()
-        seq_split_dict = {x: partition_dataset_classes(
-            data=seq_split_dict[x][0],
-            classes=seq_class_dict[x],
+        seq_split_dict = [convert_to_seqdict(split_dict[k], args.mod_list, phases) for k in folds]
+        seq_class_dict = {x: [[max(patient['label']) for patient in seq_split_dict[k][x][0]] for k in folds] for x in phases}
+        seq_split_dict = {x: [partition_dataset_classes(
+            data=seq_split_dict[k][x][0],
+            classes=seq_class_dict[x][k],
             num_partitions=dist.get_world_size(),
             shuffle=True,
-            even_divisible=(True if x == 'train' else False))[dist.get_rank()] for x in phases}
-        datasets = {x: CacheSeqDataset(
-            data=seq_split_dict[x], 
+            even_divisible=(True if x == 'train' else False)
+            )[dist.get_rank()] for k in folds] for x in phases}
+        datasets = {x: [CacheSeqDataset(
+            data=seq_split_dict[x][k],
             image_keys=args.mod_list,
             transform=data_transforms(
                 dataset=x, 
                 modalities=args.mod_list,
                 device=device_id), 
             num_workers=8,
-            copy_cache=False) for x in phases}
-        dataloader = {x: ThreadDataLoader(
-            dataset=datasets[x], 
+            copy_cache=False
+            ) for k in folds] for x in phases}
+        dataloader = {x: [ThreadDataLoader(
+            datasets[x][k], 
             batch_size=(args.batch_size if x == 'train' else 1), 
             shuffle=(True if x == 'train' else False),   
             drop_last=(True if x == 'train' else False), 
             num_workers=0,
-            drop_last=False,
-            collate_fn=(SequenceBatchCollater(
-                keys=['image','label','age'], 
-                seq_length=args.seq_length) if x == 'train' else list_data_collate)) for x in phases}
-    else:
-        class_dict = {x: [patient['label'] for patient in split_dict[x]] for x in phases}
-        values, counts = np.unique(class_dict['train'], return_counts=True)
+            collate_fn=(SequenceBatchCollater(keys=['image','label','age'], seq_length=args.seq_length) if x == 'train' else list_data_collate)
+            ) for k in folds] for x in phases}
+        _, counts = np.unique(seq_class_dict['train'][0], return_counts=True)
         pos_weight = counts[1] / counts.sum()
-        split_dict = {x: partition_dataset_classes(
-            data=split_dict[x],
-            classes=class_dict[x],
+    else:
+        class_dict = {x: [[patient['label'] for patient in split_dict[k][x]] for k in folds] for x in phases}
+        split_dict = {x: [partition_dataset_classes(
+            data=split_dict[k][x],
+            classes=class_dict[x][k],
             num_partitions=dist.get_world_size(),
             shuffle=True,
-            even_divisible=(True if x == 'train' else False))[dist.get_rank()] for x in phases}
-        datasets = {x: CacheDataset(
-            data=split_dict[x], 
+            even_divisible=(True if x == 'train' else False)
+            )[dist.get_rank()] for k in folds] for x in phases}
+        datasets = {x: [CacheDataset(
+            data=split_dict[x][k], 
             transform=data_transforms(
                 dataset=x, 
                 modalities=args.mod_list, 
                 device=device_id), 
             num_workers=8,
-            copy_cache=False) for x in phases}
-        dataloader = {x: ThreadDataLoader(
-            dataset=datasets[x], 
+            copy_cache=False
+            ) for k in folds] for x in phases}
+        dataloader = {x: [ThreadDataLoader(
+            dataset=datasets[x][k], 
             batch_size=(args.batch_size if x == 'train' else 1), 
             shuffle=(True if x == 'train' else False),   
             num_workers=0,
-            drop_last=(True if x == 'train' else False)) for x in phases}
+            drop_last=(True if x == 'train' else False)
+            ) for k in folds] for x in phases}
 
     return dataloader, pos_weight
 
@@ -597,11 +628,14 @@ def data_transforms(
     train = [
         EnsureTyped(keys='image', track_meta=False, device=device, dtype=torch.float),
         RandSpatialCropd(keys='image', roi_size=(72, 72, 72), random_size=False),
-        RandAxisFlipd(keys='image', prob=0.25),
-        RandRotate90d(keys='image', prob=0.25),
-        RandGibbsNoised(keys='image', prob=0.1, alpha=(0.1, 0.9)),
-        RandRicianNoised(keys='image', prob=0.1, mean=0, std=0.5, sample_std=True, channel_wise=True),
-        RandStdShiftIntensityd(keys='image', prob=0.5, factors=0.2, channel_wise=True)
+        RandFlipd(keys='image', spatial_axis=0, prob=0.5),
+        RandFlipd(keys='image', spatial_axis=1, prob=0.5),
+        RandFlipd(keys='image', spatial_axis=2, prob=0.5),
+        RandRotate90d(keys='image', prob=0.5),
+        # RandGibbsNoised(keys='image', prob=0.1, alpha=(0.1, 0.9)),
+        # RandRicianNoised(keys='image', prob=0.1, mean=0, std=0.5, sample_std=True, channel_wise=True),
+        RandScaleIntensityd(keys='image', factors=0.1, prob=1.0),
+        RandShiftIntensityd(keys='image', offsets=0.1, prob=1.0)
     ]
 
     test = [
@@ -655,19 +689,31 @@ def main(
     learning_rate = (alpha * np.sqrt(batch_size_gpu) / np.sqrt(128)) * np.sqrt(num_devices)
     num_classes = args.num_classes if args.num_classes > 2 else 1
 
-    for fold in range(args.k_folds):
-        dataloader, pos_weight = load_train_objs(device_id, fold, args)
-        backbone = convnext3d_femto(in_chans=len(args.mod_list), use_grn=True)
-        model = MedNet(backbone, num_classes=num_classes, pooling_mode=args.pooling_mode, dropout=args.dropout)
+    cv_dataloader, pos_weight = load_train_objs(device_id, args)
+    set_track_meta(False)
+
+    for k in range(args.k_folds):
+        dataloader = {x: cv_dataloader[x][k] for x in ['train','val']}
+        backbone = convnext3d_femto(
+            in_chans=len(args.mod_list), 
+            use_grn=True, 
+            drop_path_rate=args.stochastic_depth,
+            eps=args.epsilon)
+        model = MedNet(
+            backbone, 
+            num_classes=num_classes, 
+            pooling_mode=args.pooling_mode, 
+            dropout=args.dropout, 
+            eps=args.epsilon)
         if args.distributed:
             model = model.to(device_id)
             model = nn.parallel.DistributedDataParallel(model, device_ids=[device_id])
         else:
             model = model.to(device_id)
-        set_track_meta(False)
         trainer = Trainer(
             model=model, 
             backbone=args.backbone, 
+            loss_fn=args.loss_fn,
             amp=args.amp, 
             dataloaders=dataloader, 
             learning_rate=learning_rate, 
@@ -677,15 +723,17 @@ def main(
             pos_weight=pos_weight, 
             output_dir=args.results_dir)
         trainer.training_loop(
-            fold=fold,
+            fold=k,
+            suffix=args.suffix,
             max_epochs=args.epochs, 
             batch_size=args.batch_size, 
             val_steps=args.val_interval, 
             patience=args.patience)
+
     if args.distributed:
         cleanup()
-    trainer.visualize_training('loss', epochs=args.epochs, k_folds=args.k_folds)
-    trainer.visualize_training('metric', epochs=args.epochs, k_folds=args.k_folds)
+    trainer.visualize_training('loss', epochs=args.epochs, k_folds=args.k_folds, suffix=args.suffix)
+    trainer.visualize_training('metric', epochs=args.epochs, k_folds=args.k_folds, suffix=args.suffix)
     print('Script finished')
     
 

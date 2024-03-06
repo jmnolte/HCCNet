@@ -5,7 +5,7 @@ import torch
 
 class FocalLoss(nn.Module):
 
-    def __init__(self, gamma: float = 2.0, alpha: float | list | None = None, label_smoothing: float = 0.0, reduction: str | None = 'mean') -> None:
+    def __init__(self, gamma: float = 2.0, alpha: float | list | None = None, label_smoothing: float = 0.0, reduction: str = 'mean') -> None:
 
         super().__init__()
         self.gamma = gamma
@@ -21,13 +21,13 @@ class FocalLoss(nn.Module):
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor):
 
+        self.alpha = self.alpha.to(targets.device)
+        at = self.alpha.gather(0, targets.long())
         if self.label_smoothing > 0:
             pos_smooth = 1.0 - self.label_smoothing
             neg_smooth = self.label_smoothing
             targets = targets * pos_smooth + (1 - targets) * neg_smooth
-        self.alpha = self.alpha.to(targets.device)
         ce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
-        at = self.alpha.gather(0, targets.long())
         pt = torch.exp(-ce_loss)
         loss = at * (1 - pt) ** self.gamma * ce_loss
         if self.reduction == "mean":

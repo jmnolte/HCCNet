@@ -49,27 +49,16 @@ class SequenceBatchCollater:
         return collate_meta_tensor([item for sublist in data for item in sublist])
 
 
-def collate_shuffled_batch(batch):
-
-    data = [i for k in batch for i in k]
-    np.random.shuffle(data)
-
-    return collate_meta_tensor(data)
-
-
-def convert_to_dict(
-        train: pd.DataFrame,
-        val: pd.DataFrame,
-        test: pd.DataFrame,
-        data_dict: dict
-    ) -> dict:
+def convert_to_dict(data_frames: list, data_dict: dict, split_names: list, verbose: bool = False) -> dict:
+    split_dict = {}
+    
+    for idx, df in enumerate(data_frames):
+        name = split_names[idx]
+        split_dict[name] = df[['uid']].values
+        if verbose:
+            print(f'{len(df)} total observations in {name} set with {df["label"].sum()} positive cases ({round(df["label"].mean(), ndigits=3)} %)')
         
-    for idx, df in enumerate([train, val, test]):
-        name = 'training' if idx == 0 else 'validation' if idx == 1 else 'test'
-        print(f'{len(df)} total observations in {name} set with {df["label"].sum()} positive cases ({round(df["label"].mean(), ndigits=3)} %)')
-    split_dict = {'train': train[['uid']].values, 'val': val[['uid']].values, 'test': test[['uid']].values}
-    split_dict = {x: [patient for patient in data_dict if patient['uid'] in split_dict[x]] for x in ['train', 'val', 'test']} 
-
+    split_dict = {x: [patient for patient in data_dict if patient['uid'] in split_dict[x]] for x in split_names} 
     return split_dict
 
 

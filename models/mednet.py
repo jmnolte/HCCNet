@@ -107,6 +107,7 @@ class MedNet(nn.Module):
             dropout: float = 0.1,
             pooling_mode: str = 'cls',
             activation: str = 'gelu',
+            eps: float = 1e-5,
             norm_first: bool = True
         ) -> None:
 
@@ -121,6 +122,7 @@ class MedNet(nn.Module):
             dim_feedforward=self.d_model * 4, 
             dropout=dropout,
             activation=activation,
+            layer_norm_eps=eps,
             norm_first=norm_first)
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         if pooling_mode == 'cls':
@@ -132,14 +134,19 @@ class MedNet(nn.Module):
         self.cls_token = nn.Parameter(torch.zeros(1, 1, self.d_model)) if pooling_mode == 'cls' else None
         self.pooling_mode = pooling_mode
         self.head = Classifier(self.d_model, num_classes)
+
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
-        if isinstance(m, (nn.Linear)):
-            trunc_normal_(m.weight, std=.02)
-            nn.init.constant_(m.bias, 0)
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=0.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0.0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.weight, 1.0)
+            nn.init.constant_(m.bias, 0.0)
         if self.cls_token is not None:
-            nn.init.normal_(self.cls_token, std=1e-6)
+            trunc_normal_(self.cls_token, std=0.02)
     
     def forward(
             self, 
