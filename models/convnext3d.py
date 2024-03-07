@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -15,7 +17,15 @@ class Block(nn.Module):
         drop_path (float): Stochastic depth rate. Default: 0.0
         eps (float): Epsilon to stabilize training. Default: 1e-6.
     """
-    def __init__(self, dim, drop_path: float = 0.0, kernel_size: int = 5, use_grn: bool = False, eps: float = 1e-5):
+    def __init__(
+            self, 
+            dim: int, 
+            drop_path: float = 0.0, 
+            kernel_size: int = 5, 
+            use_grn: bool = False, 
+            eps: float = 1e-5
+        ) -> None:
+
         super().__init__()
         self.dwconv = nn.Conv3d(dim, dim, kernel_size=kernel_size, padding=kernel_size//2, groups=dim, stride=1) # depthwise conv
         self.norm = LayerNorm(dim, eps=eps)
@@ -29,7 +39,11 @@ class Block(nn.Module):
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.use_grn = use_grn
 
-    def forward(self, x):
+    def forward(
+            self, 
+            x: torch.Tensor
+        ) -> torch.Tensor:
+
         inputs = x
         x = self.dwconv(x)
         x = x.permute(0, 2, 3, 4, 1) # (N, C, H, D, W) -> (N, H, W, D, C)
@@ -60,7 +74,16 @@ class ConvNeXt3d(nn.Module):
         eps (float): Epsilon value. Default: 1e-6.
         head_init_scale (float): Init scaling value for classifier weights and biases. Default: 1.
     """
-    def __init__(self, in_chans=3, num_classes=1000, depths=[3, 3, 9, 3], dims=[96, 192, 384, 768], drop_path_rate=0., use_grn=False, eps=1e-5):
+    def __init__(
+            self, 
+            in_chans: int = 3, 
+            num_classes: int = 1000, 
+            depths: list[int] = [3, 3, 9, 3], 
+            dims: list[int] = [96, 192, 384, 768], 
+            drop_path_rate: float = 0.0, 
+            use_grn: bool = False, 
+            eps: float = 1e-5
+        ) -> None:
 
         super().__init__()
         self.downsample_layers = nn.ModuleList() # stem and 3 intermediate downsampling conv layers
@@ -89,23 +112,32 @@ class ConvNeXt3d(nn.Module):
 
         self.norm = nn.LayerNorm(dims[-1], eps=eps) # final norm layer
         self.head = nn.Linear(dims[-1], num_classes)
-
         self.apply(self._init_weights)
-        self.head.weight.data.mul_(head_init_scale)
-        self.head.bias.data.mul_(head_init_scale)
 
-    def _init_weights(self, m: nn.Module):
+    def _init_weights(
+            self, 
+            m: nn.Module
+        ) -> None:
+
         if isinstance(m, (nn.Conv3d, nn.Linear)):
             trunc_normal_(m.weight, std=.02)
             nn.init.constant_(m.bias, 0)
 
-    def forward_features(self, x):
+    def forward_features(
+            self, 
+            x: torch.Tensor
+        ) -> torch.Tensor:
+
         for i in range(4):
             x = self.downsample_layers[i](x)
             x = self.stages[i](x)
         return self.norm(x.mean([-3, -2, -1])) # global average pooling, (N, C, H, W, D) -> (N, C)
 
-    def forward(self, x):
+    def forward(
+            self, 
+            x: torch.Tensor
+        ) -> torch.Tensor:
+
         x = self.forward_features(x)
         x = self.head(x)
         return x
@@ -116,7 +148,13 @@ class LayerNorm(nn.Module):
     shape (batch_size, height, width, channels) while channels_first corresponds to inputs 
     with shape (batch_size, channels, height, width).
     """
-    def __init__(self, normalized_shape, eps=1e-5, data_format="channels_last"):
+    def __init__(
+            self, 
+            normalized_shape: int, 
+            eps: float = 1e-5, 
+            data_format: str = "channels_last"
+        ) -> None:
+
         super().__init__()
         self.weight = nn.Parameter(torch.ones(normalized_shape))
         self.bias = nn.Parameter(torch.zeros(normalized_shape))
@@ -126,7 +164,11 @@ class LayerNorm(nn.Module):
             raise NotImplementedError 
         self.normalized_shape = (normalized_shape, )
     
-    def forward(self, x):
+    def forward(
+            self, 
+            x: torch.Tensor
+        ) -> torch.Tensor:
+
         if self.data_format == "channels_last":
             return F.layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
         elif self.data_format == "channels_first":
@@ -139,13 +181,22 @@ class LayerNorm(nn.Module):
 class GRN(nn.Module):
     """ GRN (Global Response Normalization) layer
     """
-    def __init__(self, dim, eps = 1e-5):
+    def __init__(
+            self, 
+            dim: int, 
+            eps: float = 1e-5
+        ) -> None:
+
         super().__init__()
         self.gamma = nn.Parameter(torch.zeros(1, 1, 1, 1, dim))
         self.beta = nn.Parameter(torch.zeros(1, 1, 1, 1, dim))
         self.eps = eps
 
-    def forward(self, x):
+    def forward(
+            self, 
+            x: torch.Tensor
+        ) -> torch.Tensor:
+        
         Gx = torch.norm(x, p=2, dim=(1,2,3), keepdim=True)
         Nx = Gx / (Gx.mean(dim=-1, keepdim=True) + self.eps)
         return self.gamma * (x * Nx) + self.beta + x
