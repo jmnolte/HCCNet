@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from typing import List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import torch.optim.lr_scheduler as lr_scheduler
 import torch.distributed as dist
 from torch.cuda.amp import GradScaler, autocast
 from torchmetrics.classification import BinaryAveragePrecision, BinaryAUROC
@@ -34,7 +36,7 @@ from monai.transforms import (
     RandSpatialCropd,
     RandShiftIntensityd,
     RandScaleIntensityd,
-    RandGibbsNoised,
+    RandKSpaceSpikeNoised,
     RandRicianNoised,
     RandZoomd,
     CopyItemsd,
@@ -56,7 +58,6 @@ from data.transforms import PercentileSpatialCropd, YeoJohnsond, SoftClipIntensi
 from data.splits import GroupStratifiedSplit
 from data.datasets import CacheSeqDataset
 from data.utils import DatasetPreprocessor, convert_to_dict, convert_to_seqdict, SequenceBatchCollater
-from handlers.slidingwindowinference import SlidingWindowInferer
 from models.mednet import MedNet
 from models.convnext3d import convnext3d_atto, convnext3d_femto, convnext3d_pico, convnext3d_nano, convnext3d_tiny
 from losses.focalloss import FocalLoss
@@ -69,17 +70,16 @@ class Trainer:
     def __init__(
             self, 
             model: nn.Module, 
-            backbone: str, 
-            loss_fn: str,
-            amp: bool,
+            loss_fn: List[nn.Module],
             dataloaders: dict, 
-            learning_rate: float, 
-            weight_decay: float,
-            max_seq_length: int,
-            accum_steps: int,
-            pos_weight: float,
-            output_dir: str,
-            ) -> None:
+            optimizer: optim,
+            scheduler: lr_scheduler | None = None,
+            num_folds: int = 1,
+            num_epochs: int = 100,
+            amp: bool = True,
+            suffix: str | None = None,
+            output_dir: str | None = None
+        ) -> None:
 
         '''
         Initialize the training class.
@@ -98,29 +98,22 @@ class Trainer:
         '''
         self.gpu_id = int(os.environ['LOCAL_RANK'])
         self.model = model
-        self.amp = amp
-        self.backbone = backbone
         self.dataloaders = dataloaders
+        self.num_folds = num_folds
+        self.num_epochs = num_epochs
+        self.amp = amp
+        self.suffix = suffix
+        if self.suffix is None:
+            raise ValueError('Please specify a unique suffix for results storage.')
         self.output_dir = output_dir
-        self.accum_steps = accum_steps
-
+        if self.output_dir is None:
+            raise ValueError('Please specify a path to the data directory.')
         self.scaler = GradScaler(enabled=amp)
-        self.inferer = SlidingWindowInferer(self.model, self.gpu_id, max_length=max_seq_length)
 
-        params = self.model.parameters()
-        self.optim = optim.AdamW(params, lr=learning_rate, weight_decay=weight_decay)
-        self.schedule = optim.lr_scheduler.OneCycleLR(
-            optimizer=self.optim,
-            max_lr=learning_rate * 25,
-            epochs=50,
-            steps_per_epoch=int(len(dataloaders['train']) / accum_steps))
-
-        if loss_fn == 'focal':
-            self.train_bce = FocalLoss(gamma=2, alpha=pos_weight, label_smoothing=0.1).to(self.gpu_id)
-            self.val_bce = FocalLoss(gamma=0).to(self.gpu_id)
-        else:
-            self.train_bce = BinaryCELoss(weights=pos_weight, label_smoothing=0.1).to(self.gpu_id)
-            self.val_bce = BinaryCELoss().to(self.gpu_id)
+        self.train_loss = loss_fn[0].to(self.gpu_id)
+        self.val_loss = loss_fn[1].to(self.gpu_id)
+        self.optim = optimizer
+        self.schedule = scheduler
 
         self.train_auprc = BinaryAveragePrecision().to(self.gpu_id)
         self.train_auroc = BinaryAUROC().to(self.gpu_id)
@@ -131,9 +124,8 @@ class Trainer:
             self, 
             output_dict: dict, 
             output_type: str,
-            fold: int | None = None,
-            suffix: str | None = None
-            ) -> None:
+            fold: int
+        ) -> None:
 
         '''
         Save the model's output.
@@ -149,11 +141,11 @@ class Trainer:
             exit(1)
         
         if output_type == 'weights':
-            folder_name = self.backbone + '_weights.pth'
+            folder_name = f'weights_fold{fold}_' + self.suffix + '.pth'
         elif output_type == 'history':
-            folder_name = self.backbone + f'_hist_fold{fold}' + suffix + '.npy'
+            folder_name = f'hist_fold{fold}_' + self.suffix + '.npy'
         elif output_type == 'preds':
-            folder_name = self.backbone + '_preds.npy'
+            folder_name = self.suffix + '_preds.npy'
         folder_path = os.path.join(self.output_dir, 'model_' + output_type, folder_name)
         folder_path_root = os.path.join(self.output_dir, 'model_' + output_type)
 
@@ -170,8 +162,9 @@ class Trainer:
     def train(
             self,
             epoch: int,
-            batch_size: int
-            ) -> tuple:
+            batch_size: int,
+            accum_steps: int
+        ) -> tuple:
 
         running_loss = 0.0
         self.model.train()
@@ -188,9 +181,9 @@ class Trainer:
 
             with autocast(enabled=self.amp):
                 logits = self.model(inputs, pos_token=pos_token, padding_mask=padding_mask)
-                loss = self.train_bce(logits.squeeze(-1), labels.float())
-                # loss = torch.mean(torch.mul(weight, loss)) / self.accum_steps
-                loss /= self.accum_steps
+                loss = self.train_loss(logits.squeeze(-1), labels.float())
+                # loss = torch.mean(torch.mul(weight, loss)) / accum_steps
+                loss /= accum_steps
 
             self.scaler.scale(loss).backward()
             running_loss += loss.item()
@@ -198,19 +191,20 @@ class Trainer:
             self.train_auprc.update(preds, labels)
             self.train_auroc.update(preds, labels)
 
-            if ((step + 1) % self.accum_steps == 0) or (step + 1 == len(self.dataloaders['train'])):
+            if ((step + 1) % accum_steps == 0) or (step + 1 == len(self.dataloaders['train'])):
                 self.scaler.unscale_(self.optim)
                 nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0, norm_type=2)
 
                 self.scaler.step(self.optim)
                 self.scaler.update()
                 self.optim.zero_grad(set_to_none=True)
-                # self.schedule.step()
+                if self.schedule is not None:
+                    self.schedule.step()
 
                 if self.gpu_id == 0:
-                    print(f"{step + 1}/{len(self.dataloaders['train'])}, Batch Loss: {loss.item() * self.accum_steps:.4f}")
+                    print(f"{step + 1}/{len(self.dataloaders['train'])}, Batch Loss: {loss.item() * accum_steps:.4f}")
 
-        epoch_loss = running_loss / (len(self.dataloaders['train']) // self.accum_steps)
+        epoch_loss = running_loss / (len(self.dataloaders['train']) // accum_steps)
         epoch_auprc = self.train_auprc.compute()
         epoch_auroc = self.train_auroc.compute()
         self.train_auprc.reset()
@@ -224,7 +218,7 @@ class Trainer:
     def evaluate(
             self, 
             epoch: int,
-            ) -> tuple:
+        ) -> tuple:
 
         '''
         Validate the model.
@@ -239,12 +233,11 @@ class Trainer:
         self.model.eval()
         with torch.no_grad():
             for step, batch_data in enumerate(self.dataloaders['val']):
-                inputs, labels, pos_token, padding_mask = self.prep_batch(batch_data, batch_size=1)
-                labels = labels.to(self.gpu_id)
+                inputs, labels, pos_token, padding_mask = self.prep_batch(batch_data, batch_size=1, device_id=self.gpu_id)
 
                 with autocast(enabled=self.amp):
-                    logits = self.inferer(inputs, pos_token=pos_token)
-                    loss = self.val_bce(logits.squeeze(-1), labels.float())
+                    logits = self.model(inputs, pos_token=pos_token, padding_mask=None)
+                    loss = self.val_loss(logits.squeeze(-1), labels.float())
 
                 running_loss += loss.item()
                 preds = F.sigmoid(logits.squeeze(-1))
@@ -266,9 +259,8 @@ class Trainer:
     def training_loop(
             self, 
             fold: int,
-            suffix: str,
             batch_size: int,
-            max_epochs: int = 100,
+            accum_steps: int,
             val_steps: int = 1,
             patience: int = 10
         ) -> None:
@@ -294,9 +286,9 @@ class Trainer:
         log_book = {dataset: {log_type: [] for log_type in ['loss','metric']} for dataset in ['train','val']}
         stop_criterion = torch.zeros(1).to(self.gpu_id)
 
-        for epoch in range(0, max_epochs):
+        for epoch in range(0, self.num_epochs):
             start_time = time.time()
-            train_loss, train_auprc, train_auroc = self.train(epoch, batch_size)
+            train_loss, train_auprc, train_auroc = self.train(epoch, batch_size, accum_steps)
             log_book['train']['loss'].append(train_loss)
             log_book['train']['metric'].append(train_auprc.cpu().item())
 
@@ -315,7 +307,7 @@ class Trainer:
                         best_weights = copy.deepcopy(self.model.state_dict())
                     else:
                         counter += 1
-                        if counter >= patience and epoch >= max_epochs:
+                        if counter >= patience and epoch >= self.num_epochs:
                             stop_criterion += 1
 
             train_time = time.time() - start_time
@@ -330,11 +322,16 @@ class Trainer:
             time_elapsed = time.time() - since
             print(f'[Fold {fold}] Training complete in {time_elapsed // 60:.0f}min {time_elapsed % 60:.0f}sec')
             print(f'[Fold {fold}] Loss: {best_loss:.4f}, AUPRC: {best_auprc:.4f}, and {best_auroc:.4f} of best model configuration.')
-            self.save_output(best_weights, 'weights')
-            self.save_output(log_book, 'history', fold, suffix)
+            self.save_output(best_weights, 'weights', fold)
+            self.save_output(log_book, 'history', fold)
             
     @staticmethod
-    def prep_batch(data: dict, batch_size: int, device_id: torch.device | None = None, normalize: bool = True) -> tuple:
+    def prep_batch(
+            data: dict, 
+            batch_size: int, 
+            device_id: torch.device | None = None, 
+            normalize: bool = True
+        ) -> tuple:
 
         stats_dict = {'mean': 63.3394, 'std': 11.2231}
         B, C, H, W, D = data['image'].shape
@@ -356,32 +353,33 @@ class Trainer:
             return data['image'], data['label'].to(torch.int), data['age'].to(torch.float), mask.to(torch.float)
 
     @staticmethod
-    def calc_weight(data: torch.Tensor, base: int = 3, dim: int = 1) -> torch.Tensor:
+    def calc_weight(
+            data: torch.Tensor, 
+            base: int = 3, 
+            dim: int = 1
+        ) -> torch.Tensor:
 
         count = torch.count_nonzero(data, dim=dim)
         base = torch.Tensor([base])
         return torch.log(count + 1) / torch.log(base.to(count.device))
 
-    @staticmethod
-    def get_wd_params(model: nn.Module):
-        decay = list()
-        no_decay = list()
-        for name, param in model.named_parameters():
-            if hasattr(param,'requires_grad') and not param.requires_grad:
-                continue
-            if 'weight' in name and 'norm' not in name and 'bn' not in name:
-                decay.append(param)
-            else:
-                no_decay.append(param)
-        return decay, no_decay
+    # @staticmethod
+    # def get_wd_params(model: nn.Module):
+    #     decay = list()
+    #     no_decay = list()
+    #     for name, param in model.named_parameters():
+    #         if hasattr(param,'requires_grad') and not param.requires_grad:
+    #             continue
+    #         if 'weight' in name and 'norm' not in name and 'bn' not in name:
+    #             decay.append(param)
+    #         else:
+    #             no_decay.append(param)
+    #     return decay, no_decay
     
     def visualize_training(
             self, 
-            log_type: str,
-            epochs: int = 50,
-            k_folds: int = 10,
-            suffix: str | None = None
-            ) -> None:
+            log_type: str
+        ) -> None:
 
         '''
         Visualize the training and validation history.
@@ -394,22 +392,22 @@ class Trainer:
             axis_label = 'Loss'
         elif log_type == 'metric':
             axis_label = 'AUPRC'
-        plot_name = log_type + '_' + suffix + '.png' if suffix is not None else log_type + '.png'
+        plot_name = log_type + '_' + self.suffix + '.png' if self.suffix is not None else log_type + '.png'
 
         for dataset in ['train','val']:
             log_book = []
-            for fold in range(k_folds):
-                file_name = self.backbone + f'_hist_fold{fold}' + suffix + '.npy'
+            for fold in range(self.num_folds):
+                file_name = f'hist_fold{fold}_' + self.suffix + '.npy'
                 fold_log = np.load(os.path.join(self.output_dir, 'model_history', file_name), allow_pickle='TRUE').item()
                 log_book.append(fold_log[dataset][log_type])
                 plt.plot(fold_log[dataset][log_type], color=('blue' if dataset == 'train' else 'orange'), alpha=0.2)
             log_df = pd.DataFrame(log_book)
             mean_log = log_df.mean(axis=0).tolist()
-            plt.plot(mean_log, color=('blue' if dataset == 'train' else 'orange'), alpha=1.0)
+            plt.plot(mean_log, color=('blue' if dataset == 'train' else 'orange'), label=('Training' if dataset == 'train' else 'Validation'), alpha=1.0)
             
         plt.ylabel(axis_label, fontsize=20, labelpad=10)
         plt.xlabel('Training Epoch', fontsize=20, labelpad=10)
-        plt.legend(['Training', 'Validation'], loc='lower right')
+        plt.legend(loc='lower right')
         file_path = os.path.join(self.output_dir, 'model_history/diagnostics', plot_name)
         file_path_root, _ = os.path.split(file_path)
         if os.path.exists(file_path):
@@ -429,10 +427,10 @@ def parse_args() -> argparse.Namespace:
         argparse.Namespace: Command line arguments.
     '''
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--backbone", type=str, default='convnext',
-                        help="Model encoder to use. Defaults to ResNet50.")
     parser.add_argument("--loss-fn", type=str, default='bce',
                         help="Loss function to use.")
+    parser.add_argument("--gamma", type=int, default=2,
+                        help="Gamma parameter to use for focal loss.")
     parser.add_argument("--pooling-mode", default='cls', type=str,
                         help="Pooling mode. Can be cls, mean, max, or att. Defaults to cls.")
     parser.add_argument("--pretrained", action='store_true',
@@ -441,24 +439,22 @@ def parse_args() -> argparse.Namespace:
                         help="Flag to enable distributed training.")
     parser.add_argument("--amp", action='store_true',
                         help="Flag to enable automated mixed precision training.")
+    parser.add_argument("--scheduler", action='store_true',
+                        help="Flag to use a LR scheduler.")
     parser.add_argument("--num-classes", default=2, type=int,
                         help="Number of output classes. Defaults to 2.")
     parser.add_argument("--epochs", default=100, type=int, 
                         help="Number of epochs to train for. Defaults to 10.")
-    parser.add_argument("--val-interval", default=1, type=int,
-                        help="Number of epochs to wait before running validation. Defaults to 2.")
     parser.add_argument("--batch-size", default=4, type=int, 
                         help="Batch size to use for training. Defaults to 4.")
     parser.add_argument("--effective-batch-size", default=32, type=int,
                         help="Total batch size: batch size x number of devices x number of accumulations steps.")
     parser.add_argument("--seq-length", default=4, type=int,
                         help="Flag to scale the raw model logits using temperature scalar.")
-    parser.add_argument("--num-workers", default=8, type=int,
-                        help="Number of workers to use for training. Defaults to 8.")
     parser.add_argument("--k-folds", default=0, type=int, 
                         help="Number of folds to use in cross validation. Defaults to 0.8.")
-    parser.add_argument("--learning-rate", default=1e-4, type=float, 
-                        help="Learning rate to use for training. Defaults to 1e-4.")
+    parser.add_argument("--label-smoothing", default=0.0, type=float, 
+                        help="Label smoothing to use for training. Defaults to 0.")
     parser.add_argument("--weight-decay", default=0, type=float, 
                         help="Weight decay to use for training. Defaults to 0.")
     parser.add_argument("--dropout", default=0, type=float, 
@@ -467,12 +463,16 @@ def parse_args() -> argparse.Namespace:
                         help="Stochastic depth rate to use for training. Defaults to 0.")
     parser.add_argument("--epsilon", default=1e-5, type=float, 
                         help="Epsilon value to use for norm layers. Defaults to 1e-5.")
+    parser.add_argument("--val-interval", default=1, type=int,
+                        help="Number of epochs to wait before running validation. Defaults to 2.")
     parser.add_argument("--patience", default=10, type=int, 
                         help="Patience to use for early stopping. Defaults to 10.")
     parser.add_argument("--mod-list", default=MODALITY_LIST, nargs='+', 
                         help="List of modalities to use for training")
     parser.add_argument("--seed", default=1234, type=int, 
                         help="Seed to use for reproducibility")
+    parser.add_argument("--num-workers", default=8, type=int,
+                        help="Number of workers to use for training. Defaults to 8.")
     parser.add_argument("--suffix", default='MedNet', type=str, 
                         help="File suffix for identification")
     parser.add_argument("--data-dir", default=DATA_DIR, type=str, 
@@ -483,11 +483,10 @@ def parse_args() -> argparse.Namespace:
                         help="Path to results directory")
     return parser.parse_args()
 
-def load_train_objs(
-        device_id,
+def load_train_data(
         args: argparse.Namespace,
-        phases: list = ['train', 'val']
-        ) -> tuple:
+        device: torch.device
+    ) -> tuple:
 
     '''
     Load training objects.
@@ -499,6 +498,7 @@ def load_train_objs(
         tuple: Training objects consisting of the datasets, dataloaders, the model, and the performance metric.
     '''
     folds = range(args.k_folds)
+    phases = ['train', 'val']
     data_dict, label_df = DatasetPreprocessor(data_dir=args.data_dir).load_data(modalities=args.mod_list)
     dev, test = GroupStratifiedSplit(split_ratio=0.8).split_dataset(label_df)
     if args.k_folds > 1:
@@ -521,7 +521,7 @@ def load_train_objs(
             classes=seq_class_dict[x][k],
             num_partitions=dist.get_world_size(),
             shuffle=True,
-            even_divisible=(True if x == 'train' else False)
+            even_divisible=False
             )[dist.get_rank()] for k in folds] for x in phases}
         datasets = {x: [CacheSeqDataset(
             data=seq_split_dict[x][k],
@@ -529,15 +529,15 @@ def load_train_objs(
             transform=data_transforms(
                 dataset=x, 
                 modalities=args.mod_list,
-                device=device_id), 
-            num_workers=8,
+                device=device), 
+            num_workers=args.num_workers,
             copy_cache=False
             ) for k in folds] for x in phases}
         dataloader = {x: [ThreadDataLoader(
             datasets[x][k], 
             batch_size=(args.batch_size if x == 'train' else 1), 
             shuffle=(True if x == 'train' else False),   
-            drop_last=(True if x == 'train' else False), 
+            drop_last=(True if x == 'train' else False),   
             num_workers=0,
             collate_fn=(SequenceBatchCollater(keys=['image','label','age'], seq_length=args.seq_length) if x == 'train' else list_data_collate)
             ) for k in folds] for x in phases}
@@ -557,7 +557,7 @@ def load_train_objs(
             transform=data_transforms(
                 dataset=x, 
                 modalities=args.mod_list, 
-                device=device_id), 
+                device=device), 
             num_workers=8,
             copy_cache=False
             ) for k in folds] for x in phases}
@@ -571,11 +571,30 @@ def load_train_objs(
 
     return dataloader, pos_weight
 
+def load_train_objs(
+        args: argparse.Namespace,
+        model: nn.Module,
+        dataloader: dict,
+        pos_weight: float | list | None = None,
+        learning_rate: float = 1e-4,
+        accum_steps: int = 1
+    ) -> tuple:
+
+    if args.loss_fn == 'focal':
+        train_fn = FocalLoss(gamma=args.gamma, alpha=pos_weight, label_smoothing=args.label_smoothing)
+    else:
+        train_fn = BinaryCELoss(weights=pos_weight, label_smoothing=args.label_smoothing)
+    loss_fn = [train_fn, BinaryCELoss()]
+    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=args.weight_decay)
+    max_iter = len(dataloader['train']) / accum_steps * args.epochs
+    scheduler = lr_scheduler.CosineAnnealingLR(optimizer, max_iter) if args.scheduler else None
+    return loss_fn, optimizer, scheduler
+
 def data_transforms(
         dataset: str,
         modalities: list,
         device: torch.device
-        ) -> transforms:
+    ) -> transforms:
 
     '''
     Perform data transformations on image and image labels.
@@ -617,29 +636,36 @@ def data_transforms(
             roi_center=(0.45, 0.25, 0.3),
             roi_size=(0.6, 0.45, 0.4),
             min_size=(96, 96, 96)),
-        SoftClipIntensityd(keys='image', min_value=-3.0, max_value=3.0, channel_wise=True),
-        NormalizeIntensityd(
-            keys='image',
-            subtrahend=(0.2907, 0.3094, 0.3167, 0.3051),
-            divisor=(0.7265, 0.7447, 0.7597, 0.7605),
-            channel_wise=True)
+        SoftClipIntensityd(keys='image', min_value=-3.0, max_value=3.0, channel_wise=True)
     ]
 
     train = [
         EnsureTyped(keys='image', track_meta=False, device=device, dtype=torch.float),
         RandSpatialCropd(keys='image', roi_size=(72, 72, 72), random_size=False),
-        RandFlipd(keys='image', spatial_axis=0, prob=0.5),
-        RandFlipd(keys='image', spatial_axis=1, prob=0.5),
-        RandFlipd(keys='image', spatial_axis=2, prob=0.5),
+        RandFlipd(keys='image', prob=0.5, spatial_axis=0),
+        RandFlipd(keys='image', prob=0.5, spatial_axis=1),
+        RandFlipd(keys='image', prob=0.5, spatial_axis=2),
         RandRotate90d(keys='image', prob=0.5),
-        # RandGibbsNoised(keys='image', prob=0.1, alpha=(0.1, 0.9)),
-        # RandRicianNoised(keys='image', prob=0.1, mean=0, std=0.5, sample_std=True, channel_wise=True),
-        RandScaleIntensityd(keys='image', factors=0.1, prob=1.0),
-        RandShiftIntensityd(keys='image', offsets=0.1, prob=1.0)
+        RandScaleIntensityd(keys='image', prob=1.0, factors=0.1),
+        RandShiftIntensityd(keys='image', prob=1.0, offsets=0.1),
+        RandRicianNoised(keys='image', prob=0.1, mean=0.0, std=0.05, sample_std=True, channel_wise=True),
+        RandKSpaceSpikeNoised(keys='image', prob=0.1, channel_wise=True),
+        # NormalizeIntensityd(
+        #     keys='image',
+        #     subtrahend=(0.4749, 0.5230, 0.5435, 0.5377),
+        #     divisor=(0.6674, 0.6753, 0.6840, 0.6757),
+        #     channel_wise=True)
+        NormalizeIntensityd(keys='image', channel_wise=True)
     ]
 
     test = [
         CenterSpatialCropd(keys='image', roi_size=(96, 96, 96)),
+        # NormalizeIntensityd(
+        #     keys='image',
+        #     subtrahend=(0.4749, 0.5230, 0.5435, 0.5377),
+        #     divisor=(0.6674, 0.6753, 0.6840, 0.6757),
+        #     channel_wise=True),
+        NormalizeIntensityd(keys='image', channel_wise=True),
         EnsureTyped(keys='image', track_meta=False, device=device, dtype=torch.float)
     ]
 
@@ -666,7 +692,7 @@ def cleanup() -> None:
 
 def main(
         args: argparse.Namespace
-        ) -> None:
+    ) -> None:
 
     '''
     Main function. The function loads the dataloader, model, and metric, and trains the model. After
@@ -689,7 +715,7 @@ def main(
     learning_rate = (alpha * np.sqrt(batch_size_gpu) / np.sqrt(128)) * np.sqrt(num_devices)
     num_classes = args.num_classes if args.num_classes > 2 else 1
 
-    cv_dataloader, pos_weight = load_train_objs(device_id, args)
+    cv_dataloader, pos_weight = load_train_data(args, device_id)
     set_track_meta(False)
 
     for k in range(args.k_folds):
@@ -710,30 +736,35 @@ def main(
             model = nn.parallel.DistributedDataParallel(model, device_ids=[device_id])
         else:
             model = model.to(device_id)
+        loss_fn, optimizer, scheduler = load_train_objs(
+            args, 
+            model=model, 
+            dataloader=dataloader,
+            pos_weight=pos_weight,
+            learning_rate=learning_rate,
+            accum_steps=accum_steps)
         trainer = Trainer(
             model=model, 
-            backbone=args.backbone, 
-            loss_fn=args.loss_fn,
-            amp=args.amp, 
+            loss_fn=loss_fn,
             dataloaders=dataloader, 
-            learning_rate=learning_rate, 
-            weight_decay=args.weight_decay, 
-            max_seq_length=args.seq_length * args.batch_size, 
-            accum_steps=accum_steps, 
-            pos_weight=pos_weight, 
+            optimizer=optimizer,
+            scheduler=scheduler,
+            num_folds=(args.k_folds if args.k_folds > 0 else 1),
+            num_epochs=args.epochs,
+            amp=args.amp,
+            suffix=args.suffix,
             output_dir=args.results_dir)
         trainer.training_loop(
             fold=k,
-            suffix=args.suffix,
-            max_epochs=args.epochs, 
             batch_size=args.batch_size, 
+            accum_steps=accum_steps,
             val_steps=args.val_interval, 
             patience=args.patience)
 
     if args.distributed:
         cleanup()
-    trainer.visualize_training('loss', epochs=args.epochs, k_folds=args.k_folds, suffix=args.suffix)
-    trainer.visualize_training('metric', epochs=args.epochs, k_folds=args.k_folds, suffix=args.suffix)
+    trainer.visualize_training('loss')
+    trainer.visualize_training('metric')
     print('Script finished')
     
 
@@ -745,5 +776,3 @@ WEIGHTS_DIR = '/Users/noltinho/MedicalNet/pytorch_files/pretrain'
 if __name__ == '__main__':
     args = parse_args()
     main(args)
-
-

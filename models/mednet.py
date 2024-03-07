@@ -15,7 +15,11 @@ def _extract_num_features(backbone) -> int:
     
 class PositionalEncoding(nn.Module):
 
-    def __init__(self, d_model: int = 512, dropout: float = 0.1):
+    def __init__(
+            self, 
+            d_model: int, 
+            dropout: float = 0.1
+        ) -> None:
 
         super().__init__()
         self.dropout = nn.Dropout(p=dropout)
@@ -23,7 +27,11 @@ class PositionalEncoding(nn.Module):
         self.register_buffer('div_term', div_term)
         self.d_model = d_model
 
-    def forward(self, x: torch.Tensor, pos_token: torch.Tensor):
+    def forward(
+            self, 
+            x: torch.Tensor, 
+            pos_token: torch.Tensor
+        ) -> torch.Tensor:
 
         device, dtype = x.device, x.dtype
         pe = torch.zeros(x.shape, device=device, dtype=dtype)
@@ -35,13 +43,20 @@ class PositionalEncoding(nn.Module):
 
 class CLSPooling(nn.Module):
 
-    def __init__(self, d_model: int = 512):
+    def __init__(
+            self,
+            d_model: int
+        ) -> None:
 
         super().__init__()
         self.linear = nn.Linear(d_model, d_model)
         self.activation = nn.Tanh()
 
-    def forward(self, hidden_states: torch.Tensor, padding_mask: torch.Tensor | None) -> torch.Tensor:
+    def forward(
+            self, 
+            hidden_states: torch.Tensor, 
+            padding_mask: torch.Tensor | None
+        ) -> torch.Tensor:
 
         cls_token = hidden_states[:, 0]
         out = self.linear(cls_token)
@@ -50,11 +65,18 @@ class CLSPooling(nn.Module):
 
 class MeanPooling(nn.Module):
 
-    def __init__(self, d_model: int = 512):
+    def __init__(
+            self, 
+            d_model: int
+        ) -> None:
 
         super().__init__()
 
-    def forward(self, hidden_states: torch.Tensor, padding_mask: torch.Tensor | None) -> torch.Tensor:
+    def forward(
+            self, 
+            hidden_states: torch.Tensor, 
+            padding_mask: torch.Tensor | None
+        ) -> torch.Tensor:
 
         if padding_mask is None:
             padding_mask = torch.ones_like(hidden_states[:, :, 1])
@@ -67,12 +89,19 @@ class MeanPooling(nn.Module):
 
 class AttentionPooling(nn.Module):
 
-    def __init__(self, d_model: int = 512):
+    def __init__(
+            self, 
+            d_model: int
+        ) -> None:
 
         super().__init__()
         self.attention = nn.Sequential(nn.Linear(d_model, d_model), nn.Tanh(), nn.Linear(d_model, 1))
 
-    def forward(self, hidden_states: torch.Tensor, padding_mask: torch.Tensor | None) -> torch.Tensor:
+    def forward(
+            self, 
+            hidden_states: torch.Tensor, 
+            padding_mask: torch.Tensor | None
+        ) -> torch.Tensor:
 
         if padding_mask is None:
             padding_mask = torch.zeros_like(hidden_states[:, :, 1])
@@ -86,13 +115,20 @@ class AttentionPooling(nn.Module):
 
 class Classifier(nn.Module):
 
-    def __init__(self, d_model: int = 512, num_classes: int = 1000) -> None:
+    def __init__(
+            self, 
+            d_model: int, 
+            num_classes: int = 1000
+        ) -> None:
 
         super().__init__()
         self.norm = nn.LayerNorm([d_model])
         self.head = nn.Linear(d_model, num_classes)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+            self, 
+            x: torch.Tensor
+        ) -> torch.Tensor:
 
         out = self.head(self.norm(x))
         return out
@@ -134,10 +170,13 @@ class MedNet(nn.Module):
         self.cls_token = nn.Parameter(torch.zeros(1, 1, self.d_model)) if pooling_mode == 'cls' else None
         self.pooling_mode = pooling_mode
         self.head = Classifier(self.d_model, num_classes)
-
         self.apply(self._init_weights)
 
-    def _init_weights(self, m):
+    def _init_weights(
+            self, 
+            m: nn.Module
+        ) -> None:
+
         if isinstance(m, nn.Linear):
             trunc_normal_(m.weight, std=0.02)
             if m.bias is not None:
@@ -160,7 +199,7 @@ class MedNet(nn.Module):
         x = self.backbone(x)
         x = x.reshape(B, S, self.d_model)
         cls_pos_mask = (torch.zeros((B, 1))).to(pos_token.device)
-        if self.pooling_mode == 'cls':
+        if self.cls_token is not None:
             cls_token = self.cls_token.expand(B, -1, -1)
             x = torch.cat([cls_token, x], dim=1)
             pos_token = torch.hstack([cls_pos_mask, pos_token])
