@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 import os
 import numpy as np
+import pandas as pd
 from sklearn import metrics
 import matplotlib.pyplot as plt
 from torch.cuda.amp import GradScaler, autocast
@@ -23,27 +24,27 @@ from monai.data import (
     set_track_meta,
     list_data_collate
 )
+from monai.visualize.class_activation_maps import GradCAMpp
+from monai.visualize import OcclusionSensitivity
 from monai.utils import set_determinism
 from data.splits import GroupStratifiedSplit
 from data.datasets import CacheSeqDataset
 from data.utils import DatasetPreprocessor, convert_to_dict, convert_to_seqdict, SequenceBatchCollater
-from handlers.slidingwindowinference import SlidingWindowInferer
-from models.sequencenet import SeqNet
-from models.resnet3d import resnet10, resnet18, resnet34, resnet50
-from models.swinvit import swinvit_tiny, swinvit_small, swinvit_base
+from models.mednet import MedNet
+from models.convnext3d import convnext3d_atto, convnext3d_femto, convnext3d_pico, convnext3d_nano, convnext3d_tiny
 from train import data_transforms
 import argparse
 
-class Tester():
+class Tester:
     
     def __init__(
             self, 
             model: nn.Module, 
-            backbone: str, 
-            amp: bool,
             dataloaders: dict, 
-            max_seq_length: int,
-            output_dir: str
+            num_folds: int = 5,
+            amp: bool = True,
+            suffix: str | None = None,
+            output_dir: str | None = None
             ) -> None:
 
         '''
@@ -59,12 +60,14 @@ class Tester():
         '''
         self.gpu_id = int(os.environ['LOCAL_RANK'])
         self.model = model
-        self.amp = amp
-        self.backbone = backbone
         self.dataloaders = dataloaders
+        self.num_folds = num_folds
+        self.amp = amp
+        self.suffix = suffix
         self.output_dir = output_dir
+        # self.grad_cam = GradCAMpp(self.model, target_layers=)
+        # self.occ_sens = OcclusionSensitivity(backbone, n_batch=1)
 
-        self.inferer = SlidingWindowInferer(self.model, self.gpu_id, max_length=max_seq_length)
         self.metrics = MetricCollection([
             BinaryAccuracy(), BinaryRecall(), BinaryPrecision(), BinaryF1Score(),
             BinaryAveragePrecision(), BinaryAUROC()
@@ -72,6 +75,7 @@ class Tester():
 
     def test(
             self,
+            fold: int
             ) -> None:
 
         '''
@@ -82,24 +86,23 @@ class Tester():
         self.model.eval()
         with torch.no_grad():
             for step, batch_data in enumerate(self.dataloaders['test']):
-                inputs, labels, pos_token, mask = self.prep_batch(batch_data, batch_size=1)
-                labels = labels.to(self.gpu_id)
+                inputs, labels, pos_token, mask = self.prep_batch(batch_data, batch_size=1, device_id=self.gpu_id)
 
                 with autocast(enabled=self.amp):
-                    logits = self.inferer(inputs, pos_token=pos_token)
+                    logits = self.model(inputs, pos_token=pos_token, padding_mask=None)
 
                 preds = F.sigmoid(logits.squeeze(-1))
                 self.metrics.update(preds, labels)
-                results_dict['preds'].append(preds)
-                results_dict['labels'].append(labels)
+                results_dict['preds'].append(preds.cpu())
+                results_dict['labels'].append(labels.cpu())
 
-            results = self.metrics.compute()
-            self.metrics.reset()
+        results = self.metrics.compute()
+        self.metrics.reset()
 
         if self.gpu_id == 0:
             for metric in results:
-                print(f'{metric}: {results[metric].item()}')
-        self.save_output(results_dict, 'preds')
+                print(f'[Fold {fold}] {metric}: {results[metric].item()}')
+        self.save_output(results_dict, 'preds', fold)
     
     @staticmethod
     def prep_batch(data: dict, batch_size: int, device_id: torch.device | None = None, normalize: bool = True) -> tuple:
@@ -126,14 +129,15 @@ class Tester():
     def save_output(
             self, 
             output_dict: dict, 
-            output_type: str
-            ) -> None:
+            output_type: str,
+            fold: int
+        ) -> None:
 
         '''
         Save the model's output.
 
         Args:
-            output_dict (dict): Output dictionary.
+            output_dict (dict): Dictionary containing the model outputs.
             output_type (str): Type of output. Can be 'weights', 'history', or 'preds'.
         '''
         try: 
@@ -143,11 +147,11 @@ class Tester():
             exit(1)
         
         if output_type == 'weights':
-            folder_name = self.backbone + '_weights.pth'
+            folder_name = f'weights_fold{fold}_' + self.suffix + '.pth'
         elif output_type == 'history':
-            folder_name = self.backbone + '_hist.npy'
+            folder_name = f'hist_fold{fold}_' + self.suffix + '.npy'
         elif output_type == 'preds':
-            folder_name = self.backbone + '_preds.npy'
+            folder_name = f'preds_fold{fold}_' + self.suffix + '.npy'
         folder_path = os.path.join(self.output_dir, 'model_' + output_type, folder_name)
         folder_path_root = os.path.join(self.output_dir, 'model_' + output_type)
 
@@ -157,54 +161,67 @@ class Tester():
             os.makedirs(folder_path_root)
 
         if output_type == 'weights':
-            torch.save(self.model.module.state_dict(output_dict), folder_path)
+            torch.save(output_dict, folder_path)
         else:
             np.save(folder_path, output_dict)
 
-def visualize_results(
-        self,
-        backbone: str,
-        results_dir: str
-    ) -> None:
+    def visualize_results(
+            self,
+        ) -> None:
 
-    results = np.load(os.path.join(results_dir, 'model_preds', backbone + '_preds.npy'), allow_pickle=True).item()
-    for metric in ['AUROC','AUPRC']:
-        if metric == 'AUROC':
-            x_axis, y_axis, _ = metrics.roc_curve(results['labels'],  results['preds'])
-            metric_val = metrics.roc_auc_score(results['labels'],  results['preds'])
-            chance_val = 0.5
-            chance = [0.0, 1.0]
-        else:
-            y_axis, x_axis, _ = metrics.precision_recall_curve(results['labels'],  results['preds'])
-            metric_val = metrics.average_precision_score(results['labels'],  results['preds'])
-            chance_val = len(results['labels'][results['labels'] == 1]) / len(results['labels'])
-            chance = [chance_val, chance_val]
-        store_path = os.path.join(results_dir, 'model_history/diagnostics', backbone + '_' + metric + '.png')
-        plt.plot(x_axis, y_axis, label='SeqNet: ' + str(metric) + '=' + str(metric_val))
-        plt.plot([0.0, 1.0], chance, linestyle='--', label='Random Chance: ' + str(metric) + '=' + str(chance_val))
-        plt.legend(loc=4)
-        plt.savefig(store_path, dpi=300, bbox_inches="tight")
-        plt.close()
+        log_book = []
+        for metric in ['AUROC','AUPRC']:
+            store_path = os.path.join(self.output_dir, 'model_diagnostics/roc_pr_curves', self.suffix + '_' + metric + '.png')
+            for fold in range(self.num_folds):
+                file_name = os.path.join(self.output_dir, 'model_preds', f'preds_fold{fold}_' + self.suffix + '.npy')
+                results = np.load(file_name, allow_pickle=True).item()
+                log_book.append(results['preds'])
+                if metric == 'AUROC':
+                    x_axis, y_axis, _ = metrics.roc_curve(results['labels'], results['preds'])
+                else:
+                    y_axis, x_axis, _ = metrics.precision_recall_curve(results['labels'], results['preds'])
+                plt.plot(x_axis, y_axis, color='blue', alpha=0.2)
+            
+            proba_array = np.mean(np.array(log_book), axis=0)
+            preds_array = [1 if proba >= 0.5 else 0 for proba in proba_array]
+            if metric == 'AUROC':
+                x_axis, y_axis, _ = metrics.roc_curve(results['labels'], proba_array)
+                metric_val = metrics.roc_auc_score(results['labels'], proba_array)
+                chance_val = 0.500
+                chance = [0.0, 1.0]
+            else:
+                y_axis, x_axis, _ = metrics.precision_recall_curve(results['labels'], proba_array)
+                metric_val = metrics.average_precision_score(results['labels'], proba_array)
+                chance_val = 0.128
+                chance = [chance_val, chance_val]
+            plt.plot(x_axis, y_axis, color='blue', label='MedNet: ' + str(metric) + '=' + str(round(metric_val, 3)))
+            plt.plot([0.0, 1.0], chance, color='darkgray', linestyle='--', label='Random Chance: ' + str(metric) + '=' + str(round(chance_val, 3)))
+            plt.ylabel('True Positive Rate' if metric == 'AUROC' else 'Precision', fontsize=20, labelpad=10)
+            plt.xlabel('False Positive Rate' if metric == 'AUROC' else 'Recall', fontsize=20, labelpad=10)
+            plt.legend(loc=4)
+            plt.savefig(store_path, dpi=300, bbox_inches="tight")
+            plt.close()
 
-def load_model_weights(
-        model: nn.Module,
-        backbone: str,
-        weights_path: str
-        ) -> nn.Module:
+        acc = metrics.accuracy_score(results['labels'], preds_array)
+        prec = metrics.precision_score(results['labels'], preds_array)
+        rec = metrics.recall_score(results['labels'], preds_array)
+        fscore = metrics.f1_score(results['labels'], preds_array)
+        print(f'Accuracy: {acc}, Precision: {prec}, Recall: {rec}, and F1-Score: {fscore}')
 
-    '''
-    Update the model dictionary with the weights from the best epoch.
+    def load_weights(
+            self,
+            fold: int,
+            weights_dir: str
+        ) -> None:
 
-    Returns:
-        dict: Updated model dictionary.
-    '''
-    model_dict = model.state_dict()
-    weights_dict = torch.load(os.path.join(weights_path, backbone + '_weights.pth'))
-    weights_dict = {k.replace('module.', ''): v for k, v in weights_dict.items()}
-    model_dict.update(weights_dict)
-    model.load_state_dict(model_dict)
-    print('Model weights have bee sucessfully updated.')
-    return model
+        '''
+        Update the model dictionary with the weights from the best epoch.
+        '''
+        map_location = {'cuda:%d' % 0: 'cuda:%d' % self.gpu_id}
+        weights_path = os.path.join(weights_dir, f'weights_fold{fold}_' + self.suffix + '.pth')
+        weights = torch.load(weights_path, map_location=map_location)
+        self.model.load_state_dict(weights)
+
 
 def parse_args() -> argparse.Namespace:
 
@@ -217,22 +234,26 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--num-classes", default=2, type=int,
                         help="Number of output classes. Defaults to 2.")
-    parser.add_argument("--backbone", type=str, 
-                        help="Model encoder to use. Defaults to ResNet50.")
-    parser.add_argument("--pretrained", action='store_true',
-                        help="Flag to use pretrained weights")
+    parser.add_argument("--pooling-mode", type=str, default='cls',
+                        help="Pooling to use. Defaults to cls pooling")
     parser.add_argument("--distributed", action='store_true',
                         help="Flag to enable distributed training.")
     parser.add_argument("--amp", action='store_true',
                         help="Flag to enable automated mixed precision training.")
+    parser.add_argument("--k-folds", default=4, type=int, 
+                        help="Number of folds to evaluate over.")
     parser.add_argument("--batch-size", default=4, type=int, 
                         help="Batch size to use for training")
     parser.add_argument("--seq-length", default=4, type=int, 
                         help="Maxiaml training length of input sequence")
-    parser.add_argument("--train-ratio", default=0.85, type=float, 
+    parser.add_argument("--train-ratio", default=0.8, type=float, 
                         help="Ratio of training data to use for training")
+    parser.add_argument("--epsilon", default=1e-5, type=float, 
+                        help="Epsilon to use for normalization layers.")
     parser.add_argument("--mod-list", default=MODALITY_LIST, nargs='+', 
                         help="List of modalities to use for training")
+    parser.add_argument("--suffix", type=str,
+                        help="Suffix to use for identification")
     parser.add_argument("--seed", default=123, type=int, 
                         help="Seed to use for reproducibility")               
     parser.add_argument("--data-dir", default=DATA_DIR, type=str, 
@@ -244,8 +265,8 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 def load_test_objs(
-        device_id,
-        args: argparse.Namespace
+        args: argparse.Namespace,
+        device_id: torch.device
         ) -> tuple:
 
     '''
@@ -256,11 +277,12 @@ def load_test_objs(
 
     Returns:
         tuple: Training objects consisting of the datasets, dataloaders, the model, and the performance metric.
-    '''
+    '''    
     data_dict, label_df = DatasetPreprocessor(data_dir=args.data_dir).load_data(modalities=args.mod_list)
-    train, val_test = GroupStratifiedSplit(split_ratio=args.train_ratio).split_dataset(label_df)
-    test, val = GroupStratifiedSplit(split_ratio=0.6).split_dataset(val_test)
-    split_dict = convert_to_dict(train, val, test, data_dict)
+    dev, test = GroupStratifiedSplit(split_ratio=0.75).split_dataset(label_df)
+    train, val = GroupStratifiedSplit(split_ratio=0.8).split_dataset(dev)
+    # test = test[(test['delta'] < -365.25) | (test['delta'].isnull())]
+    split_dict = convert_to_dict([val], data_dict=data_dict, split_names=['test'], verbose=True)
 
     if args.seq_length > 0:
         seq_split_dict = convert_to_seqdict(split_dict, args.mod_list, ['test'])
@@ -349,40 +371,34 @@ def main(
     rank = dist.get_rank()
     num_devices = torch.cuda.device_count()
     device_id = rank % num_devices
-
-    dataloader = load_test_objs(device_id, args)
-    set_track_meta(False)
     num_classes = args.num_classes if args.num_classes > 2 else 1
-    if args.backbone == 'resnet10':
-        backbone = resnet10(pretrained=args.pretrained, n_input_channels=len(args.mod_list), num_classes=num_classes, shortcut_type='B')
-    elif args.backbone == 'resnet50':
-        backbone = resnet50(pretrained=args.pretrained, n_input_channels=len(args.mod_list), num_classes=num_classes, shortcut_type='B')
-    elif args.backbone == 'swinvit_t':
-        backbone = swinvit_tiny(pretrained=False, in_chans=len(args.mod_list), num_classes=num_classes)
-    elif args.backbone == 'swinvit_s':
-        backbone = swinvit_small(pretrained=False, in_chans=len(args.mod_list), num_classes=num_classes)
-    elif args.backbone == 'swinvit_b':
-        backbone = swinvit_base(pretrained=True, in_chans=len(args.mod_list), num_classes=num_classes)
-    model = SeqNet(backbone, num_classes=num_classes)
-    model = load_model_weights(model, backbone=args.backbone, weights_path=args.weights_dir)
+
+    dataloader = load_test_objs(args, device_id)
+    set_track_meta(False)
+
+    backbone = convnext3d_femto(
+        in_chans=len(args.mod_list), 
+        use_grn=True, 
+        eps=args.epsilon)
+    model = MedNet(
+        backbone, 
+        num_classes=num_classes, 
+        pooling_mode=args.pooling_mode, 
+        eps=args.epsilon)
+    model = model.to(device_id)
     if args.distributed:
-        model = nn.SyncBatchNorm.convert_sync_batchnorm(model) if args.backbone.startswith('resnet') else model
-        model = model.to(device_id)
-        model = nn.parallel.DistributedDataParallel(
-            model, 
-            device_ids=[device_id])
-    else:
-        model = model.to(device_id)
-    # Train the model using the training data and validate the model on the validation data following each epoch.
+        model = nn.parallel.DistributedDataParallel(model, device_ids=[device_id])
     tester = Tester(
         model=model, 
-        backbone=args.backbone, 
-        amp=args.amp, 
         dataloaders=dataloader, 
-        max_seq_length=args.seq_length * args.batch_size, 
+        num_folds=args.k_folds,
+        amp=args.amp,
+        suffix=args.suffix,
         output_dir=args.results_dir)
-    tester.test()
-    visualize_results(args.backbone, args.results_dir)
+    for k in range(args.k_folds):
+        tester.load_weights(fold=k, weights_dir=args.weights_dir)
+        tester.test(fold=k)
+    tester.visualize_results()
     # Cleanup distributed training.
     if args.distributed:
         cleanup()
