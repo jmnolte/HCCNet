@@ -79,7 +79,7 @@ class MeanPooling(nn.Module):
         ) -> torch.Tensor:
 
         if padding_mask is None:
-            padding_mask = torch.ones_like(hidden_states[:, :, 1])
+            padding_mask = torch.ones_like(hidden_states[:, :, 0])
         else:
             padding_mask = torch.where(padding_mask == 1, 0, 1)
         padding_mask = padding_mask.unsqueeze(-1)
@@ -104,7 +104,7 @@ class AttentionPooling(nn.Module):
         ) -> torch.Tensor:
 
         if padding_mask is None:
-            padding_mask = torch.zeros_like(hidden_states[:, :, 1])
+            padding_mask = torch.zeros_like(hidden_states[:, :, 0])
         else:
             padding_mask = torch.where(padding_mask == 1, float('-inf'), 0)
         padding_mask = padding_mask.unsqueeze(-1)
@@ -168,7 +168,6 @@ class MedNet(nn.Module):
         elif pooling_mode == 'mean':
             self.pooler = MeanPooling(d_model=self.d_model)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, self.d_model)) if pooling_mode == 'cls' else None
-        self.pooling_mode = pooling_mode
         self.head = Classifier(self.d_model, num_classes)
         self.apply(self._init_weights)
 
@@ -198,14 +197,14 @@ class MedNet(nn.Module):
         x = x.reshape(B * S, C, H, W, D)
         x = self.backbone(x)
         x = x.reshape(B, S, self.d_model)
-        cls_pos_mask = (torch.zeros((B, 1))).to(pos_token.device)
         if self.cls_token is not None:
+            cls_pos_mask = (torch.zeros((B, 1))).to(pos_token.device)
             cls_token = self.cls_token.expand(B, -1, -1)
             x = torch.cat([cls_token, x], dim=1)
             pos_token = torch.hstack([cls_pos_mask, pos_token])
         x = self.positional_encoding(x, pos_token)
-        if padding_mask is not None:
-            padding_mask = torch.hstack([cls_pos_mask, padding_mask]) if self.pooling_mode == 'cls' else padding_mask
+        if padding_mask is not None and self.cls_token is not None:
+            padding_mask = torch.hstack([cls_pos_mask, padding_mask])
         x = x.permute(1, 0, 2)
         x = self.transformer_encoder(x, src_key_padding_mask=padding_mask)
         x = x.permute(1, 0, 2)

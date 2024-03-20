@@ -8,6 +8,7 @@ import torch.optim as optim
 import torch.optim.lr_scheduler as lr_scheduler
 import torch.distributed as dist
 from torch.cuda.amp import GradScaler, autocast
+from torchmetrics import MetricCollection
 from torchmetrics.classification import BinaryAveragePrecision, BinaryAUROC
 from sklearn.model_selection import StratifiedGroupKFold
 import argparse
@@ -37,7 +38,9 @@ from monai.transforms import (
     RandShiftIntensityd,
     RandScaleIntensityd,
     RandKSpaceSpikeNoised,
-    RandRicianNoised,
+    RandGibbsNoised,
+    RandCoarseShuffled,
+    RandCoarseDropoutd,
     RandZoomd,
     CopyItemsd,
     KeepLargestConnectedComponentd,
@@ -54,7 +57,7 @@ from monai.data import (
     list_data_collate
 )
 from monai.utils import set_determinism
-from data.transforms import PercentileSpatialCropd, YeoJohnsond, SoftClipIntensityd, RobustNormalized
+from data.transforms import PercentileSpatialCropd, YeoJohnsond, SoftClipIntensityd, RobustNormalized, MinMaxNormalizationd
 from data.splits import GroupStratifiedSplit
 from data.datasets import CacheSeqDataset
 from data.utils import DatasetPreprocessor, convert_to_dict, convert_to_seqdict, SequenceBatchCollater
@@ -75,7 +78,7 @@ class Trainer:
             optimizer: optim,
             scheduler: lr_scheduler | None = None,
             num_folds: int = 1,
-            num_epochs: int = 100,
+            num_steps: int = 1000,
             amp: bool = True,
             suffix: str | None = None,
             output_dir: str | None = None
@@ -100,7 +103,7 @@ class Trainer:
         self.model = model
         self.dataloaders = dataloaders
         self.num_folds = num_folds
-        self.num_epochs = num_epochs
+        self.num_steps = num_steps
         self.amp = amp
         self.suffix = suffix
         if self.suffix is None:
@@ -115,10 +118,10 @@ class Trainer:
         self.optim = optimizer
         self.schedule = scheduler
 
-        self.train_auprc = BinaryAveragePrecision().to(self.gpu_id)
-        self.train_auroc = BinaryAUROC().to(self.gpu_id)
-        self.val_auprc = BinaryAveragePrecision().to(self.gpu_id)
-        self.val_auroc = BinaryAUROC().to(self.gpu_id)
+        metrics = MetricCollection([BinaryAveragePrecision(), BinaryAUROC()])
+        self.train_metrics = metrics.clone(prefix='train_').to(self.gpu_id)
+        self.val_metrics = metrics.clone(prefix='val_').to(self.gpu_id)
+        self.results_dict = {dataset: {metric: [] for metric in ['loss','auprc','auroc']} for dataset in ['train','val']}
 
     def save_output(
             self, 
@@ -145,7 +148,7 @@ class Trainer:
         elif output_type == 'history':
             folder_name = f'hist_fold{fold}_' + self.suffix + '.npy'
         elif output_type == 'preds':
-            folder_name = self.suffix + '_preds.npy'
+            folder_name = f'preds_fold{fold}_' + self.suffix + '.npy'
         folder_path = os.path.join(self.output_dir, 'model_' + output_type, folder_name)
         folder_path_root = os.path.join(self.output_dir, 'model_' + output_type)
 
@@ -155,70 +158,68 @@ class Trainer:
             os.makedirs(folder_path_root)
 
         if output_type == 'weights':
-            torch.save(self.model.module.state_dict(output_dict), folder_path)
+            torch.save(output_dict, folder_path)
         else:
             np.save(folder_path, output_dict)
 
-    def train(
+    def log_dict(
             self,
-            epoch: int,
+            phase: str,
+            keys: str | List[str],
+            values: float | List[float]
+        ) -> None:
+
+        if not isinstance(keys, list):
+            keys = [keys]
+        if not isinstance(values, list):
+            values = [values]
+        for key, value in zip(keys, values):
+            self.results_dict[phase][key].append(value)
+
+    def training_step(
+            self,
+            batch,
             batch_size: int,
             accum_steps: int
-        ) -> tuple:
+        ) -> float:
 
-        running_loss = 0.0
         self.model.train()
+        inputs, labels, pos_token, padding_mask = self.prep_batch(batch, batch_size=batch_size, device_id=self.gpu_id)
+        weight = self.calc_weight(pos_token)
+
+        with autocast(enabled=self.amp):
+            logits = self.model(inputs, pos_token=pos_token, padding_mask=padding_mask)
+            loss = self.train_loss(logits.squeeze(-1), labels.float())
+            # loss = torch.mean(torch.mul(weight, loss)) / accum_steps
+            loss /= accum_steps
+
+        self.scaler.scale(loss).backward()
+        preds = F.sigmoid(logits.squeeze(-1))
+        self.train_metrics.update(preds, labels)
+
+        return loss.item()
+
+    def accumulation_step(
+            self,
+            clip_grad: bool = True
+        ) -> None:
+
+        if clip_grad:
+            self.scaler.unscale_(self.optim)
+            nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0, norm_type=2)
+
+        self.scaler.step(self.optim)
+        self.scaler.update()
         self.optim.zero_grad(set_to_none=True)
+        if self.schedule is not None:
+            self.schedule.step()
 
-        if self.gpu_id == 0:
-            print('-' * 10)
-            print(f'Epoch {epoch}')
-            print('-' * 10)
-
-        for step, batch_data in enumerate(self.dataloaders['train']):
-            inputs, labels, pos_token, padding_mask = self.prep_batch(batch_data, batch_size=batch_size, device_id=self.gpu_id)
-            weight = self.calc_weight(pos_token)
-
-            with autocast(enabled=self.amp):
-                logits = self.model(inputs, pos_token=pos_token, padding_mask=padding_mask)
-                loss = self.train_loss(logits.squeeze(-1), labels.float())
-                # loss = torch.mean(torch.mul(weight, loss)) / accum_steps
-                loss /= accum_steps
-
-            self.scaler.scale(loss).backward()
-            running_loss += loss.item()
-            preds = F.sigmoid(logits.squeeze(-1))
-            self.train_auprc.update(preds, labels)
-            self.train_auroc.update(preds, labels)
-
-            if ((step + 1) % accum_steps == 0) or (step + 1 == len(self.dataloaders['train'])):
-                self.scaler.unscale_(self.optim)
-                nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0, norm_type=2)
-
-                self.scaler.step(self.optim)
-                self.scaler.update()
-                self.optim.zero_grad(set_to_none=True)
-                if self.schedule is not None:
-                    self.schedule.step()
-
-                if self.gpu_id == 0:
-                    print(f"{step + 1}/{len(self.dataloaders['train'])}, Batch Loss: {loss.item() * accum_steps:.4f}")
-
-        epoch_loss = running_loss / (len(self.dataloaders['train']) // accum_steps)
-        epoch_auprc = self.train_auprc.compute()
-        epoch_auroc = self.train_auroc.compute()
-        self.train_auprc.reset()
-        self.train_auroc.reset()
-
-        if self.gpu_id == 0:
-            print(f"[GPU {self.gpu_id}] Epoch {epoch}, Training Loss: {epoch_loss:.4f}, AUPRC: {epoch_auprc:.4f}, and AUROC {epoch_auroc:.4f}")
-
-        return epoch_loss, epoch_auprc, epoch_auroc
-
-    def evaluate(
+    @torch.no_grad()
+    def validation_step(
             self, 
-            epoch: int,
-        ) -> tuple:
+            batch,
+            batch_size: int = 1
+        ) -> float:
 
         '''
         Validate the model.
@@ -229,40 +230,24 @@ class Trainer:
         Returns:
             tuple: Tuple containing the loss and F1-score.
         '''
-        running_loss = 0.0
         self.model.eval()
-        with torch.no_grad():
-            for step, batch_data in enumerate(self.dataloaders['val']):
-                inputs, labels, pos_token, padding_mask = self.prep_batch(batch_data, batch_size=1, device_id=self.gpu_id)
+        inputs, labels, pos_token, padding_mask = self.prep_batch(batch, batch_size=batch_size, device_id=self.gpu_id)
 
-                with autocast(enabled=self.amp):
-                    logits = self.model(inputs, pos_token=pos_token, padding_mask=None)
-                    loss = self.val_loss(logits.squeeze(-1), labels.float())
+        with autocast(enabled=self.amp):
+            logits = self.model(inputs, pos_token=pos_token, padding_mask=None)
+            loss = self.val_loss(logits.squeeze(-1), labels.float())
 
-                running_loss += loss.item()
-                preds = F.sigmoid(logits.squeeze(-1))
-                self.val_auprc.update(preds, labels)
-                self.val_auroc.update(preds, labels)
+        preds = F.sigmoid(logits.squeeze(-1))
+        self.val_metrics.update(preds, labels)
 
-        epoch_loss = torch.Tensor([running_loss / len(self.dataloaders['val'])])
-        dist.reduce(epoch_loss.to(self.gpu_id), dst=0, op=dist.ReduceOp.AVG)
-        epoch_auprc = self.val_auprc.compute()
-        epoch_auroc = self.val_auroc.compute()
-        self.val_auprc.reset()
-        self.val_auroc.reset()
-
-        if self.gpu_id == 0:
-            print(f"[GPU {self.gpu_id}] Epoch {epoch}, Validation Loss: {epoch_loss.item():.4f}, AUPRC: {epoch_auprc:.4f}, and AUROC {epoch_auroc:.4f}")
-
-        return epoch_loss.item(), epoch_auprc, epoch_auroc
+        return loss.item()
     
-    def training_loop(
+    def train(
             self, 
             fold: int,
             batch_size: int,
             accum_steps: int,
-            val_steps: int = 1,
-            patience: int = 10
+            val_steps: int = 10
         ) -> None:
 
         '''
@@ -278,52 +263,71 @@ class Trainer:
             patience (int): Number of epochs to wait before aborting the training process.
             num_patches (int): Number of slice patches to use for training.
         '''
-        since = time.time()
-        best_loss = 10.0
-        best_auprc = 0.0
-        best_auroc = 0.0
-        counter = 0
-        log_book = {dataset: {log_type: [] for log_type in ['loss','metric']} for dataset in ['train','val']}
-        stop_criterion = torch.zeros(1).to(self.gpu_id)
+        start_time = time.time()
+        step = 0
+        accum_loss = 0.0
+        running_train_loss = 0.0
+        best_metric = 0.0
 
-        for epoch in range(0, self.num_epochs):
-            start_time = time.time()
-            train_loss, train_auprc, train_auroc = self.train(epoch, batch_size, accum_steps)
-            log_book['train']['loss'].append(train_loss)
-            log_book['train']['metric'].append(train_auprc.cpu().item())
+        self.optim.zero_grad(set_to_none=True)
+        for train_epoch in range(self.num_steps * accum_steps // len(self.dataloaders['train']) + 1):
+            for train_step, train_batch in enumerate(self.dataloaders['train']):
+                step = train_epoch * len(self.dataloaders['train']) + train_step
+                if self.gpu_id == 0 and step % (accum_steps * val_steps) == 0:
+                    print('-' * 15)
+                    print(f'Step {step}/{self.num_steps}')
+                    print('-' * 15)
+                accum_loss += self.training_step(train_batch, batch_size, accum_steps)
 
-            if (epoch + 1) % val_steps == 0:
-                val_loss, val_auprc, val_auroc = self.evaluate(epoch)
-                log_book['val']['loss'].append(val_loss)
-                log_book['val']['metric'].append(val_auprc.cpu().item())
+                if (step + 1) % accum_steps == 0:
+                    self.accumulation_step(clip_grad=False)
+                    if self.gpu_id == 0:
+                        print(f"Step Loss: {accum_loss:.4f}")
+                    running_train_loss += accum_loss
+                    accum_loss = 0.0
 
-                if self.gpu_id == 0:
-                    if val_loss < best_loss:
+                if (step + 1) % (accum_steps * val_steps) == 0:
+
+                    running_val_loss = 0.0
+                    for val_batch in self.dataloaders['val']:
+                        running_val_loss += self.validation_step(val_batch)
+
+                    train_loss = running_train_loss / val_steps
+                    running_train_loss = 0.0
+                    val_loss = torch.Tensor([running_val_loss / len(self.dataloaders['val'])])
+                    dist.reduce(val_loss.to(self.gpu_id), dst=0, op=dist.ReduceOp.AVG)
+                    train_results = self.train_metrics.compute()
+                    val_results = self.val_metrics.compute()
+                    self.train_metrics.reset()
+                    self.val_metrics.reset()
+                    val_loss = 1.0 if val_loss.item() > 1.0 else val_loss.item()
+                    val_metric = (val_results['val_BinaryAveragePrecision'] + val_results['val_BinaryAUROC']) / 2
+
+                    if self.gpu_id == 0:
+                        print(f"[GPU {self.gpu_id}] Step {step}/{self.num_steps}, Training Loss: {train_loss:.4f}, AUPRC: {train_results['train_BinaryAveragePrecision']:.4f}, and AUROC {train_results['train_BinaryAUROC']:.4f}")
+                        print(f"[GPU {self.gpu_id}] Step {step}/{self.num_steps}, Validation Loss: {val_loss:.4f}, AUPRC: {val_results['val_BinaryAveragePrecision']:.4f}, and AUROC {val_results['val_BinaryAUROC']:.4f}")
+
+                    if (val_metric * (1 - val_loss)) ** 0.5 > best_metric:
+                        best_metric = (val_metric * (1 - val_loss)) ** 0.5
                         best_loss = val_loss
-                        best_auprc = val_auprc
-                        best_auroc = val_auroc
-                        counter = 0
-                        print(f'[GPU {self.gpu_id}] New best Validation Loss: {best_loss:.4f}. Saving model weights...')
-                        best_weights = copy.deepcopy(self.model.state_dict())
-                    else:
-                        counter += 1
-                        if counter >= patience and epoch >= self.num_epochs:
-                            stop_criterion += 1
+                        best_auprc = val_results['val_BinaryAveragePrecision']
+                        best_auroc = val_results['val_BinaryAUROC']
+                        if self.gpu_id == 0:
+                            print(f'[GPU {self.gpu_id}] New best Validation Loss: {best_loss:.4f} and Metric: {val_metric:.4f}. Saving model weights...')
+                            self.save_output(self.model.state_dict(), 'weights', fold)
+                        dist.barrier()
 
-            train_time = time.time() - start_time
-            if self.gpu_id == 0:
-                print(f'Epoch {epoch} complete in {train_time // 60:.0f}min {train_time % 60:.0f}sec')
+                    self.log_dict(phase='train', keys=['loss', 'auprc', 'auroc'], values=[train_loss, train_results['train_BinaryAveragePrecision'].cpu().item(), train_results['train_BinaryAUROC'].cpu().item()])
+                    self.log_dict(phase='val', keys=['loss', 'auprc', 'auroc'], values=[val_loss, val_results['val_BinaryAveragePrecision'].cpu().item(), val_results['val_BinaryAUROC'].cpu().item()])
 
-            dist.all_reduce(stop_criterion, op=dist.ReduceOp.SUM)
-            if stop_criterion == 1:
-                break
+                if step == self.num_steps * accum_steps:
+                    break
 
         if self.gpu_id == 0:
-            time_elapsed = time.time() - since
+            time_elapsed = time.time() - start_time
             print(f'[Fold {fold}] Training complete in {time_elapsed // 60:.0f}min {time_elapsed % 60:.0f}sec')
             print(f'[Fold {fold}] Loss: {best_loss:.4f}, AUPRC: {best_auprc:.4f}, and {best_auroc:.4f} of best model configuration.')
-            self.save_output(best_weights, 'weights', fold)
-            self.save_output(log_book, 'history', fold)
+            self.save_output(self.results_dict, 'history', fold)
             
     @staticmethod
     def prep_batch(
@@ -333,7 +337,7 @@ class Trainer:
             normalize: bool = True
         ) -> tuple:
 
-        stats_dict = {'mean': 63.3394, 'std': 11.2231}
+        stats_dict = {'min': 18.0, 'max': 100.0}
         B, C, H, W, D = data['image'].shape
         for key in data:
             if key == 'image':
@@ -344,7 +348,7 @@ class Trainer:
                 except:
                     pass
         data['label'] = torch.max(data['label'], dim=1).values
-        data['age'] = torch.where(data['age'] != 0.0, (data['age'] - stats_dict['mean']) / stats_dict['std'], 0.0) if normalize else data['age']
+        data['age'] = torch.where(data['age'] != 0.0, (data['age'] - stats_dict['min']) / (stats_dict['max'] - stats_dict['min']), 0.0) if normalize else data['age']
         mask = torch.where(data['age'] == 0.0, 1, 0)
 
         if device_id is not None:
@@ -362,22 +366,10 @@ class Trainer:
         count = torch.count_nonzero(data, dim=dim)
         base = torch.Tensor([base])
         return torch.log(count + 1) / torch.log(base.to(count.device))
-
-    # @staticmethod
-    # def get_wd_params(model: nn.Module):
-    #     decay = list()
-    #     no_decay = list()
-    #     for name, param in model.named_parameters():
-    #         if hasattr(param,'requires_grad') and not param.requires_grad:
-    #             continue
-    #         if 'weight' in name and 'norm' not in name and 'bn' not in name:
-    #             decay.append(param)
-    #         else:
-    #             no_decay.append(param)
-    #     return decay, no_decay
     
     def visualize_training(
             self, 
+            phases: List[str],
             log_type: str
         ) -> None:
 
@@ -390,11 +382,13 @@ class Trainer:
 
         if log_type == 'loss':
             axis_label = 'Loss'
-        elif log_type == 'metric':
+        elif log_type == 'auprc':
             axis_label = 'AUPRC'
+        elif log_type == 'auroc':
+            axis_label = 'AUROC'
         plot_name = log_type + '_' + self.suffix + '.png' if self.suffix is not None else log_type + '.png'
 
-        for dataset in ['train','val']:
+        for dataset in phases:
             log_book = []
             for fold in range(self.num_folds):
                 file_name = f'hist_fold{fold}_' + self.suffix + '.npy'
@@ -406,9 +400,9 @@ class Trainer:
             plt.plot(mean_log, color=('blue' if dataset == 'train' else 'orange'), label=('Training' if dataset == 'train' else 'Validation'), alpha=1.0)
             
         plt.ylabel(axis_label, fontsize=20, labelpad=10)
-        plt.xlabel('Training Epoch', fontsize=20, labelpad=10)
+        plt.xlabel('Training Epochs', fontsize=20, labelpad=10)
         plt.legend(loc='lower right')
-        file_path = os.path.join(self.output_dir, 'model_history/diagnostics', plot_name)
+        file_path = os.path.join(self.output_dir, 'model_diagnostics/learning_curves', plot_name)
         file_path_root, _ = os.path.split(file_path)
         if os.path.exists(file_path):
             os.remove(file_path)
@@ -416,6 +410,19 @@ class Trainer:
             os.makedirs(file_path_root)
         plt.savefig(file_path, dpi=300, bbox_inches="tight")
         plt.close()
+
+
+def get_wd_params(model: nn.Module):
+    decay = list()
+    no_decay = list()
+    for name, param in model.named_parameters():
+        if hasattr(param,'requires_grad') and not param.requires_grad:
+            continue
+        if 'weight' in name and 'norm' not in name and 'bn' not in name:
+            decay.append(param)
+        else:
+            no_decay.append(param)
+    return decay, no_decay
 
 
 def parse_args() -> argparse.Namespace:
@@ -443,7 +450,7 @@ def parse_args() -> argparse.Namespace:
                         help="Flag to use a LR scheduler.")
     parser.add_argument("--num-classes", default=2, type=int,
                         help="Number of output classes. Defaults to 2.")
-    parser.add_argument("--epochs", default=100, type=int, 
+    parser.add_argument("--num-steps", default=100, type=int, 
                         help="Number of epochs to train for. Defaults to 10.")
     parser.add_argument("--batch-size", default=4, type=int, 
                         help="Batch size to use for training. Defaults to 4.")
@@ -465,8 +472,6 @@ def parse_args() -> argparse.Namespace:
                         help="Epsilon value to use for norm layers. Defaults to 1e-5.")
     parser.add_argument("--val-interval", default=1, type=int,
                         help="Number of epochs to wait before running validation. Defaults to 2.")
-    parser.add_argument("--patience", default=10, type=int, 
-                        help="Patience to use for early stopping. Defaults to 10.")
     parser.add_argument("--mod-list", default=MODALITY_LIST, nargs='+', 
                         help="List of modalities to use for training")
     parser.add_argument("--seed", default=1234, type=int, 
@@ -500,74 +505,48 @@ def load_train_data(
     folds = range(args.k_folds)
     phases = ['train', 'val']
     data_dict, label_df = DatasetPreprocessor(data_dir=args.data_dir).load_data(modalities=args.mod_list)
-    dev, test = GroupStratifiedSplit(split_ratio=0.8).split_dataset(label_df)
+    dev, test = GroupStratifiedSplit(split_ratio=0.75).split_dataset(label_df)
     if args.k_folds > 1:
         cv_folds = StratifiedGroupKFold(n_splits=args.k_folds).split(dev, y=dev['label'], groups=dev['patient_id'])
         indices = [(dev.iloc[train_idx], dev.iloc[val_idx]) for train_idx, val_idx in list(cv_folds)]
         split_dict = [convert_to_dict([indices[k][0], indices[k][1]], data_dict=data_dict, split_names=phases) for k in folds]
     elif args.k_folds == 1:
-        train, val = GroupStratifiedSplit(split_ratio=0.85).split_dataset(dev)
+        train, val = GroupStratifiedSplit(split_ratio=0.8).split_dataset(dev)
         split_dict = [convert_to_dict([train, val], data_dict=data_dict, split_names=phases, verbose=True) for k in folds]
     else:
         phases = ['train']
         folds = range(1)
         split_dict = [convert_to_dict([dev], data_dict=data_dict, split_names=phases, verbose=True) for k in folds]
 
-    if args.seq_length > 0:
-        seq_split_dict = [convert_to_seqdict(split_dict[k], args.mod_list, phases) for k in folds]
-        seq_class_dict = {x: [[max(patient['label']) for patient in seq_split_dict[k][x][0]] for k in folds] for x in phases}
-        seq_split_dict = {x: [partition_dataset_classes(
-            data=seq_split_dict[k][x][0],
-            classes=seq_class_dict[x][k],
-            num_partitions=dist.get_world_size(),
-            shuffle=True,
-            even_divisible=False
-            )[dist.get_rank()] for k in folds] for x in phases}
-        datasets = {x: [CacheSeqDataset(
-            data=seq_split_dict[x][k],
-            image_keys=args.mod_list,
-            transform=data_transforms(
-                dataset=x, 
-                modalities=args.mod_list,
-                device=device), 
-            num_workers=args.num_workers,
-            copy_cache=False
-            ) for k in folds] for x in phases}
-        dataloader = {x: [ThreadDataLoader(
-            datasets[x][k], 
-            batch_size=(args.batch_size if x == 'train' else 1), 
-            shuffle=(True if x == 'train' else False),   
-            drop_last=(True if x == 'train' else False),   
-            num_workers=0,
-            collate_fn=(SequenceBatchCollater(keys=['image','label','age'], seq_length=args.seq_length) if x == 'train' else list_data_collate)
-            ) for k in folds] for x in phases}
-        _, counts = np.unique(seq_class_dict['train'][0], return_counts=True)
-        pos_weight = counts[1] / counts.sum()
-    else:
-        class_dict = {x: [[patient['label'] for patient in split_dict[k][x]] for k in folds] for x in phases}
-        split_dict = {x: [partition_dataset_classes(
-            data=split_dict[k][x],
-            classes=class_dict[x][k],
-            num_partitions=dist.get_world_size(),
-            shuffle=True,
-            even_divisible=(True if x == 'train' else False)
-            )[dist.get_rank()] for k in folds] for x in phases}
-        datasets = {x: [CacheDataset(
-            data=split_dict[x][k], 
-            transform=data_transforms(
-                dataset=x, 
-                modalities=args.mod_list, 
-                device=device), 
-            num_workers=8,
-            copy_cache=False
-            ) for k in folds] for x in phases}
-        dataloader = {x: [ThreadDataLoader(
-            dataset=datasets[x][k], 
-            batch_size=(args.batch_size if x == 'train' else 1), 
-            shuffle=(True if x == 'train' else False),   
-            num_workers=0,
-            drop_last=(True if x == 'train' else False)
-            ) for k in folds] for x in phases}
+    seq_split_dict = [convert_to_seqdict(split_dict[k], args.mod_list, phases) for k in folds]
+    seq_class_dict = {x: [[max(patient['label']) for patient in seq_split_dict[k][x][0]] for k in folds] for x in phases}
+    seq_split_dict = {x: [partition_dataset_classes(
+        data=seq_split_dict[k][x][0],
+        classes=seq_class_dict[x][k],
+        num_partitions=dist.get_world_size(),
+        shuffle=True,
+        even_divisible=False
+        )[dist.get_rank()] for k in folds] for x in phases}
+    datasets = {x: [CacheSeqDataset(
+        data=seq_split_dict[x][k],
+        image_keys=args.mod_list,
+        transform=data_transforms(
+            dataset=x, 
+            modalities=args.mod_list,
+            device=device), 
+        num_workers=args.num_workers,
+        copy_cache=False
+        ) for k in folds] for x in phases}
+    dataloader = {x: [ThreadDataLoader(
+        datasets[x][k], 
+        batch_size=(args.batch_size if x == 'train' else 1), 
+        shuffle=(True if x == 'train' else False),   
+        drop_last=(True if x == 'train' else False),   
+        num_workers=0,
+        collate_fn=(SequenceBatchCollater(keys=['image','label','age'], seq_length=args.seq_length) if x == 'train' else list_data_collate)
+        ) for k in folds] for x in phases}
+    _, counts = np.unique(seq_class_dict['train'][0], return_counts=True)
+    pos_weight = counts[1] / counts.sum()
 
     return dataloader, pos_weight
 
@@ -585,10 +564,19 @@ def load_train_objs(
     else:
         train_fn = BinaryCELoss(weights=pos_weight, label_smoothing=args.label_smoothing)
     loss_fn = [train_fn, BinaryCELoss()]
-    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=args.weight_decay)
-    max_iter = len(dataloader['train']) / accum_steps * args.epochs
-    scheduler = lr_scheduler.CosineAnnealingLR(optimizer, max_iter) if args.scheduler else None
+    decay, no_decay = get_wd_params(model)
+    optimizer = optim.AdamW([{'params': no_decay, 'weight_decay': 0}, {'params': decay}], lr=learning_rate, weight_decay=args.weight_decay)
+    # max_iter = len(dataloader['train']) / accum_steps * args.epochs
+    scheduler = None
     return loss_fn, optimizer, scheduler
+
+def scale_learning_rate(
+        batch_size: int,
+        num_devices: int
+    ) -> float:
+
+    alpha = {8: 0.0001, 16: 0.000141, 32: 0.0002, 64: 0.000282, 128: 0.0004, 256: 0.000565, 512: 0.0008}
+    return alpha[batch_size] * np.sqrt(batch_size * num_devices) / np.sqrt(128)
 
 def data_transforms(
         dataset: str,
@@ -627,10 +615,10 @@ def data_transforms(
             select_fn=lambda x: x > 0,
             k_divisible=1,
             allow_smaller=False),
-        YeoJohnsond(keys=modalities, lmbda=0.1),
         ConcatItemsd(keys=modalities, name='image'),
         DeleteItemsd(keys=modalities + ['mask']),
-        RobustNormalized(keys='image', channel_wise=True),
+        YeoJohnsond(keys='image', lmbda=0.1, channel_wise=True),
+        NormalizeIntensityd(keys='image', channel_wise=True),
         PercentileSpatialCropd(
             keys='image',
             roi_center=(0.45, 0.25, 0.3),
@@ -648,24 +636,25 @@ def data_transforms(
         RandRotate90d(keys='image', prob=0.5),
         RandScaleIntensityd(keys='image', prob=1.0, factors=0.1),
         RandShiftIntensityd(keys='image', prob=1.0, offsets=0.1),
-        RandRicianNoised(keys='image', prob=0.1, mean=0.0, std=0.05, sample_std=True, channel_wise=True),
+        RandGibbsNoised(keys='image', prob=0.1, alpha=(0.1, 0.9)),
         RandKSpaceSpikeNoised(keys='image', prob=0.1, channel_wise=True),
-        # NormalizeIntensityd(
-        #     keys='image',
-        #     subtrahend=(0.4749, 0.5230, 0.5435, 0.5377),
-        #     divisor=(0.6674, 0.6753, 0.6840, 0.6757),
-        #     channel_wise=True)
-        NormalizeIntensityd(keys='image', channel_wise=True)
+        RandCoarseDropoutd(keys='image', prob=0.25, holes=1, spatial_size=(16, 16, 16), max_spatial_size=(48, 48, 48)),
+        NormalizeIntensityd(
+            keys='image', 
+            subtrahend=(0.4467, 0.4416, 0.4409, 0.4212),
+            divisor=(0.6522, 0.6429, 0.6301, 0.6041),
+            channel_wise=True)
+        # NormalizeIntensityd(keys='image', channel_wise=True)
     ]
 
     test = [
-        CenterSpatialCropd(keys='image', roi_size=(96, 96, 96)),
-        # NormalizeIntensityd(
-        #     keys='image',
-        #     subtrahend=(0.4749, 0.5230, 0.5435, 0.5377),
-        #     divisor=(0.6674, 0.6753, 0.6840, 0.6757),
-        #     channel_wise=True),
-        NormalizeIntensityd(keys='image', channel_wise=True),
+        CenterSpatialCropd(keys='image', roi_size=(72, 72, 72)),
+        NormalizeIntensityd(
+            keys='image', 
+            subtrahend=(0.4467, 0.4416, 0.4409, 0.4212),
+            divisor=(0.6522, 0.6429, 0.6301, 0.6041),
+            channel_wise=True),
+        # NormalizeIntensityd(keys='image', channel_wise=True),
         EnsureTyped(keys='image', track_meta=False, device=device, dtype=torch.float)
     ]
 
@@ -709,10 +698,9 @@ def main(
     rank = dist.get_rank()
     num_devices = torch.cuda.device_count()
     device_id = rank % num_devices
-    accum_steps = args.effective_batch_size / args.batch_size / num_devices
+    accum_steps = args.effective_batch_size // args.batch_size // num_devices
     batch_size_gpu = args.batch_size * accum_steps
-    alpha = 0.0001 if batch_size_gpu == 8 else 0.000141 if batch_size_gpu == 16 else 0.0002 if batch_size_gpu == 32 else 0.000282
-    learning_rate = (alpha * np.sqrt(batch_size_gpu) / np.sqrt(128)) * np.sqrt(num_devices)
+    learning_rate = scale_learning_rate(batch_size_gpu, num_devices)
     num_classes = args.num_classes if args.num_classes > 2 else 1
 
     cv_dataloader, pos_weight = load_train_data(args, device_id)
@@ -731,11 +719,9 @@ def main(
             pooling_mode=args.pooling_mode, 
             dropout=args.dropout, 
             eps=args.epsilon)
+        model = model.to(device_id)
         if args.distributed:
-            model = model.to(device_id)
             model = nn.parallel.DistributedDataParallel(model, device_ids=[device_id])
-        else:
-            model = model.to(device_id)
         loss_fn, optimizer, scheduler = load_train_objs(
             args, 
             model=model, 
@@ -750,21 +736,21 @@ def main(
             optimizer=optimizer,
             scheduler=scheduler,
             num_folds=(args.k_folds if args.k_folds > 0 else 1),
-            num_epochs=args.epochs,
+            num_steps=args.num_steps,
             amp=args.amp,
             suffix=args.suffix,
             output_dir=args.results_dir)
-        trainer.training_loop(
+        trainer.train(
             fold=k,
             batch_size=args.batch_size, 
             accum_steps=accum_steps,
-            val_steps=args.val_interval, 
-            patience=args.patience)
+            val_steps=args.val_interval)
 
     if args.distributed:
         cleanup()
     trainer.visualize_training('loss')
-    trainer.visualize_training('metric')
+    trainer.visualize_training('auprc')
+    trainer.visualize_training('auroc')
     print('Script finished')
     
 

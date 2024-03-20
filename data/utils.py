@@ -1,3 +1,4 @@
+from typing import List
 import torch
 import os
 import numpy as np
@@ -88,6 +89,7 @@ class DatasetPreprocessor:
     def __init__(
             self,
             data_dir: str,
+            partial: bool = False
         ) -> None:
         '''
         Initialize the dataset preprocessor class.
@@ -102,6 +104,7 @@ class DatasetPreprocessor:
         self.nifti_dir = os.path.join(data_dir, 'nifti')
         self.nifti_patients = glob(os.path.join(self.nifti_dir, '*'), recursive = True)
         self.label_dir = os.path.join(data_dir, 'labels')
+        self.partial = partial
 
     def assert_observation_completeness(
             self,
@@ -123,8 +126,12 @@ class DatasetPreprocessor:
             images = [image for image in glob(os.path.join(observation, '*.nii.gz'))]
             common_prefix = os.path.commonprefix(images)
             image_names = [image_name[len(common_prefix):] for image_name in images]
-            if all(names in image_names for names in image_names_list):
-                observation_list.append(observation)
+            if self.partial:
+                if any(names in image_names for names in image_names_list):
+                    observation_list.append(observation)
+            else:
+                if all(names in image_names for names in image_names_list):
+                    observation_list.append(observation)
         if verbose:
             print('{} out of {} observations include all required images'.format(len(observation_list), len(self.nifti_patients)))
         return observation_list
@@ -149,6 +156,7 @@ class DatasetPreprocessor:
     @staticmethod
     def create_label_dict(
             observation_list: list, 
+            keys: List[str],
             label_path: str
         ) -> dict:
         '''
@@ -161,7 +169,8 @@ class DatasetPreprocessor:
         Returns:
             label_dict (dict): Dictionary containing the labels.
         '''
-        label_dict = {x: [] for x in ['uid','label','age']}
+        new_keys = ['uid'] + keys
+        label_dict = {x: [] for x in new_keys}
         labels_df = pd.read_csv(label_path)
         for idx, row in labels_df.iterrows():
             if labels_df.loc[idx, 'observation'] < 10:
@@ -173,11 +182,9 @@ class DatasetPreprocessor:
             if observation_id not in labels_df['uid'].values:
                 continue
             else:
-                label = labels_df.loc[labels_df['uid'] == observation_id, 'label'].values.item()
-                age = labels_df.loc[labels_df['uid'] == observation_id, 'age'].values.item()
-            label_dict['label'].append(label)
+                for key in keys:
+                    label_dict[key].append(labels_df.loc[labels_df['uid'] == observation_id, key].values.item())
             label_dict['uid'].append(observation_id)
-            label_dict['age'].append(age)
         return [dict(zip(label_dict.keys(), vals)) for vals in zip(*(label_dict[k] for k in label_dict.keys()))]
     
     @staticmethod
@@ -201,7 +208,8 @@ class DatasetPreprocessor:
     def load_data(
             self,
             modalities: list,
-            label_column: str = 'label',
+            keys: List[str],
+            file_name: str = 'labels.csv',
             verbose: bool = True
         ) -> list:
         '''
@@ -217,17 +225,18 @@ class DatasetPreprocessor:
         '''
         observation_list = self.assert_observation_completeness(modalities, verbose)
         modality_dict = {modality: self.split_observations_by_modality(observation_list, modality) for modality in modalities}
-        label_dict = self.create_label_dict(observation_list, os.path.join(self.label_dir, 'labels.csv'))
+        label_dict = self.create_label_dict(observation_list, keys, os.path.join(self.label_dir, file_name))
         label_df = pd.DataFrame.from_dict(label_dict)
         label_df['patient_id'] = label_df['uid'].str.split('_').str[1]
         data_dict = self.create_data_dict(observation_list, modality_dict)
         for idx, patient in enumerate(data_dict):
             if patient['uid'] in [label['uid'] for label in label_dict]:
-                data_dict[idx][label_column] = label_dict[[label['uid'] for label in label_dict].index(patient['uid'])][label_column]
-                data_dict[idx]['age'] = label_dict[[label['uid'] for label in label_dict].index(patient['uid'])]['age']
+                for key in keys:
+                    data_dict[idx][key] = label_dict[[label['uid'] for label in label_dict].index(patient['uid'])][key]
             else:
-                data_dict[idx][label_column] = None
-                data_dict[idx]['age'] = None
-        data_dict = [patient for patient in data_dict if not (patient[label_column] == None)]
+                for key in keys:
+                    data_dict[idx][key] = None
+        if not self.partial:
+            data_dict = [patient for patient in data_dict if not (patient['label'] == None)]
 
         return data_dict, label_df

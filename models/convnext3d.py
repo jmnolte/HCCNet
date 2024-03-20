@@ -20,9 +20,9 @@ class Block(nn.Module):
     def __init__(
             self, 
             dim: int, 
-            drop_path: float = 0.0, 
             kernel_size: int = 5, 
             use_grn: bool = False, 
+            drop_path: float = 0.0, 
             eps: float = 1e-5
         ) -> None:
 
@@ -104,8 +104,8 @@ class ConvNeXt3d(nn.Module):
         cur = 0
         for i in range(4):
             stage = nn.Sequential(
-                *[Block(dim=dims[i], drop_path=dp_rates[cur + j], use_grn=use_grn,
-                eps=eps) for j in range(depths[i])]
+                *[Block(dim=dims[i], drop_path=dp_rates[cur + j], use_grn=use_grn, eps=eps
+                ) for j in range(depths[i])]
             )
             self.stages.append(stage)
             cur += depths[i]
@@ -120,7 +120,7 @@ class ConvNeXt3d(nn.Module):
         ) -> None:
 
         if isinstance(m, (nn.Conv3d, nn.Linear)):
-            trunc_normal_(m.weight, std=.02)
+            trunc_normal_(m.weight, std=0.02)
             nn.init.constant_(m.bias, 0)
 
     def forward_features(
