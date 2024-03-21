@@ -4,8 +4,8 @@ import torch.nn.functional as F
 import torch.distributed as dist
 import numpy as np
 
-
 class DINOLoss(nn.Module):
+
     def __init__(
             self, 
             out_dim: int, 
@@ -26,8 +26,7 @@ class DINOLoss(nn.Module):
         # we apply a warm up for the teacher temperature because
         # a too high temperature makes the training instable at the beginning
         self.teacher_temp_schedule = np.concatenate((
-            np.linspace(teacher_warmup_temp,
-                        teacher_temp, teacher_warmup_steps),
+            np.linspace(teacher_warmup_temp, teacher_temp, teacher_warmup_steps),
             np.ones(num_steps - teacher_warmup_steps) * teacher_temp
         ))
 

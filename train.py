@@ -57,7 +57,7 @@ from monai.data import (
     list_data_collate
 )
 from monai.utils import set_determinism
-from data.transforms import PercentileSpatialCropd, YeoJohnsond, SoftClipIntensityd, RobustNormalized, MinMaxNormalizationd
+from data.transforms import PercentileSpatialCropd, YeoJohnsond, SoftClipIntensityd
 from data.splits import GroupStratifiedSplit
 from data.datasets import CacheSeqDataset
 from data.utils import DatasetPreprocessor, convert_to_dict, convert_to_seqdict, SequenceBatchCollater
@@ -272,6 +272,7 @@ class Trainer:
         self.optim.zero_grad(set_to_none=True)
         for train_epoch in range(self.num_steps * accum_steps // len(self.dataloaders['train']) + 1):
             for train_step, train_batch in enumerate(self.dataloaders['train']):
+
                 step = train_epoch * len(self.dataloaders['train']) + train_step
                 if self.gpu_id == 0 and step % (accum_steps * val_steps) == 0:
                     print('-' * 15)
@@ -287,7 +288,6 @@ class Trainer:
                     accum_loss = 0.0
 
                 if (step + 1) % (accum_steps * val_steps) == 0:
-
                     running_val_loss = 0.0
                     for val_batch in self.dataloaders['val']:
                         running_val_loss += self.validation_step(val_batch)
@@ -304,6 +304,8 @@ class Trainer:
                     val_metric = (val_results['val_BinaryAveragePrecision'] + val_results['val_BinaryAUROC']) / 2
 
                     if self.gpu_id == 0:
+                        self.log_dict(phase='train', keys=['loss', 'auprc', 'auroc'], values=[train_loss, train_results['train_BinaryAveragePrecision'].cpu().item(), train_results['train_BinaryAUROC'].cpu().item()])
+                        self.log_dict(phase='val', keys=['loss', 'auprc', 'auroc'], values=[val_loss, val_results['val_BinaryAveragePrecision'].cpu().item(), val_results['val_BinaryAUROC'].cpu().item()])
                         print(f"[GPU {self.gpu_id}] Step {step}/{self.num_steps}, Training Loss: {train_loss:.4f}, AUPRC: {train_results['train_BinaryAveragePrecision']:.4f}, and AUROC {train_results['train_BinaryAUROC']:.4f}")
                         print(f"[GPU {self.gpu_id}] Step {step}/{self.num_steps}, Validation Loss: {val_loss:.4f}, AUPRC: {val_results['val_BinaryAveragePrecision']:.4f}, and AUROC {val_results['val_BinaryAUROC']:.4f}")
 
@@ -312,13 +314,11 @@ class Trainer:
                         best_loss = val_loss
                         best_auprc = val_results['val_BinaryAveragePrecision']
                         best_auroc = val_results['val_BinaryAUROC']
+                        dist_barrier()
                         if self.gpu_id == 0:
                             print(f'[GPU {self.gpu_id}] New best Validation Loss: {best_loss:.4f} and Metric: {val_metric:.4f}. Saving model weights...')
                             self.save_output(self.model.state_dict(), 'weights', fold)
                         dist.barrier()
-
-                    self.log_dict(phase='train', keys=['loss', 'auprc', 'auroc'], values=[train_loss, train_results['train_BinaryAveragePrecision'].cpu().item(), train_results['train_BinaryAUROC'].cpu().item()])
-                    self.log_dict(phase='val', keys=['loss', 'auprc', 'auroc'], values=[val_loss, val_results['val_BinaryAveragePrecision'].cpu().item(), val_results['val_BinaryAUROC'].cpu().item()])
 
                 if step == self.num_steps * accum_steps:
                     break
@@ -504,7 +504,7 @@ def load_train_data(
     '''
     folds = range(args.k_folds)
     phases = ['train', 'val']
-    data_dict, label_df = DatasetPreprocessor(data_dir=args.data_dir).load_data(modalities=args.mod_list)
+    data_dict, label_df = DatasetPreprocessor(data_dir=args.data_dir).load_data(modalities=args.mod_list, keys=['label','age'], file_name='labels.csv')
     dev, test = GroupStratifiedSplit(split_ratio=0.75).split_dataset(label_df)
     if args.k_folds > 1:
         cv_folds = StratifiedGroupKFold(n_splits=args.k_folds).split(dev, y=dev['label'], groups=dev['patient_id'])

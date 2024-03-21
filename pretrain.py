@@ -59,6 +59,7 @@ class Pretrainer:
             student: nn.Module,
             teacher: nn.Module,
             loss_fn: nn.Module,
+            dataloaders: dict,
             optimizer: optim,
             scheduler: List[np.array],
             num_steps: int = 1000,
@@ -146,14 +147,15 @@ class Pretrainer:
             accum_steps: int
         ) -> float:
 
-        self.model.train()
+        self.student.train()
+        self.teacher.train()
         gv1, gv2, lv1, lv2 = batch['gv1'], batch['gv2'], batch['lv1'], batch['lv2']
         views = [view.to(self.gpu_id) for view in [gv1, gv2, lv1, lv2]]
 
-        with torch.autocast(enabled=self.amp):
-            teacher_logits = self.teacher(views[:2])
+        with autocast(enabled=self.amp):
             student_logits = self.student(views)
-            loss = self.dino_loss(teacher_logits, student_logits, step)
+            teacher_logits = self.teacher(views[:2])
+            loss = self.dino_loss(step, student_logits, teacher_logits)
             loss /= accum_steps
         self.scaler.scale(loss).backward()
 
@@ -203,6 +205,7 @@ class Pretrainer:
         self.optim.zero_grad(set_to_none=True)
         for train_epoch in range(self.num_steps * accum_steps // len(self.dataloaders['train']) + 1):
             for train_step, train_batch in enumerate(self.dataloaders['train']):
+
                 step = train_epoch * len(self.dataloaders['train']) + train_step
                 if self.gpu_id == 0 and step % (accum_steps * log_every) == 0:
                     print('-' * 15)
@@ -218,22 +221,25 @@ class Pretrainer:
                     accum_loss = 0.0
                     self.update_teacher(step)
 
-                if (step + 1) % (accum_steps * log_every):
+                if (step + 1) % (accum_steps * log_every) == 0:
                     loss = torch.Tensor([running_loss])
                     running_loss = 0.0
                     dist.reduce(loss.to(self.gpu_id), dst=0, op=dist.ReduceOp.AVG)
-                    self.log_dict(phase='train', keys=['loss'], values=[loss])
 
                     if self.gpu_id == 0:
+                        self.log_dict(phase='train', keys='loss', values=loss)
                         print(f"[GPU {self.gpu_id}] Step {step}/{self.num_steps}, Loss: {loss.item():.4f}")
 
                 if step == self.num_steps * accum_steps:
                     break
 
+        dist.barrier()
         if self.gpu_id == 0:
             time_elapsed = time.time() - start_time
             print(f'Pretraining finished in {time_elapsed // 60:.0f}min {time_elapsed % 60:.0f}sec')
-            self.save_output(self.results_dict, 'history', fold)
+            self.save_output(self.results_dict, 'history', fold=0)
+            self.save_output(self.student.state_dict(), 'weights', fold=0)
+        dist.barrier()
 
     def visualize_training(
             self, 
@@ -314,18 +320,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--local-crop-size", default=48, type=int, 
                         help="Local crop size to use. Defaults to 48.")
 
+    parser.add_argument("--kernel-size", default=3, type=int,
+                        help="Kernel size of convolutional downsampling layers. Defaults to 2.")
+    parser.add_argument("--use-v2", action='store_true',
+                        help="Whether to use ConvNext v1 or v2.")
     parser.add_argument("--out-dim", default=128, type=int,
                         help="Number of output classes. Defaults to 2.")
     parser.add_argument("--norm-last-layer", action='store_true',
                         help="Whether to weight normalize the last layer of the DINO head.")
-    parser.add_argument("--momentum-teacher", default=0.9995, type=float, 
+    parser.add_argument("--teacher-momentum", default=0.9995, type=float, 
                         help="Inital momentum value to update teacher network with EMA. Defaults to 0.9995.")
     parser.add_argument("--teacher-temp", default=0.04, type=float, 
                         help="Final (i.e., after warmup) teacher temperature value. Defaults to 0.04")
     parser.add_argument("--teacher-warmup-temp", default=0.04, type=float, 
                         help="Initial teacher temperature value. Defaults to 0.04")
 
-    parser.add_argument("--mod-list", default=MODALITY_LIST, nargs='+', 
+    parser.add_argument("--mod-list", default=MOD_LIST, nargs='+', 
                         help="List of modalities to use for training")
     parser.add_argument("--distributed", action='store_true',
                         help="Whether to enable distributed training.")
@@ -363,8 +373,8 @@ def ssl_transforms(
         LoadImaged(keys=modalities, image_only=True, allow_missing_keys=True),
         EnsureChannelFirstd(keys=modalities, allow_missing_keys=True),
         Orientationd(keys=modalities, axcodes='PLI', allow_missing_keys=True),
-        Spacingd(keys=modalities, pixdim=image_spacing, mode=3, allow_missing_keys=True),
-        ResampleToMatchFirstd(keys=modalities, mode=3, allow_missing_keys=True),
+        Spacingd(keys=modalities, pixdim=image_spacing, mode='bilinear', allow_missing_keys=True),
+        ResampleToMatchFirstd(keys=modalities, mode='bilinear', allow_missing_keys=True),
         ConcatItemsd(keys=modalities, name='image', allow_missing_keys=True),
         PercentileSpatialCropd(
             keys='image',
@@ -420,7 +430,7 @@ def load_pretrain_data(
     ) -> tuple:
     
     phases = ['train']
-    data_dict, label_df = DatasetPreprocessor(data_dir=args.data_dir).load_data(modalities=args.mod_list, keys=['label','age'], file_name='labels.csv')
+    data_dict, label_df = DatasetPreprocessor(data_dir=args.data_dir).load_data(modalities=args.mod_list, keys=['label','age'], file_name='labels.csv', verbose=False)
     ssl_dict, ssl_df = DatasetPreprocessor(data_dir=args.data_dir, partial=True).load_data(modalities=args.mod_list, keys=['age'], file_name='nolabels.csv')
     dev, test = GroupStratifiedSplit(split_ratio=0.75).split_dataset(label_df)
     ssl_test = ssl_df[ssl_df['patient_id'].isin(test['patient_id'])]
@@ -520,19 +530,22 @@ def main(
     accum_steps = args.effective_batch_size // args.batch_size // num_devices
     batch_size_gpu = args.batch_size * accum_steps
     learning_rate = scale_learning_rate(batch_size_gpu, num_devices)
+    version = 'v2' if args.use_v2 else 'v1'
 
     dataloader = load_pretrain_data(args, device_id)
     set_track_meta(False)
     student = convnext3d_femto(
         in_chans=1, 
-        use_grn=True, 
+        kernel_size=args.kernel_size,
         drop_path_rate=args.stochastic_depth,
+        use_v2=args.use_v2,
         eps=args.epsilon)
     teacher = convnext3d_femto(
         in_chans=1, 
-        use_grn=True, 
+        kernel_size=args.kernel_size,
+        use_v2=args.use_v2,
         eps=args.epsilon)
-    embed_dim = 384
+    embed_dim = student.head.in_features
     student = MultiCropWrapper(
         student,
         DINOHead(embed_dim, args.out_dim, norm_last_layer=args.norm_last_layer))
@@ -552,6 +565,7 @@ def main(
         student=student,
         teacher=teacher,
         loss_fn=loss_fn,
+        dataloaders=dataloader,
         optimizer=optimizer,
         scheduler=schedules,
         num_steps=args.num_steps,
@@ -563,10 +577,10 @@ def main(
         print('-' * 15)
         print(f'Model pretraining is initialized using the following parameters:')
         print(f'- AdamW optimizer with cosine learning rate ({learning_rate} to {args.min_learning_rate}), weight decay ({args.weight_decay} to {args.max_weight_decay}), and momentum ({args.teacher_momentum} to {1.0}) decay.')
-        print(f'- Projection head output dimensionality of {args.out_dim}, teacher temperature of ({args.teacher_warmup_temp} to {args.teacher_temp} in {args.warmup_steps}), stochastic depth rate of {args.stochastic_depth}, and epislon of {args.epsilon}.')
-        print(f'- {args.num_steps} steps with {args.warmup_steps}, a batch size of {batch_size_gpu} per GPU and a effective batch size of {args.effective_batch_size}')
+        print(f'- Model is ConvNext{version} using a {args.kernel_size}^3 downsampling kernel and projection head of dimensionality {args.out_dim}.') 
+        print(f'- The teacher temperature ranges from ({args.teacher_warmup_temp} to {args.teacher_temp} in {args.warmup_steps} steps), stochastic depth rate is set to {args.stochastic_depth}, and epislon to {args.epsilon}.')
+        print(f'- Pretraining is set to {args.num_steps} steps with {args.warmup_steps} warm-up steps, a batch size of {batch_size_gpu} per GPU and a effective batch size of {args.effective_batch_size}.')
         print(f'Starting DINO pretraining...')
-        print('-' * 15)
 
     pretrainer.pretrain(accum_steps, args.warmup_steps // 10)
     pretrainer.visualize_training('train', 'loss')
@@ -574,7 +588,7 @@ def main(
 
 RESULTS_DIR = '/Users/noltinho/thesis/results'
 DATA_DIR = '/Users/noltinho/thesis/sensitive_data'
-MODALITY_LIST = ['T1W_OOP','T1W_IP','T1W_DYN','T2W_TES','T2W_TEL','DWI_b150','DWI_b400','DWI_b800']
+MOD_LIST = ['DWI_b0','DWI_b150','DWI_b400','DWI_b800']
 WEIGHTS_DIR = '/Users/noltinho/MedicalNet/pytorch_files/pretrain'
 
 if __name__ == '__main__':
