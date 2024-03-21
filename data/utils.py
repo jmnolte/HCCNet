@@ -236,7 +236,12 @@ class DatasetPreprocessor:
             else:
                 for key in keys:
                     data_dict[idx][key] = None
-        if not self.partial:
+        if self.partial:
+            for patient in data_dict:
+                keys_to_remove = [key for key, value in patient.items() if value == []]
+                for key in keys_to_remove:
+                    del patient[key]
+        else:
             data_dict = [patient for patient in data_dict if not (patient['label'] == None)]
 
         return data_dict, label_df

@@ -20,10 +20,11 @@ class Block(nn.Module):
     def __init__(
             self, 
             dim: int, 
-            kernel_size: int = 5, 
-            use_grn: bool = False, 
+            kernel_size: int = 3, 
             drop_path: float = 0.0, 
-            eps: float = 1e-5
+            use_v2: bool = False, 
+            layer_scale_init: float = 1e-6,
+            eps: float = 1e-6
         ) -> None:
 
         super().__init__()
@@ -31,13 +32,13 @@ class Block(nn.Module):
         self.norm = LayerNorm(dim, eps=eps)
         self.pwconv1 = nn.Linear(dim, 4 * dim) # pointwise/1x1 convs, implemented with linear layers
         self.act = nn.GELU()
-        if use_grn:
+        if use_v2:
             self.grn = GRN(4 * dim, eps=eps)
         self.pwconv2 = nn.Linear(4 * dim, dim)
-        # self.gamma = nn.Parameter(layer_scale_init_value * torch.ones((dim)), 
-        #                             requires_grad=True) if layer_scale_init_value > 0 else None
+        if not use_v2:
+            self.gamma = nn.Parameter(layer_scale_init * torch.ones((dim)), requires_grad=True) if layer_scale_init > 0 else None
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-        self.use_grn = use_grn
+        self.use_v2 = use_v2
 
     def forward(
             self, 
@@ -50,11 +51,11 @@ class Block(nn.Module):
         x = self.norm(x)
         x = self.pwconv1(x)
         x = self.act(x)
-        if self.use_grn:
+        if self.use_v2:
             x = self.grn(x)
         x = self.pwconv2(x)
-        # if self.gamma is not None:
-        #     x = self.gamma * x
+        if not self.use_v2:
+            x = self.gamma * x
         x = x.permute(0, 4, 1, 2, 3) # (N, H, W, D, C) -> (N, C, H, W, D)
 
         x = inputs + self.drop_path(x)
@@ -78,11 +79,13 @@ class ConvNeXt3d(nn.Module):
             self, 
             in_chans: int = 3, 
             num_classes: int = 1000, 
+            kernel_size: int = 3,
             depths: list[int] = [3, 3, 9, 3], 
             dims: list[int] = [96, 192, 384, 768], 
             drop_path_rate: float = 0.0, 
-            use_grn: bool = False, 
-            eps: float = 1e-5
+            use_v2: bool = False, 
+            layer_scale_init: float = 1e-6,
+            eps: float = 1e-6
         ) -> None:
 
         super().__init__()
@@ -104,7 +107,8 @@ class ConvNeXt3d(nn.Module):
         cur = 0
         for i in range(4):
             stage = nn.Sequential(
-                *[Block(dim=dims[i], drop_path=dp_rates[cur + j], use_grn=use_grn, eps=eps
+                *[Block(
+                    dim=dims[i], kernel_size=kernel_size, drop_path=dp_rates[cur + j], use_v2=use_v2, layer_scale_init=layer_scale_init, eps=eps
                 ) for j in range(depths[i])]
             )
             self.stages.append(stage)
@@ -151,7 +155,7 @@ class LayerNorm(nn.Module):
     def __init__(
             self, 
             normalized_shape: int, 
-            eps: float = 1e-5, 
+            eps: float = 1e-6, 
             data_format: str = "channels_last"
         ) -> None:
 
@@ -184,7 +188,7 @@ class GRN(nn.Module):
     def __init__(
             self, 
             dim: int, 
-            eps: float = 1e-5
+            eps: float = 1e-6
         ) -> None:
 
         super().__init__()

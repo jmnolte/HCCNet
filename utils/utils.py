@@ -23,7 +23,7 @@ def cosine_scheduler(
 
     warmup_schedule = np.array([])
     if warmup_steps > 0:
-        warmup_schedule = np.linspace(start_warmup_value, base_value, warmup_steps)
+        warmup_schedule = np.linspace(final_value, base_value, warmup_steps)
 
     iters = np.arange(steps - warmup_steps)
     schedule = final_value + 0.5 * (base_value - final_value) * (1 + np.cos(np.pi * iters / len(iters)))
