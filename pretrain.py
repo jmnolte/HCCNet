@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List
+from typing import List, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -47,7 +47,7 @@ from monai.utils import set_determinism
 from data.transforms import PercentileSpatialCropd, YeoJohnsond, SoftClipIntensityd, ResampleToMatchFirstd, RandSelectChanneld
 from data.splits import GroupStratifiedSplit
 from data.utils import DatasetPreprocessor, convert_to_dict
-from models.convnext3d import convnext3d_atto, convnext3d_femto, convnext3d_pico, convnext3d_nano, convnext3d_tiny
+from models.convnext3d import convnext3d_femto, convnext3d_pico, convnext3d_nano, convnext3d_tiny
 from models.dinohead import DINOHead
 from losses.dinoloss import DINOLoss
 from utils.utils import cancel_gradients_last_layer, cosine_scheduler, get_params_groups, scale_learning_rate, MultiCropWrapper
@@ -73,6 +73,7 @@ class Pretrainer:
         self.teacher = teacher
         self.dataloaders = dataloaders
         self.num_steps = num_steps
+        self.num_folds = 1
         self.amp = amp
         self.suffix = suffix
         if self.suffix is None:
@@ -168,7 +169,7 @@ class Pretrainer:
             clip_grad: bool = True
         ) -> None:
 
-        for i, param_group in enumerate(self.optimizer.param_groups):
+        for i, param_group in enumerate(self.optim.param_groups):
             param_group['lr'] = self.lr_schedule[step]
             if i == 0:  # only the first group is regularized
                 param_group['weight_decay'] = self.wd_schedule[step]
@@ -196,49 +197,57 @@ class Pretrainer:
             self,
             accum_steps: int,
             warmup_steps: int,
-            log_every: int = 10
+            log_every: int = 10,
+            checkpoints: list = [2000, 4000, 8000, 16000, 32000]
         ) -> None:
 
         accum_loss = 0.0
         running_loss = 0.0
-
+        start_time = time.time()
         self.optim.zero_grad(set_to_none=True)
-        for train_epoch in range(self.num_steps * accum_steps // len(self.dataloaders['train']) + 1):
-            for train_step, train_batch in enumerate(self.dataloaders['train']):
 
-                step = train_epoch * len(self.dataloaders['train']) + train_step
+        for epoch in range(self.num_steps * accum_steps // len(self.dataloaders['train']) + 1):
+            for idx, batch in enumerate(self.dataloaders['train']):
+
+                step = epoch * len(self.dataloaders['train']) + idx
+                update_step = step // accum_steps
                 if self.gpu_id == 0 and step % (accum_steps * log_every) == 0:
                     print('-' * 15)
-                    print(f'Step {step}/{self.num_steps}')
+                    print(f'Step {update_step}/{self.num_steps}')
                     print('-' * 15)
-                accum_loss += self.pretraining_step(train_batch, step, accum_steps)
+
+                accum_loss += self.pretraining_step(batch, update_step, accum_steps)
 
                 if (step + 1) % accum_steps == 0:
-                    self.accumulation_step(step, warmup_steps, clip_grad=False)
+                    self.accumulation_step(update_step, warmup_steps, clip_grad=False)
                     if self.gpu_id == 0:
                         print(f"Step Loss: {accum_loss:.4f}")
                     running_loss += accum_loss
                     accum_loss = 0.0
-                    self.update_teacher(step)
+                    self.update_teacher(update_step)
 
                 if (step + 1) % (accum_steps * log_every) == 0:
-                    loss = torch.Tensor([running_loss])
+                    loss = torch.Tensor([running_loss / log_every])
                     running_loss = 0.0
-                    dist.reduce(loss.to(self.gpu_id), dst=0, op=dist.ReduceOp.AVG)
+                    dist.all_reduce(loss.to(self.gpu_id), op=dist.ReduceOp.AVG)
 
                     if self.gpu_id == 0:
                         self.log_dict(phase='train', keys='loss', values=loss)
-                        print(f"[GPU {self.gpu_id}] Step {step}/{self.num_steps}, Loss: {loss.item():.4f}")
+                        print(f"[GPU {self.gpu_id}] Step {update_step}/{self.num_steps}, Loss: {loss.item():.4f}")
 
-                if step == self.num_steps * accum_steps:
+                if (step + 1) / accum_steps in checkpoints:
+                    dist.barrier()
+                    if self.gpu_id == 0:
+                        self.save_output(self.teacher.module.state_dict(), 'weights', fold=int(step + 1))
+                    dist.barrier()
+
+                if (step + 1) == self.num_steps * accum_steps:
                     break
 
-        dist.barrier()
         if self.gpu_id == 0:
             time_elapsed = time.time() - start_time
             print(f'Pretraining finished in {time_elapsed // 60:.0f}min {time_elapsed % 60:.0f}sec')
             self.save_output(self.results_dict, 'history', fold=0)
-            self.save_output(self.student.state_dict(), 'weights', fold=0)
         dist.barrier()
 
     def visualize_training(
@@ -320,12 +329,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--local-crop-size", default=48, type=int, 
                         help="Local crop size to use. Defaults to 48.")
 
-    parser.add_argument("--kernel-size", default=3, type=int,
-                        help="Kernel size of convolutional downsampling layers. Defaults to 2.")
+    parser.add_argument("--arch", type=str, default='femto',
+                        help="ConvNeXT model architecture. Choices are femto, pico, nano, tiny. Defaults to femto.")
     parser.add_argument("--use-v2", action='store_true',
                         help="Whether to use ConvNext v1 or v2.")
-    parser.add_argument("--out-dim", default=128, type=int,
-                        help="Number of output classes. Defaults to 2.")
+    parser.add_argument("--kernel-size", default=3, type=int,
+                        help="Kernel size of convolutional downsampling layers. Defaults to 2.")
+    parser.add_argument("--out-dim", default=4096, type=int,
+                        help="Output dimensionality of projection head. Defaults to 4096")
     parser.add_argument("--norm-last-layer", action='store_true',
                         help="Whether to weight normalize the last layer of the DINO head.")
     parser.add_argument("--teacher-momentum", default=0.9995, type=float, 
@@ -373,8 +384,8 @@ def ssl_transforms(
         LoadImaged(keys=modalities, image_only=True, allow_missing_keys=True),
         EnsureChannelFirstd(keys=modalities, allow_missing_keys=True),
         Orientationd(keys=modalities, axcodes='PLI', allow_missing_keys=True),
-        Spacingd(keys=modalities, pixdim=image_spacing, mode='bilinear', allow_missing_keys=True),
-        ResampleToMatchFirstd(keys=modalities, mode='bilinear', allow_missing_keys=True),
+        Spacingd(keys=modalities, pixdim=image_spacing, mode=3, allow_missing_keys=True),
+        ResampleToMatchFirstd(keys=modalities, mode=3, allow_missing_keys=True),
         ConcatItemsd(keys=modalities, name='image', allow_missing_keys=True),
         PercentileSpatialCropd(
             keys='image',
@@ -382,7 +393,7 @@ def ssl_transforms(
             roi_size=(0.85, 0.8, 0.99),
             min_size=global_crop_size),
         CopyItemsd(keys='image', names='mask'),
-        Lambdad(keys='mask', func=lambda x: x[0:1]),
+        Lambdad(keys='mask', func=lambda x: x[:1]),
         Lambdad(keys='mask', func=lambda x: torch.where(x > torch.mean(x), 1, 0)),
         KeepLargestConnectedComponentd(keys='mask', connectivity=1),
         CropForegroundd(
@@ -450,6 +461,7 @@ def load_pretrain_data(
             device=device,
             global_crop_size=ensure_tuple_rep(args.global_crop_size, 3),
             local_crop_size=ensure_tuple_rep(args.local_crop_size, 3)),
+        cache_rate=1.0,
         num_workers=8,
         copy_cache=False
         ) for x in phases}
@@ -494,6 +506,32 @@ def load_pretrain_objs(
     schedules = [lr_schedule, wd_schedule, m_schedule]
     return loss_fn, optimizer, schedules
 
+def load_models(
+        args: argparse.Namespace
+    ) -> Tuple[nn.Module]:
+
+    if args.arch == 'femto':
+        student = convnext3d_femto(
+            in_chans=1, kernel_size=args.kernel_size, drop_path_rate=args.stochastic_depth, use_v2=args.use_v2, eps=args.epsilon)
+        teacher = convnext3d_femto(
+            in_chans=1, kernel_size=args.kernel_size, use_v2=args.use_v2, eps=args.epsilon)
+    elif args.arch == 'pico':
+        student = convnext3d_pico(
+            in_chans=1, kernel_size=args.kernel_size, drop_path_rate=args.stochastic_depth, use_v2=args.use_v2, eps=args.epsilon)
+        teacher = convnext3d_pico(
+            in_chans=1, kernel_size=args.kernel_size, use_v2=args.use_v2, eps=args.epsilon)
+    elif args.arch == 'nano':
+        student = convnext3d_nano(
+            in_chans=1, kernel_size=args.kernel_size, drop_path_rate=args.stochastic_depth, use_v2=args.use_v2, eps=args.epsilon)
+        teacher = convnext3d_nano(
+            in_chans=1, kernel_size=args.kernel_size, use_v2=args.use_v2, eps=args.epsilon)
+    elif args.arch == 'tiny':
+        student = convnext3d_tiny(
+            in_chans=1, kernel_size=args.kernel_size, drop_path_rate=args.stochastic_depth, use_v2=args.use_v2, eps=args.epsilon)
+        teacher = convnext3d_tiny(
+            in_chans=1, kernel_size=args.kernel_size, use_v2=args.use_v2, eps=args.epsilon)
+    return student, teacher
+
 def setup() -> None:
 
     '''
@@ -528,23 +566,12 @@ def main(
     num_devices = torch.cuda.device_count()
     device_id = rank % num_devices
     accum_steps = args.effective_batch_size // args.batch_size // num_devices
-    batch_size_gpu = args.batch_size * accum_steps
-    learning_rate = scale_learning_rate(batch_size_gpu, num_devices)
+    learning_rate = scale_learning_rate(args.effective_batch_size)
     version = 'v2' if args.use_v2 else 'v1'
 
     dataloader = load_pretrain_data(args, device_id)
     set_track_meta(False)
-    student = convnext3d_femto(
-        in_chans=1, 
-        kernel_size=args.kernel_size,
-        drop_path_rate=args.stochastic_depth,
-        use_v2=args.use_v2,
-        eps=args.epsilon)
-    teacher = convnext3d_femto(
-        in_chans=1, 
-        kernel_size=args.kernel_size,
-        use_v2=args.use_v2,
-        eps=args.epsilon)
+    student, teacher = load_models(args)
     embed_dim = student.head.in_features
     student = MultiCropWrapper(
         student,
@@ -577,7 +604,7 @@ def main(
         print('-' * 15)
         print(f'Model pretraining is initialized using the following parameters:')
         print(f'- AdamW optimizer with cosine learning rate ({learning_rate} to {args.min_learning_rate}), weight decay ({args.weight_decay} to {args.max_weight_decay}), and momentum ({args.teacher_momentum} to {1.0}) decay.')
-        print(f'- Model is ConvNext{version} using a {args.kernel_size}^3 downsampling kernel and projection head of dimensionality {args.out_dim}.') 
+        print(f'- Model is ConvNext{version} {args.arch} using a {args.kernel_size}^3 downsampling kernel and projection head of dimensionality {args.out_dim}.') 
         print(f'- The teacher temperature ranges from ({args.teacher_warmup_temp} to {args.teacher_temp} in {args.warmup_steps} steps), stochastic depth rate is set to {args.stochastic_depth}, and epislon to {args.epsilon}.')
         print(f'- Pretraining is set to {args.num_steps} steps with {args.warmup_steps} warm-up steps, a batch size of {batch_size_gpu} per GPU and a effective batch size of {args.effective_batch_size}.')
         print(f'Starting DINO pretraining...')

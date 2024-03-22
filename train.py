@@ -65,7 +65,6 @@ from models.mednet import MedNet
 from models.convnext3d import convnext3d_atto, convnext3d_femto, convnext3d_pico, convnext3d_nano, convnext3d_tiny
 from losses.focalloss import FocalLoss
 from losses.binaryceloss import BinaryCELoss
-from optimizer.adams import AdamS
 
 
 class Trainer:
@@ -268,16 +267,18 @@ class Trainer:
         accum_loss = 0.0
         running_train_loss = 0.0
         best_metric = 0.0
-
         self.optim.zero_grad(set_to_none=True)
-        for train_epoch in range(self.num_steps * accum_steps // len(self.dataloaders['train']) + 1):
-            for train_step, train_batch in enumerate(self.dataloaders['train']):
 
-                step = train_epoch * len(self.dataloaders['train']) + train_step
+        for epoch in range(self.num_steps * accum_steps // len(self.dataloaders['train']) + 1):
+            for idx, train_batch in enumerate(self.dataloaders['train']):
+
+                step = epoch * len(self.dataloaders['train']) + idx
+                update_step = step // accum_steps
                 if self.gpu_id == 0 and step % (accum_steps * val_steps) == 0:
                     print('-' * 15)
                     print(f'Step {step}/{self.num_steps}')
                     print('-' * 15)
+
                 accum_loss += self.training_step(train_batch, batch_size, accum_steps)
 
                 if (step + 1) % accum_steps == 0:
@@ -295,7 +296,7 @@ class Trainer:
                     train_loss = running_train_loss / val_steps
                     running_train_loss = 0.0
                     val_loss = torch.Tensor([running_val_loss / len(self.dataloaders['val'])])
-                    dist.reduce(val_loss.to(self.gpu_id), dst=0, op=dist.ReduceOp.AVG)
+                    dist.all_reduce(val_loss.to(self.gpu_id), op=dist.ReduceOp.AVG)
                     train_results = self.train_metrics.compute()
                     val_results = self.val_metrics.compute()
                     self.train_metrics.reset()
@@ -314,10 +315,10 @@ class Trainer:
                         best_loss = val_loss
                         best_auprc = val_results['val_BinaryAveragePrecision']
                         best_auroc = val_results['val_BinaryAUROC']
-                        dist_barrier()
+                        dist.barrier()
                         if self.gpu_id == 0:
                             print(f'[GPU {self.gpu_id}] New best Validation Loss: {best_loss:.4f} and Metric: {val_metric:.4f}. Saving model weights...')
-                            self.save_output(self.model.state_dict(), 'weights', fold)
+                            self.save_output(self.model.module.state_dict(), 'weights', fold)
                         dist.barrier()
 
                 if step == self.num_steps * accum_steps:

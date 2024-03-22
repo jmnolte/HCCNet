@@ -46,12 +46,11 @@ def get_params_groups(model):
     return [{'params': regularized}, {'params': not_regularized, 'weight_decay': 0.}]
 
 def scale_learning_rate(
-        batch_size: int,
-        num_devices: int
+        batch_size: int
     ) -> float:
 
     alpha = {8: 0.0001, 16: 0.000141, 32: 0.0002, 64: 0.000282, 128: 0.0004, 256: 0.000565, 512: 0.0008}
-    return alpha[batch_size] * np.sqrt(batch_size * num_devices) / np.sqrt(128)
+    return alpha[batch_size] * np.sqrt(batch_size) / np.sqrt(128)
 
 class MultiCropWrapper(nn.Module):
     """
