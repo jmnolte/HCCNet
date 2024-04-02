@@ -331,31 +331,38 @@ class Trainer:
             self.save_output(self.results_dict, 'history', fold)
             
     @staticmethod
-    def prep_batch(
-            data: dict, 
-            batch_size: int, 
-            device_id: torch.device | None = None, 
-            normalize: bool = True
-        ) -> tuple:
+    def prep_batch(data: dict, batch_size: int, pretrain: bool = False) -> tuple:
 
-        stats_dict = {'min': 18.0, 'max': 100.0}
         B, C, H, W, D = data['image'].shape
+        seq_length = B // batch_size
         for key in data:
             if key == 'image':
-                data[key] = data[key].reshape(batch_size, B // batch_size, C, H, W, D)
+                data[key] = data[key].reshape(batch_size, seq_length, C, H, W, D)
             elif not isinstance(data[key], list):
                 try:
-                    data[key] = data[key].reshape(batch_size, B // batch_size)
+                    data[key] = data[key].reshape(batch_size, seq_length)
                 except:
                     pass
-        data['label'] = torch.max(data['label'], dim=1).values
-        data['age'] = torch.where(data['age'] != 0.0, (data['age'] - stats_dict['min']) / (stats_dict['max'] - stats_dict['min']), 0.0) if normalize else data['age']
-        mask = torch.where(data['age'] == 0.0, 1, 0)
-
-        if device_id is not None:
-            return data['image'].to(device_id), data['label'].to(device_id, dtype=torch.int), data['age'].to(device_id, dtype=torch.float), mask.to(device_id, dtype=torch.float)
+        data['age'] = torch.where(data['age'] != 0.0, data['age'].int(), 99)
+        padding_mask = torch.where(data['age'] == 99, 1, 0)
+        pad_idx = torch.argmax(padding_mask, dim=1)
+        pad_idx = torch.where(pad_idx == 0, seq_length, pad_idx)
+        for key in ['etiology', 'sex']:
+            data[key] = torch.max(data[key], dim=1).values
+            data[key] = data[key].unsqueeze(-1).expand(-1, seq_length)
+        if pretrain:
+            data['label'] = torch.zeros(batch_size)
+            for i in range(batch_size):
+                rand_gen = torch.rand(1)
+                if rand_gen < 0.6:
+                    shuffled_idx = torch.randperm(pad_idx[i])
+                    sorted_idx = torch.sort(shuffled_idx).values
+                    data['image'][i, :pad_idx[i]] = data['image'][i, shuffled_idx]
+                    data['age'][i, :pad_idx[i]] = data['age'][i, shuffled_idx]
+                    data['label'][i] = 0 if shuffled_idx.equal(sorted_idx) else 1
         else:
-            return data['image'], data['label'].to(torch.int), data['age'].to(torch.float), mask.to(torch.float)
+            data['label'] = torch.max(data['label'], dim=1).values
+        return data['image'], data['label'], data['age'], data['etiology'], data['sex'], padding_mask
 
     @staticmethod
     def calc_weight(

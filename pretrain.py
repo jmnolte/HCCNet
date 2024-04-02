@@ -46,9 +46,11 @@ from monai.utils.misc import ensure_tuple_rep
 from monai.utils import set_determinism
 from data.transforms import PercentileSpatialCropd, YeoJohnsond, SoftClipIntensityd, ResampleToMatchFirstd, RandSelectChanneld
 from data.splits import GroupStratifiedSplit
-from data.utils import DatasetPreprocessor, convert_to_dict
+from data.datasets import CacheSeqDataset
+from data.utils import DatasetPreprocessor, convert_to_dict, convert_to_seqdict, SequenceBatchCollater
 from models.convnext3d import convnext3d_femto, convnext3d_pico, convnext3d_nano, convnext3d_tiny
 from models.dinohead import DINOHead
+from models.mednet import MedNet
 from losses.dinoloss import DINOLoss
 from utils.utils import cancel_gradients_last_layer, cosine_scheduler, get_params_groups, scale_learning_rate, MultiCropWrapper
 
@@ -56,8 +58,7 @@ class Pretrainer:
 
     def __init__(
             self,
-            student: nn.Module,
-            teacher: nn.Module,
+            model: nn.Module | List[nn.Module],
             loss_fn: nn.Module,
             dataloaders: dict,
             optimizer: optim,
@@ -69,8 +70,13 @@ class Pretrainer:
         ) -> None:
 
         self.gpu_id = int(os.environ['LOCAL_RANK'])
-        self.student = student
-        self.teacher = teacher
+        if isinstance(model, list):
+            self.student = model[0]
+            self.teacher = model[1]
+            self.pretrain_encoder = True
+        else:
+            self.model = model
+            self.pretrain_encoder = False
         self.dataloaders = dataloaders
         self.num_steps = num_steps
         self.num_folds = 1
@@ -83,9 +89,14 @@ class Pretrainer:
             raise ValueError('Please specify a path to the data directory.')
         self.scaler = GradScaler(enabled=amp)
 
-        self.dino_loss = loss_fn.to(self.gpu_id)
+        self.loss_fn = loss_fn.to(self.gpu_id)
         self.optim = optimizer
-        self.lr_schedule, self.wd_schedule, self.m_schedule = scheduler[0], scheduler[1], scheduler[2]
+        if self.pretrain_encoder:
+            self.lr_schedule, self.wd_schedule, self.m_schedule = scheduler[0], scheduler[1], scheduler[2]
+            self.params = self.student.parameters()
+        else:
+            self.lr_schedule, self.wd_schedule = scheduler[0], scheduler[1]
+            self.params = self.model.parameters()
         self.results_dict = {dataset: {metric: [] for metric in ['loss']} for dataset in ['train']}
 
     def save_output(
@@ -141,7 +152,7 @@ class Pretrainer:
         for key, value in zip(keys, values):
             self.results_dict[phase][key].append(value)
 
-    def pretraining_step(
+    def encoder_step(
             self,
             batch: dict,
             step: int,
@@ -156,7 +167,25 @@ class Pretrainer:
         with autocast(enabled=self.amp):
             student_logits = self.student(views)
             teacher_logits = self.teacher(views[:2])
-            loss = self.dino_loss(step, student_logits, teacher_logits)
+            loss = self.loss_fn(step, student_logits, teacher_logits)
+            loss /= accum_steps
+        self.scaler.scale(loss).backward()
+
+        return loss.item()
+
+    def decoder_step(
+            self,
+            batch: dict,
+            accum_steps: int
+        ) -> float:
+
+        self.model.train()
+        inputs, labels, pt_info, padding_mask = self.prep_batch(batch, batch_size=batch_size, pretrain=True)
+        inputs, labels, padding_mask = inputs.to(self.gpu_id), labels.to(self.gpu_id), padding_mask.to(self.gpu_id)
+        pt_info = [info.to(self.gpu_id) for info in pt_info]
+        with autocast(enabled=self.amp):
+            logits = self.model(inputs, padding_mask=padding_mask, pt_info=pt_info)
+            loss = self.loss_fn(logits.squeeze(-1), labels.float())
             loss /= accum_steps
         self.scaler.scale(loss).backward()
 
@@ -176,8 +205,9 @@ class Pretrainer:
 
         if clip_grad:
             self.scaler.unscale_(self.optim)
-            nn.utils.clip_grad_norm_(self.student.parameters(), max_norm=1.0, norm_type=2)
-        cancel_gradients_last_layer(self.student, step=step, warmup_steps=warmup_steps)
+            nn.utils.clip_grad_norm_(self.params, max_norm=1.0, norm_type=2)
+        if self.pretrain_encoder:
+            cancel_gradients_last_layer(self.student, step=step, warmup_steps=warmup_steps)
 
         self.scaler.step(self.optim)
         self.scaler.update()
@@ -197,8 +227,7 @@ class Pretrainer:
             self,
             accum_steps: int,
             warmup_steps: int,
-            log_every: int = 10,
-            checkpoints: list = [2000, 4000, 8000, 16000, 32000]
+            log_every: int = 10
         ) -> None:
 
         accum_loss = 0.0
@@ -216,7 +245,10 @@ class Pretrainer:
                     print(f'Step {update_step}/{self.num_steps}')
                     print('-' * 15)
 
-                accum_loss += self.pretraining_step(batch, update_step, accum_steps)
+                if self.pretrain_encoder:
+                    accum_loss += self.encoder_step(batch, update_step, accum_steps)
+                else:
+                    accum_loss += self.decoder_step(batch, accum_steps)
 
                 if (step + 1) % accum_steps == 0:
                     self.accumulation_step(update_step, warmup_steps, clip_grad=False)
@@ -224,7 +256,8 @@ class Pretrainer:
                         print(f"Step Loss: {accum_loss:.4f}")
                     running_loss += accum_loss
                     accum_loss = 0.0
-                    self.update_teacher(update_step)
+                    if self.pretrain_encoder:
+                        self.update_teacher(update_step)
 
                 if (step + 1) % (accum_steps * log_every) == 0:
                     loss = torch.Tensor([running_loss / log_every])
@@ -235,10 +268,11 @@ class Pretrainer:
                         self.log_dict(phase='train', keys='loss', values=loss)
                         print(f"[GPU {self.gpu_id}] Step {update_step}/{self.num_steps}, Loss: {loss.item():.4f}")
 
-                if (step + 1) / accum_steps in checkpoints:
+                if (step + 1) / accum_steps % 1000 == 0:
                     dist.barrier()
                     if self.gpu_id == 0:
-                        self.save_output(self.teacher.module.state_dict(), 'weights', fold=int(step + 1))
+                        model_weights = self.teacher.module.state_dict() if self.pretrain_encoder else self.model.module.state_dict()
+                        self.save_output(model_weights, 'weights', fold=int(update_step + 1))
                     dist.barrier()
 
                 if (step + 1) == self.num_steps * accum_steps:
@@ -249,6 +283,40 @@ class Pretrainer:
             print(f'Pretraining finished in {time_elapsed // 60:.0f}min {time_elapsed % 60:.0f}sec')
             self.save_output(self.results_dict, 'history', fold=0)
         dist.barrier()
+
+    @staticmethod
+    def prep_batch(data: dict, batch_size: int, pretrain: bool = False) -> tuple:
+
+        B, C, H, W, D = data['image'].shape
+        seq_length = B // batch_size
+        for key in data:
+            if key == 'image':
+                data[key] = data[key].reshape(batch_size, seq_length, C, H, W, D)
+            elif not isinstance(data[key], list):
+                try:
+                    data[key] = data[key].reshape(batch_size, seq_length)
+                except:
+                    pass
+        padding_mask = torch.where(data['age'] == 0.0, 1, 0)
+        pad_idx = torch.argmax(padding_mask, dim=1)
+        pad_idx = torch.where(pad_idx == 0, seq_length, pad_idx)
+        for key in ['etiology', 'sex']:
+            data[key] = torch.max(data[key], dim=1).values
+            data[key] = data[key].unsqueeze(-1).expand(-1, seq_length)
+        if pretrain:
+            data['label'] = torch.zeros(batch_size)
+            for i in range(batch_size):
+                rand_gen = torch.rand(1)
+                if rand_gen < 0.66:
+                    shuffled_idx = torch.randperm(pad_idx[i])
+                    sorted_idx = torch.sort(shuffled_idx).values
+                    data['image'][i, :pad_idx[i]] = data['image'][i, shuffled_idx]
+                    data['age'][i, :pad_idx[i]] = data['age'][i, shuffled_idx]
+                    data['label'][i] = 0 if shuffled_idx.equal(sorted_idx) else 1
+        else:
+            data['label'] = torch.max(data['label'], dim=1).values
+        pt_info = [data['age'], data['etiology'], data['sex']]
+        return data['image'], data['label'], pt_info, padding_mask
 
     def visualize_training(
             self, 
@@ -320,8 +388,10 @@ def parse_args() -> argparse.Namespace:
                         help="Initial weight decay value. Defaults to 0.05.")
     parser.add_argument("--max-weight-decay", default=0.5, type=float, 
                         help="Final weight decay value. Defaults to 0.5.")
-    parser.add_argument("--stochastic-depth", default=0, type=float, 
+    parser.add_argument("--stochastic-depth", default=0.0, type=float, 
                         help="Stochastic depth rate to use for training. Defaults to 0.")
+    parser.add_argument("--dropout", default=0.0, type=float, 
+                        help="Dropout rate to use for training. Defaults to 0.")
     parser.add_argument("--epsilon", default=1e-5, type=float, 
                         help="Epsilon value to use for norm layers. Defaults to 1e-5.")
     parser.add_argument("--global-crop-size", default=72, type=int, 
@@ -329,6 +399,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--local-crop-size", default=48, type=int, 
                         help="Local crop size to use. Defaults to 48.")
 
+    parser.add_argument("--pretrain-encoder", action='store_true',
+                        help="Whether to only pretrain the CNN backbone.")
     parser.add_argument("--arch", type=str, default='femto',
                         help="ConvNeXT model architecture. Choices are femto, pico, nano, tiny. Defaults to femto.")
     parser.add_argument("--use-v2", action='store_true',
@@ -364,7 +436,7 @@ def parse_args() -> argparse.Namespace:
                         help="Path to results directory")
     return parser.parse_args()
 
-def ssl_transforms(
+def encoder_transforms(
         modalities: list,
         device: torch.device,
         global_crop_size: tuple = (72, 72, 72),
@@ -435,49 +507,138 @@ def ssl_transforms(
     ]
     return Compose(prep + global_crop + local_crop + post)
 
+def decoder_transforms(
+        modalities: list,
+        device: torch.device,
+        crop_size: tuple = (72, 72, 72),
+        image_spacing: tuple = (1.5, 1.5, 1.5)
+    ) -> monai.transforms:
+
+    '''
+    Perform data transformations on image and image labels.
+
+    Args:
+        dataset (str): Dataset to apply transformations on. Can be 'train', 'val' or 'test'.
+
+    Returns:
+        transforms (monai.transforms): Data transformations to be applied.
+    '''
+    transforms = [
+        LoadImaged(keys=modalities, image_only=True),
+        EnsureChannelFirstd(keys=modalities),
+        Orientationd(keys=modalities, axcodes='PLI'),
+        Spacingd(keys=modalities, pixdim=image_spacing, mode=3),
+        ResampleToMatchd(keys=modalities, key_dst=modalities[0], mode=3),
+        PercentileSpatialCropd(
+            keys=modalities,
+            roi_center=(0.5, 0.5, 0.5),
+            roi_size=(0.85, 0.8, 0.99),
+            min_size=crop_size),
+        CopyItemsd(keys=modalities[0], names='mask'),
+        Lambdad(
+            keys='mask', 
+            func=lambda x: torch.where(x > torch.mean(x), 1, 0)),
+        KeepLargestConnectedComponentd(keys='mask', connectivity=1),
+        CropForegroundd(
+            keys=modalities,
+            source_key='mask',
+            select_fn=lambda x: x > 0,
+            k_divisible=1,
+            allow_smaller=False),
+        ConcatItemsd(keys=modalities, name='image'),
+        DeleteItemsd(keys=modalities + ['mask']),
+        YeoJohnsond(keys='image', lmbda=0.1, channel_wise=True),
+        NormalizeIntensityd(keys='image', channel_wise=True),
+        PercentileSpatialCropd(
+            keys='image',
+            roi_center=(0.45, 0.25, 0.3),
+            roi_size=(0.6, 0.45, 0.4),
+            min_size=crop_size),
+        SoftClipIntensityd(keys='image', min_value=-3.0, max_value=3.0, channel_wise=True)
+        EnsureTyped(keys='image', track_meta=False, device=device, dtype=torch.float),
+        SpatialPadd(keys='image', spatial_size=crop_size, method='symmetric')
+        RandSpatialCropd(keys='image', roi_size=crop_size, random_size=False),
+        RandFlipd(keys='image', prob=0.5, spatial_axis=0),
+        RandFlipd(keys='image', prob=0.5, spatial_axis=1),
+        RandFlipd(keys='image', prob=0.5, spatial_axis=2),
+        RandRotate90d(keys='image', prob=0.5),
+        RandScaleIntensityd(keys='image', prob=1.0, factors=0.1),
+        RandShiftIntensityd(keys='image', prob=1.0, offsets=0.1),
+        NormalizeIntensityd(
+            keys='image', 
+            subtrahend=(0.4467, 0.4416, 0.4409, 0.4212),
+            divisor=(0.6522, 0.6429, 0.6301, 0.6041),
+            channel_wise=True)
+    ]
+    return Compose(transforms)
+
 def load_pretrain_data(
         args: argsparse.Namespace,
         device: torch.device
     ) -> tuple:
     
     phases = ['train']
-    data_dict, label_df = DatasetPreprocessor(data_dir=args.data_dir).load_data(modalities=args.mod_list, keys=['label','age'], file_name='labels.csv', verbose=False)
-    ssl_dict, ssl_df = DatasetPreprocessor(data_dir=args.data_dir, partial=True).load_data(modalities=args.mod_list, keys=['age'], file_name='nolabels.csv')
+    data_dict, label_df = DatasetPreprocessor(
+        data_dir=args.data_dir).load_data(
+            modalities=args.mod_list, keys=['label','age','etiology','sex'], file_name='labels.csv', verbose=False)
+    ssl_dict, ssl_df = DatasetPreprocessor(
+        data_dir=args.data_dir, partial=(True if args.pretrain_encoder else False), no_labels=True).load_data(
+            modalities=args.mod_list, keys=['age','etiology','sex'], file_name='nolabels.csv')
     dev, test = GroupStratifiedSplit(split_ratio=0.75).split_dataset(label_df)
     ssl_test = ssl_df[ssl_df['patient_id'].isin(test['patient_id'])]
     ssl_dev = ssl_df[-ssl_df['patient_id'].isin(ssl_test['patient_id'])]
     split_dict = convert_to_dict([ssl_dev], data_dict=ssl_dict, split_names=phases, verbose=False)
-
+    seq_split_dict = convert_to_seqdict(split_dict, args.mod_list, phases)
     split_dict = {x: partition_dataset(
-        data=split_dict[x],
+        data=split_dict[x] if args.pretrain_encoder else seq_split_dict[x][0],
         num_partitions=dist.get_world_size(),
         shuffle=True,
-        even_divisible=(True if x == 'train' else False)
+        even_divisible=True
         )[dist.get_rank()] for x in phases}
-    datasets = {x: CacheDataset(
-        data=split_dict[x], 
-        transform=ssl_transforms(
-            modalities=args.mod_list, 
-            device=device,
-            global_crop_size=ensure_tuple_rep(args.global_crop_size, 3),
-            local_crop_size=ensure_tuple_rep(args.local_crop_size, 3)),
-        cache_rate=1.0,
-        num_workers=8,
-        copy_cache=False
-        ) for x in phases}
-    dataloader = {x: ThreadDataLoader(
-        dataset=datasets[x], 
-        batch_size=(args.batch_size if x == 'train' else 1), 
-        shuffle=(True if x == 'train' else False),   
-        num_workers=0,
-        drop_last=(True if x == 'train' else False)
-        ) for x in phases}
 
+    if args.pretrain_encoder:
+        datasets = {x: CacheDataset(
+            data=split_dict[x], 
+            transform=encoder_transforms(
+                modalities=args.mod_list, 
+                device=device,
+                global_crop_size=ensure_tuple_rep(args.global_crop_size, 3),
+                local_crop_size=ensure_tuple_rep(args.local_crop_size, 3)),
+            num_workers=8,
+            copy_cache=False
+            ) for x in phases}
+        dataloader = {x: ThreadDataLoader(
+            dataset=datasets[x], 
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=0,
+            drop_last=True
+            ) for x in phases}
+    else:
+        datasets = {x: CacheSeqDataset(
+            data=split_dict[x], 
+            transform=decoder_transforms(
+                modalities=args.mod_list, 
+                device=device,
+                crop_size=ensure_tuple_rep(args.global_crop_size, 3)),
+            num_workers=8,
+            copy_cache=False
+            ) for x in phases}
+        dataloader = {x: ThreadDataLoader(
+            dataset=datasets[x], 
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=0,
+            drop_last=True
+            collate_fn=(SequenceBatchCollater(
+                keys=['image','label','age','etiology','sex'], 
+                seq_length=7))
+            ) for x in phases}
     return dataloader
 
 def load_pretrain_objs(
         args: argparse.Namespace,
-        student: nn.Module,
+        model: nn.Module,
         learning_rate: float = 1e-4
     ) -> tuple:
 
@@ -487,8 +648,9 @@ def load_pretrain_objs(
         num_steps=args.num_steps,
         teacher_temp=args.teacher_temp,
         teacher_warmup_temp=args.teacher_warmup_temp,
-        teacher_warmup_steps=args.warmup_steps)
-    params = get_params_groups(student)
+        teacher_warmup_steps=int(args.warmup_steps * 4)
+    ) if args.pretrain_encoder else nn.BCEWithLogitsLoss()
+    params = get_params_groups(model)
     optimizer = optim.AdamW(params, lr=learning_rate, weight_decay=args.weight_decay)
     lr_schedule = cosine_scheduler(
         base_value=learning_rate,
@@ -503,10 +665,10 @@ def load_pretrain_objs(
         base_value=args.teacher_momentum,
         final_value=1,
         steps=args.num_steps)
-    schedules = [lr_schedule, wd_schedule, m_schedule]
+    schedules = [lr_schedule, wd_schedule, m_schedule] if args.pretrain_encoder else [lr_schedule, wd_schedule]
     return loss_fn, optimizer, schedules
 
-def load_models(
+def load_encoder(
         args: argparse.Namespace
     ) -> Tuple[nn.Module]:
 
@@ -531,6 +693,19 @@ def load_models(
         teacher = convnext3d_tiny(
             in_chans=1, kernel_size=args.kernel_size, use_v2=args.use_v2, eps=args.epsilon)
     return student, teacher
+
+def load_weights(
+        weights_path: str
+    ) -> dict:
+
+    weights = torch.load(weights_path, map_location='cpu')
+    for key in list(weights.keys()):
+        if 'backbone.' in key:
+            weights[key.replace('backbone.', '')] = weights.pop(key)
+        if 'head.' in key:
+            weights.pop(key)
+    weights['downsample_layers.0.0.weight'] = weights['downsample_layers.0.0.weight'].repeat(1, 4, 1, 1, 1)
+    return weights
 
 def setup() -> None:
 
@@ -571,26 +746,43 @@ def main(
 
     dataloader = load_pretrain_data(args, device_id)
     set_track_meta(False)
-    student, teacher = load_models(args)
-    embed_dim = student.head.in_features
-    student = MultiCropWrapper(
-        student,
-        DINOHead(embed_dim, args.out_dim, norm_last_layer=args.norm_last_layer))
-    teacher = MultiCropWrapper(
-        teacher,
-        DINOHead(embed_dim, args.out_dim))
-    student, teacher = student.to(device_id), teacher.to(device_id)
-    if args.distributed:
-        student = nn.parallel.DistributedDataParallel(student, device_ids=[device_id])
-        teacher = nn.parallel.DistributedDataParallel(teacher, device_ids=[device_id])
-    teacher.load_state_dict(student.state_dict())
-    for p in teacher.parameters():
-        p.requires_grad = False
-    loss_fn, optimizer, schedules = load_pretrain_objs(args, student, learning_rate)
+    if args.pretrain_encoder:
+        student, teacher = load_encoder(args)
+        embed_dim = student.head.in_features
+        student = MultiCropWrapper(
+            student,
+            DINOHead(embed_dim, args.out_dim, norm_last_layer=args.norm_last_layer))
+        teacher = MultiCropWrapper(
+            teacher,
+            DINOHead(embed_dim, args.out_dim))
+        student, teacher = student.to(device_id), teacher.to(device_id)
+        if args.distributed:
+            student = nn.parallel.DistributedDataParallel(student, device_ids=[device_id])
+            teacher = nn.parallel.DistributedDataParallel(teacher, device_ids=[device_id])
+        teacher.load_state_dict(student.state_dict())
+        for p in teacher.parameters():
+            p.requires_grad = False
+        model = [student, teacher]
+        loss_fn, optimizer, schedules = load_pretrain_objs(args, student, learning_rate)
+    else:
+        backbone, _ load_encoder(args)
+        model = MedNet(
+            backbone=backbone, 
+            num_classes=1,
+            max_len=16,
+            dropout=args.dropout,
+            eps=args.eps)
+        weights = load_weights(os.path.join(args.results_dir, 'model_weights/weights_fold8000_dmri_tiny_v1.pth'))
+        model.backbone.load_state_dict(weights, strict=False)
+        model = model.to(device_id)
+        if args.distributed:
+            model = nn.parallel.DistributedDataParallel(model, device_ids=[device_id])
+        for p in model.backbone.parameters():
+            p.requires_grad = False
+        loss_fn, optimizer, schedules = load_pretrain_objs(args, model, learning_rate)
 
     pretrainer = Pretrainer(
-        student=student,
-        teacher=teacher,
+        model=model,
         loss_fn=loss_fn,
         dataloaders=dataloader,
         optimizer=optimizer,
@@ -604,10 +796,15 @@ def main(
         print('-' * 15)
         print(f'Model pretraining is initialized using the following parameters:')
         print(f'- AdamW optimizer with cosine learning rate ({learning_rate} to {args.min_learning_rate}), weight decay ({args.weight_decay} to {args.max_weight_decay}), and momentum ({args.teacher_momentum} to {1.0}) decay.')
-        print(f'- Model is ConvNext{version} {args.arch} using a {args.kernel_size}^3 downsampling kernel and projection head of dimensionality {args.out_dim}.') 
-        print(f'- The teacher temperature ranges from ({args.teacher_warmup_temp} to {args.teacher_temp} in {args.warmup_steps} steps), stochastic depth rate is set to {args.stochastic_depth}, and epislon to {args.epsilon}.')
-        print(f'- Pretraining is set to {args.num_steps} steps with {args.warmup_steps} warm-up steps, a batch size of {batch_size_gpu} per GPU and a effective batch size of {args.effective_batch_size}.')
-        print(f'Starting DINO pretraining...')
+        print(f'- Pretraining is set to {args.num_steps} steps with {args.warmup_steps} warm-up steps, an effective batch size of {args.effective_batch_size}, and a world size of {num_devices}.')
+        if args.pretrain_encoder:
+            print(f'- Model is ConvNeXt{version} {args.arch} using a {args.kernel_size}^3 downsampling kernel and projection head of dimensionality {args.out_dim}.') 
+            print(f'- The teacher temperature ranges from ({args.teacher_warmup_temp} to {args.teacher_temp} in {args.warmup_steps} steps), stochastic depth rate is set to {args.stochastic_depth}, and epsilon to {args.epsilon}.')
+            print(f'Starting DINO pretraining...')
+        else:
+            print(f'- Model consists of ConvNeXt{version} {args.arch} encoder and Transformer decoder.')
+            print(f'- The stochastic depth rate is set to {args.stochastic_depth}, dropout rate to {args.dropout}, and epsilon to {args.epsilon}.')
+            print(f'Starting Decoder pretraining...')
 
     pretrainer.pretrain(accum_steps, args.warmup_steps // 10)
     pretrainer.visualize_training('train', 'loss')
