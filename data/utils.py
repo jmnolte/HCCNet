@@ -89,7 +89,8 @@ class DatasetPreprocessor:
     def __init__(
             self,
             data_dir: str,
-            partial: bool = False
+            partial: bool = False,
+            no_labels: bool = False
         ) -> None:
         '''
         Initialize the dataset preprocessor class.
@@ -105,6 +106,7 @@ class DatasetPreprocessor:
         self.nifti_patients = glob(os.path.join(self.nifti_dir, '*'), recursive = True)
         self.label_dir = os.path.join(data_dir, 'labels')
         self.partial = partial
+        self.no_labels = no_labels
 
     def assert_observation_completeness(
             self,
@@ -241,7 +243,7 @@ class DatasetPreprocessor:
                 keys_to_remove = [key for key, value in patient.items() if value == []]
                 for key in keys_to_remove:
                     del patient[key]
-        else:
+        if not self.no_labels:
             data_dict = [patient for patient in data_dict if not (patient['label'] == None)]
 
         return data_dict, label_df
