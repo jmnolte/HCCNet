@@ -46,7 +46,7 @@ from monai.transforms import (
     KeepLargestConnectedComponentd,
     Lambdad,
     NormalizeIntensityd,
-    Resized
+    SpatialPadd
 )
 from monai import transforms
 from monai.data import (
@@ -56,6 +56,7 @@ from monai.data import (
     partition_dataset_classes,
     list_data_collate
 )
+from monai.utils.misc import ensure_tuple_rep
 from monai.utils import set_determinism
 from data.transforms import PercentileSpatialCropd, YeoJohnsond, SoftClipIntensityd
 from data.splits import GroupStratifiedSplit
@@ -65,6 +66,7 @@ from models.mednet import MedNet
 from models.convnext3d import convnext3d_atto, convnext3d_femto, convnext3d_pico, convnext3d_nano, convnext3d_tiny
 from losses.focalloss import FocalLoss
 from losses.binaryceloss import BinaryCELoss
+from utils.utils import cosine_scheduler, get_params_groups, scale_learning_rate, prep_batch
 
 
 class Trainer:
@@ -75,7 +77,7 @@ class Trainer:
             loss_fn: List[nn.Module],
             dataloaders: dict, 
             optimizer: optim,
-            scheduler: lr_scheduler | None = None,
+            scheduler: List[np.array],
             num_folds: int = 1,
             num_steps: int = 1000,
             amp: bool = True,
@@ -115,7 +117,8 @@ class Trainer:
         self.train_loss = loss_fn[0].to(self.gpu_id)
         self.val_loss = loss_fn[1].to(self.gpu_id)
         self.optim = optimizer
-        self.schedule = scheduler
+        self.lr_schedule, self.wd_schedule = scheduler[0], scheduler[1]
+        self.params = self.model.parameters()
 
         metrics = MetricCollection([BinaryAveragePrecision(), BinaryAUROC()])
         self.train_metrics = metrics.clone(prefix='train_').to(self.gpu_id)
@@ -183,35 +186,39 @@ class Trainer:
         ) -> float:
 
         self.model.train()
-        inputs, labels, pos_token, padding_mask = self.prep_batch(batch, batch_size=batch_size, device_id=self.gpu_id)
-        weight = self.calc_weight(pos_token)
+        inputs, labels, pt_info, padding_mask = prep_batch(batch, batch_size=batch_size)
+        inputs, labels, padding_mask = inputs.to(self.gpu_id), labels.to(self.gpu_id), padding_mask.to(self.gpu_id)
+        pt_info = [info.to(self.gpu_id) for info in pt_info]
 
         with autocast(enabled=self.amp):
-            logits = self.model(inputs, pos_token=pos_token, padding_mask=padding_mask)
+            logits = self.model(inputs, pad_mask=padding_mask, pt_info=pt_info)
             loss = self.train_loss(logits.squeeze(-1), labels.float())
-            # loss = torch.mean(torch.mul(weight, loss)) / accum_steps
             loss /= accum_steps
 
         self.scaler.scale(loss).backward()
         preds = F.sigmoid(logits.squeeze(-1))
-        self.train_metrics.update(preds, labels)
+        self.train_metrics.update(preds, labels.int())
 
         return loss.item()
 
     def accumulation_step(
             self,
+            step: int,
             clip_grad: bool = True
         ) -> None:
 
+        for i, param_group in enumerate(self.optim.param_groups):
+            param_group['lr'] = self.lr_schedule[step]
+            if i == 0:  # only the first group is regularized
+                param_group['weight_decay'] = self.wd_schedule[step]
+
         if clip_grad:
             self.scaler.unscale_(self.optim)
-            nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0, norm_type=2)
+            nn.utils.clip_grad_norm_(self.params, max_norm=1.0, norm_type=2)
 
         self.scaler.step(self.optim)
         self.scaler.update()
         self.optim.zero_grad(set_to_none=True)
-        if self.schedule is not None:
-            self.schedule.step()
 
     @torch.no_grad()
     def validation_step(
@@ -230,14 +237,16 @@ class Trainer:
             tuple: Tuple containing the loss and F1-score.
         '''
         self.model.eval()
-        inputs, labels, pos_token, padding_mask = self.prep_batch(batch, batch_size=batch_size, device_id=self.gpu_id)
+        inputs, labels, pt_info, padding_mask = prep_batch(batch, batch_size=batch_size)
+        inputs, labels, padding_mask = inputs.to(self.gpu_id), labels.to(self.gpu_id), padding_mask.to(self.gpu_id)
+        pt_info = [info.to(self.gpu_id) for info in pt_info]
 
         with autocast(enabled=self.amp):
-            logits = self.model(inputs, pos_token=pos_token, padding_mask=None)
+            logits = self.model(inputs, pad_mask=padding_mask, pt_info=pt_info)
             loss = self.val_loss(logits.squeeze(-1), labels.float())
 
         preds = F.sigmoid(logits.squeeze(-1))
-        self.val_metrics.update(preds, labels)
+        self.val_metrics.update(preds, labels.int())
 
         return loss.item()
     
@@ -276,13 +285,13 @@ class Trainer:
                 update_step = step // accum_steps
                 if self.gpu_id == 0 and step % (accum_steps * val_steps) == 0:
                     print('-' * 15)
-                    print(f'Step {step}/{self.num_steps}')
+                    print(f'Step {update_step}/{self.num_steps}')
                     print('-' * 15)
 
                 accum_loss += self.training_step(train_batch, batch_size, accum_steps)
 
                 if (step + 1) % accum_steps == 0:
-                    self.accumulation_step(clip_grad=False)
+                    self.accumulation_step(update_step, clip_grad=False)
                     if self.gpu_id == 0:
                         print(f"Step Loss: {accum_loss:.4f}")
                     running_train_loss += accum_loss
@@ -307,8 +316,8 @@ class Trainer:
                     if self.gpu_id == 0:
                         self.log_dict(phase='train', keys=['loss', 'auprc', 'auroc'], values=[train_loss, train_results['train_BinaryAveragePrecision'].cpu().item(), train_results['train_BinaryAUROC'].cpu().item()])
                         self.log_dict(phase='val', keys=['loss', 'auprc', 'auroc'], values=[val_loss, val_results['val_BinaryAveragePrecision'].cpu().item(), val_results['val_BinaryAUROC'].cpu().item()])
-                        print(f"[GPU {self.gpu_id}] Step {step}/{self.num_steps}, Training Loss: {train_loss:.4f}, AUPRC: {train_results['train_BinaryAveragePrecision']:.4f}, and AUROC {train_results['train_BinaryAUROC']:.4f}")
-                        print(f"[GPU {self.gpu_id}] Step {step}/{self.num_steps}, Validation Loss: {val_loss:.4f}, AUPRC: {val_results['val_BinaryAveragePrecision']:.4f}, and AUROC {val_results['val_BinaryAUROC']:.4f}")
+                        print(f"[GPU {self.gpu_id}] Step {update_step}/{self.num_steps}, Training Loss: {train_loss:.4f}, AUPRC: {train_results['train_BinaryAveragePrecision']:.4f}, and AUROC {train_results['train_BinaryAUROC']:.4f}")
+                        print(f"[GPU {self.gpu_id}] Step {update_step}/{self.num_steps}, Validation Loss: {val_loss:.4f}, AUPRC: {val_results['val_BinaryAveragePrecision']:.4f}, and AUROC {val_results['val_BinaryAUROC']:.4f}")
 
                     if (val_metric * (1 - val_loss)) ** 0.5 > best_metric:
                         best_metric = (val_metric * (1 - val_loss)) ** 0.5
@@ -321,7 +330,7 @@ class Trainer:
                             self.save_output(self.model.module.state_dict(), 'weights', fold)
                         dist.barrier()
 
-                if step == self.num_steps * accum_steps:
+                if (step + 1) == self.num_steps * accum_steps:
                     break
 
         if self.gpu_id == 0:
@@ -329,51 +338,7 @@ class Trainer:
             print(f'[Fold {fold}] Training complete in {time_elapsed // 60:.0f}min {time_elapsed % 60:.0f}sec')
             print(f'[Fold {fold}] Loss: {best_loss:.4f}, AUPRC: {best_auprc:.4f}, and {best_auroc:.4f} of best model configuration.')
             self.save_output(self.results_dict, 'history', fold)
-            
-    @staticmethod
-    def prep_batch(data: dict, batch_size: int, pretrain: bool = False) -> tuple:
-
-        B, C, H, W, D = data['image'].shape
-        seq_length = B // batch_size
-        for key in data:
-            if key == 'image':
-                data[key] = data[key].reshape(batch_size, seq_length, C, H, W, D)
-            elif not isinstance(data[key], list):
-                try:
-                    data[key] = data[key].reshape(batch_size, seq_length)
-                except:
-                    pass
-        data['age'] = torch.where(data['age'] != 0.0, data['age'].int(), 99)
-        padding_mask = torch.where(data['age'] == 99, 1, 0)
-        pad_idx = torch.argmax(padding_mask, dim=1)
-        pad_idx = torch.where(pad_idx == 0, seq_length, pad_idx)
-        for key in ['etiology', 'sex']:
-            data[key] = torch.max(data[key], dim=1).values
-            data[key] = data[key].unsqueeze(-1).expand(-1, seq_length)
-        if pretrain:
-            data['label'] = torch.zeros(batch_size)
-            for i in range(batch_size):
-                rand_gen = torch.rand(1)
-                if rand_gen < 0.6:
-                    shuffled_idx = torch.randperm(pad_idx[i])
-                    sorted_idx = torch.sort(shuffled_idx).values
-                    data['image'][i, :pad_idx[i]] = data['image'][i, shuffled_idx]
-                    data['age'][i, :pad_idx[i]] = data['age'][i, shuffled_idx]
-                    data['label'][i] = 0 if shuffled_idx.equal(sorted_idx) else 1
-        else:
-            data['label'] = torch.max(data['label'], dim=1).values
-        return data['image'], data['label'], data['age'], data['etiology'], data['sex'], padding_mask
-
-    @staticmethod
-    def calc_weight(
-            data: torch.Tensor, 
-            base: int = 3, 
-            dim: int = 1
-        ) -> torch.Tensor:
-
-        count = torch.count_nonzero(data, dim=dim)
-        base = torch.Tensor([base])
-        return torch.log(count + 1) / torch.log(base.to(count.device))
+        dist.barrier()
     
     def visualize_training(
             self, 
@@ -419,20 +384,6 @@ class Trainer:
         plt.savefig(file_path, dpi=300, bbox_inches="tight")
         plt.close()
 
-
-def get_wd_params(model: nn.Module):
-    decay = list()
-    no_decay = list()
-    for name, param in model.named_parameters():
-        if hasattr(param,'requires_grad') and not param.requires_grad:
-            continue
-        if 'weight' in name and 'norm' not in name and 'bn' not in name:
-            decay.append(param)
-        else:
-            no_decay.append(param)
-    return decay, no_decay
-
-
 def parse_args() -> argparse.Namespace:
 
     '''
@@ -446,40 +397,50 @@ def parse_args() -> argparse.Namespace:
                         help="Loss function to use.")
     parser.add_argument("--gamma", type=int, default=2,
                         help="Gamma parameter to use for focal loss.")
-    parser.add_argument("--pooling-mode", default='cls', type=str,
-                        help="Pooling mode. Can be cls, mean, max, or att. Defaults to cls.")
     parser.add_argument("--pretrained", action='store_true',
                         help="Flag to use pretrained weights.")
+    parser.add_argument("--use-v2", action='store_true',
+                        help="Flag to use ConvNeXt version 2.")
+    parser.add_argument("--kernel-size", type=int, default=3,
+                        help="Kernel size of the convolutional layers.")
     parser.add_argument("--distributed", action='store_true',
                         help="Flag to enable distributed training.")
     parser.add_argument("--amp", action='store_true',
                         help="Flag to enable automated mixed precision training.")
-    parser.add_argument("--scheduler", action='store_true',
-                        help="Flag to use a LR scheduler.")
+
     parser.add_argument("--num-classes", default=2, type=int,
                         help="Number of output classes. Defaults to 2.")
+    parser.add_argument("--label-smoothing", default=0.0, type=float, 
+                        help="Label smoothing to use for training. Defaults to 0.")
     parser.add_argument("--num-steps", default=100, type=int, 
-                        help="Number of epochs to train for. Defaults to 10.")
+                        help="Number of steps to train for. Defaults to 100.")
+    parser.add_argument("--warmup-steps", default=10, type=int, 
+                        help="Number of warmup steps. Defaults to 10.")
+    parser.add_argument("--val-interval", default=1, type=int,
+                        help="Number of epochs to wait before running validation. Defaults to 2.")
+    parser.add_argument("--k-folds", default=5, type=int, 
+                        help="Number of folds to use in cross validation. Defaults to 5.")
     parser.add_argument("--batch-size", default=4, type=int, 
                         help="Batch size to use for training. Defaults to 4.")
     parser.add_argument("--effective-batch-size", default=32, type=int,
                         help="Total batch size: batch size x number of devices x number of accumulations steps.")
     parser.add_argument("--seq-length", default=4, type=int,
                         help="Flag to scale the raw model logits using temperature scalar.")
-    parser.add_argument("--k-folds", default=0, type=int, 
-                        help="Number of folds to use in cross validation. Defaults to 0.8.")
-    parser.add_argument("--label-smoothing", default=0.0, type=float, 
-                        help="Label smoothing to use for training. Defaults to 0.")
-    parser.add_argument("--weight-decay", default=0, type=float, 
-                        help="Weight decay to use for training. Defaults to 0.")
-    parser.add_argument("--dropout", default=0, type=float, 
-                        help="Dropout rate to use for training. Defaults to 0.")
-    parser.add_argument("--stochastic-depth", default=0, type=float, 
+    parser.add_argument("--min-learning-rate", default=1e-6, type=float, 
+                        help="Final learning rate. Defaults to 1e-6.")
+    parser.add_argument("--weight-decay", default=0.05, type=float, 
+                        help="Initial weight decay value. Defaults to 0.05.")
+    parser.add_argument("--max-weight-decay", default=0.5, type=float, 
+                        help="Final weight decay value. Defaults to 0.5.")
+    parser.add_argument("--stochastic-depth", default=0.0, type=float, 
                         help="Stochastic depth rate to use for training. Defaults to 0.")
+    parser.add_argument("--dropout", default=0.0, type=float, 
+                        help="Dropout rate to use for training. Defaults to 0.")
     parser.add_argument("--epsilon", default=1e-5, type=float, 
                         help="Epsilon value to use for norm layers. Defaults to 1e-5.")
-    parser.add_argument("--val-interval", default=1, type=int,
-                        help="Number of epochs to wait before running validation. Defaults to 2.")
+    parser.add_argument("--crop-size", default=72, type=int, 
+                        help="Global crop size to use. Defaults to 72.")
+
     parser.add_argument("--mod-list", default=MODALITY_LIST, nargs='+', 
                         help="List of modalities to use for training")
     parser.add_argument("--seed", default=1234, type=int, 
@@ -512,7 +473,10 @@ def load_train_data(
     '''
     folds = range(args.k_folds)
     phases = ['train', 'val']
-    data_dict, label_df = DatasetPreprocessor(data_dir=args.data_dir).load_data(modalities=args.mod_list, keys=['label','age'], file_name='labels.csv')
+    data_dict, label_df = DatasetPreprocessor(data_dir=args.data_dir).load_data(
+        modalities=args.mod_list, 
+        keys=['label','age','etiology','sex'], 
+        file_name='labels.csv')
     dev, test = GroupStratifiedSplit(split_ratio=0.75).split_dataset(label_df)
     if args.k_folds > 1:
         cv_folds = StratifiedGroupKFold(n_splits=args.k_folds).split(dev, y=dev['label'], groups=dev['patient_id'])
@@ -538,10 +502,11 @@ def load_train_data(
     datasets = {x: [CacheSeqDataset(
         data=seq_split_dict[x][k],
         image_keys=args.mod_list,
-        transform=data_transforms(
+        transform=transforms(
             dataset=x, 
             modalities=args.mod_list,
-            device=device), 
+            device=device,
+            crop_size=ensure_tuple_rep(args.crop_size, 3)),
         num_workers=args.num_workers,
         copy_cache=False
         ) for k in folds] for x in phases}
@@ -551,7 +516,9 @@ def load_train_data(
         shuffle=(True if x == 'train' else False),   
         drop_last=(True if x == 'train' else False),   
         num_workers=0,
-        collate_fn=(SequenceBatchCollater(keys=['image','label','age'], seq_length=args.seq_length) if x == 'train' else list_data_collate)
+        collate_fn=(SequenceBatchCollater(
+            keys=['image','label','age','etiology','sex'], 
+            seq_length=args.seq_length) if x == 'train' else list_data_collate)
         ) for k in folds] for x in phases}
     _, counts = np.unique(seq_class_dict['train'][0], return_counts=True)
     pos_weight = counts[1] / counts.sum()
@@ -561,10 +528,8 @@ def load_train_data(
 def load_train_objs(
         args: argparse.Namespace,
         model: nn.Module,
-        dataloader: dict,
-        pos_weight: float | list | None = None,
         learning_rate: float = 1e-4,
-        accum_steps: int = 1
+        pos_weight: float | None = None
     ) -> tuple:
 
     if args.loss_fn == 'focal':
@@ -572,24 +537,33 @@ def load_train_objs(
     else:
         train_fn = BinaryCELoss(weights=pos_weight, label_smoothing=args.label_smoothing)
     loss_fn = [train_fn, BinaryCELoss()]
-    decay, no_decay = get_wd_params(model)
-    optimizer = optim.AdamW([{'params': no_decay, 'weight_decay': 0}, {'params': decay}], lr=learning_rate, weight_decay=args.weight_decay)
-    # max_iter = len(dataloader['train']) / accum_steps * args.epochs
-    scheduler = None
+    params = get_params_groups(model)
+    optimizer = optim.AdamW(params, lr=learning_rate, weight_decay=args.weight_decay)
+    lr_schedule = cosine_scheduler(
+        base_value=learning_rate,
+        final_value=args.min_learning_rate,
+        steps=args.num_steps,
+        warmup_steps=args.warmup_steps)
+    wd_schedule = cosine_scheduler(
+        base_value=args.weight_decay,
+        final_value=args.max_weight_decay,
+        steps=args.num_steps)
+    scheduler = [lr_schedule, wd_schedule]
     return loss_fn, optimizer, scheduler
 
-def scale_learning_rate(
-        batch_size: int,
-        num_devices: int
-    ) -> float:
+def load_weights(
+        weights_path: str
+    ) -> dict:
 
-    alpha = {8: 0.0001, 16: 0.000141, 32: 0.0002, 64: 0.000282, 128: 0.0004, 256: 0.000565, 512: 0.0008}
-    return alpha[batch_size] * np.sqrt(batch_size * num_devices) / np.sqrt(128)
+    weights = torch.load(weights_path, map_location='cpu')
+    return weights
 
-def data_transforms(
+def transforms(
         dataset: str,
         modalities: list,
-        device: torch.device
+        device: torch.device,
+        crop_size: tuple = (72, 72, 72),
+        image_spacing: tuple = (1.5, 1.5, 1.5)
     ) -> transforms:
 
     '''
@@ -605,13 +579,13 @@ def data_transforms(
         LoadImaged(keys=modalities, image_only=True),
         EnsureChannelFirstd(keys=modalities),
         Orientationd(keys=modalities, axcodes='PLI'),
-        Spacingd(keys=modalities, pixdim=(1.5, 1.5, 1.5), mode=3),
+        Spacingd(keys=modalities, pixdim=image_spacing, mode=3),
         ResampleToMatchd(keys=modalities, key_dst=modalities[0], mode=3),
         PercentileSpatialCropd(
             keys=modalities,
             roi_center=(0.5, 0.5, 0.5),
             roi_size=(0.85, 0.8, 0.99),
-            min_size=(96, 96, 96)),
+            min_size=crop_size),
         CopyItemsd(keys=modalities[0], names='mask'),
         Lambdad(
             keys='mask', 
@@ -631,38 +605,38 @@ def data_transforms(
             keys='image',
             roi_center=(0.45, 0.25, 0.3),
             roi_size=(0.6, 0.45, 0.4),
-            min_size=(96, 96, 96)),
+            min_size=crop_size),
         SoftClipIntensityd(keys='image', min_value=-3.0, max_value=3.0, channel_wise=True)
     ]
 
     train = [
         EnsureTyped(keys='image', track_meta=False, device=device, dtype=torch.float),
         RandSpatialCropd(keys='image', roi_size=(72, 72, 72), random_size=False),
+        SpatialPadd(keys='image', spatial_size=crop_size, method='symmetric'),
         RandFlipd(keys='image', prob=0.5, spatial_axis=0),
         RandFlipd(keys='image', prob=0.5, spatial_axis=1),
         RandFlipd(keys='image', prob=0.5, spatial_axis=2),
         RandRotate90d(keys='image', prob=0.5),
         RandScaleIntensityd(keys='image', prob=1.0, factors=0.1),
         RandShiftIntensityd(keys='image', prob=1.0, offsets=0.1),
-        RandGibbsNoised(keys='image', prob=0.1, alpha=(0.1, 0.9)),
-        RandKSpaceSpikeNoised(keys='image', prob=0.1, channel_wise=True),
-        RandCoarseDropoutd(keys='image', prob=0.25, holes=1, spatial_size=(16, 16, 16), max_spatial_size=(48, 48, 48)),
+        # RandGibbsNoised(keys='image', prob=0.1, alpha=(0.1, 0.9)),
+        # RandKSpaceSpikeNoised(keys='image', prob=0.1, channel_wise=True),
+        # RandCoarseDropoutd(keys='image', prob=0.25, holes=1, spatial_size=(16, 16, 16), max_spatial_size=(48, 48, 48)),
         NormalizeIntensityd(
             keys='image', 
             subtrahend=(0.4467, 0.4416, 0.4409, 0.4212),
             divisor=(0.6522, 0.6429, 0.6301, 0.6041),
             channel_wise=True)
-        # NormalizeIntensityd(keys='image', channel_wise=True)
     ]
 
     test = [
         CenterSpatialCropd(keys='image', roi_size=(72, 72, 72)),
+        SpatialPadd(keys='image', spatial_size=crop_size, method='symmetric'),
         NormalizeIntensityd(
             keys='image', 
             subtrahend=(0.4467, 0.4416, 0.4409, 0.4212),
             divisor=(0.6522, 0.6429, 0.6301, 0.6041),
             channel_wise=True),
-        # NormalizeIntensityd(keys='image', channel_wise=True),
         EnsureTyped(keys='image', track_meta=False, device=device, dtype=torch.float)
     ]
 
@@ -708,7 +682,7 @@ def main(
     device_id = rank % num_devices
     accum_steps = args.effective_batch_size // args.batch_size // num_devices
     batch_size_gpu = args.batch_size * accum_steps
-    learning_rate = scale_learning_rate(batch_size_gpu, num_devices)
+    learning_rate = scale_learning_rate(args.effective_batch_size)
     num_classes = args.num_classes if args.num_classes > 2 else 1
 
     cv_dataloader, pos_weight = load_train_data(args, device_id)
@@ -716,27 +690,32 @@ def main(
 
     for k in range(args.k_folds):
         dataloader = {x: cv_dataloader[x][k] for x in ['train','val']}
-        backbone = convnext3d_femto(
+        backbone = convnext3d_tiny(
             in_chans=len(args.mod_list), 
-            use_grn=True, 
+            kernel_size=args.kernel_size,
             drop_path_rate=args.stochastic_depth,
+            use_v2=args.use_v2, 
             eps=args.epsilon)
         model = MedNet(
             backbone, 
             num_classes=num_classes, 
-            pooling_mode=args.pooling_mode, 
+            max_len=16,
             dropout=args.dropout, 
             eps=args.epsilon)
+        if args.pretrained:
+            weights = load_weights(os.path.join(args.results_dir, 'model_weights/weights_fold7000_pretrain_decoder.pth'))
+            model.load_state_dict(weights)
         model = model.to(device_id)
+        for name, param in model.named_parameters():
+            if not name.startswith(('pooler','head')):
+                param.requires_grad = False
         if args.distributed:
             model = nn.parallel.DistributedDataParallel(model, device_ids=[device_id])
         loss_fn, optimizer, scheduler = load_train_objs(
             args, 
             model=model, 
-            dataloader=dataloader,
             pos_weight=pos_weight,
-            learning_rate=learning_rate,
-            accum_steps=accum_steps)
+            learning_rate=learning_rate)
         trainer = Trainer(
             model=model, 
             loss_fn=loss_fn,

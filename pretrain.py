@@ -31,6 +31,8 @@ from monai.transforms import (
     RandSpatialCropd,
     RandFlipd,
     RandRotate90d,
+    RandScaleIntensityd,
+    RandShiftIntensityd,
     CopyItemsd,
     KeepLargestConnectedComponentd,
     Lambdad,
@@ -52,7 +54,13 @@ from models.convnext3d import convnext3d_femto, convnext3d_pico, convnext3d_nano
 from models.dinohead import DINOHead
 from models.mednet import MedNet
 from losses.dinoloss import DINOLoss
-from utils.utils import cancel_gradients_last_layer, cosine_scheduler, get_params_groups, scale_learning_rate, MultiCropWrapper
+from utils.utils import (
+    cancel_gradients_last_layer, 
+    cosine_scheduler, 
+    get_params_groups, 
+    scale_learning_rate, 
+    prep_batch,
+    MultiCropWrapper)
 
 class Pretrainer:
 
@@ -176,15 +184,16 @@ class Pretrainer:
     def decoder_step(
             self,
             batch: dict,
+            batch_size: int,
             accum_steps: int
         ) -> float:
 
         self.model.train()
-        inputs, labels, pt_info, padding_mask = self.prep_batch(batch, batch_size=batch_size, pretrain=True)
+        inputs, labels, pt_info, padding_mask = prep_batch(batch, batch_size=batch_size, pretrain=True)
         inputs, labels, padding_mask = inputs.to(self.gpu_id), labels.to(self.gpu_id), padding_mask.to(self.gpu_id)
         pt_info = [info.to(self.gpu_id) for info in pt_info]
         with autocast(enabled=self.amp):
-            logits = self.model(inputs, padding_mask=padding_mask, pt_info=pt_info)
+            logits = self.model(inputs, pad_mask=padding_mask, pt_info=pt_info)
             loss = self.loss_fn(logits.squeeze(-1), labels.float())
             loss /= accum_steps
         self.scaler.scale(loss).backward()
@@ -225,6 +234,7 @@ class Pretrainer:
 
     def pretrain(
             self,
+            batch_size: int,
             accum_steps: int,
             warmup_steps: int,
             log_every: int = 10
@@ -248,7 +258,7 @@ class Pretrainer:
                 if self.pretrain_encoder:
                     accum_loss += self.encoder_step(batch, update_step, accum_steps)
                 else:
-                    accum_loss += self.decoder_step(batch, accum_steps)
+                    accum_loss += self.decoder_step(batch, batch_size, accum_steps)
 
                 if (step + 1) % accum_steps == 0:
                     self.accumulation_step(update_step, warmup_steps, clip_grad=False)
@@ -283,40 +293,6 @@ class Pretrainer:
             print(f'Pretraining finished in {time_elapsed // 60:.0f}min {time_elapsed % 60:.0f}sec')
             self.save_output(self.results_dict, 'history', fold=0)
         dist.barrier()
-
-    @staticmethod
-    def prep_batch(data: dict, batch_size: int, pretrain: bool = False) -> tuple:
-
-        B, C, H, W, D = data['image'].shape
-        seq_length = B // batch_size
-        for key in data:
-            if key == 'image':
-                data[key] = data[key].reshape(batch_size, seq_length, C, H, W, D)
-            elif not isinstance(data[key], list):
-                try:
-                    data[key] = data[key].reshape(batch_size, seq_length)
-                except:
-                    pass
-        padding_mask = torch.where(data['age'] == 0.0, 1, 0)
-        pad_idx = torch.argmax(padding_mask, dim=1)
-        pad_idx = torch.where(pad_idx == 0, seq_length, pad_idx)
-        for key in ['etiology', 'sex']:
-            data[key] = torch.max(data[key], dim=1).values
-            data[key] = data[key].unsqueeze(-1).expand(-1, seq_length)
-        if pretrain:
-            data['label'] = torch.zeros(batch_size)
-            for i in range(batch_size):
-                rand_gen = torch.rand(1)
-                if rand_gen < 0.66:
-                    shuffled_idx = torch.randperm(pad_idx[i])
-                    sorted_idx = torch.sort(shuffled_idx).values
-                    data['image'][i, :pad_idx[i]] = data['image'][i, shuffled_idx]
-                    data['age'][i, :pad_idx[i]] = data['age'][i, shuffled_idx]
-                    data['label'][i] = 0 if shuffled_idx.equal(sorted_idx) else 1
-        else:
-            data['label'] = torch.max(data['label'], dim=1).values
-        pt_info = [data['age'], data['etiology'], data['sex']]
-        return data['image'], data['label'], pt_info, padding_mask
 
     def visualize_training(
             self, 
@@ -554,9 +530,9 @@ def decoder_transforms(
             roi_center=(0.45, 0.25, 0.3),
             roi_size=(0.6, 0.45, 0.4),
             min_size=crop_size),
-        SoftClipIntensityd(keys='image', min_value=-3.0, max_value=3.0, channel_wise=True)
+        SoftClipIntensityd(keys='image', min_value=-3.0, max_value=3.0, channel_wise=True),
         EnsureTyped(keys='image', track_meta=False, device=device, dtype=torch.float),
-        SpatialPadd(keys='image', spatial_size=crop_size, method='symmetric')
+        SpatialPadd(keys='image', spatial_size=crop_size, method='symmetric'),
         RandSpatialCropd(keys='image', roi_size=crop_size, random_size=False),
         RandFlipd(keys='image', prob=0.5, spatial_axis=0),
         RandFlipd(keys='image', prob=0.5, spatial_axis=1),
@@ -617,6 +593,7 @@ def load_pretrain_data(
     else:
         datasets = {x: CacheSeqDataset(
             data=split_dict[x], 
+            image_keys=args.mod_list,
             transform=decoder_transforms(
                 modalities=args.mod_list, 
                 device=device,
@@ -629,9 +606,9 @@ def load_pretrain_data(
             batch_size=args.batch_size,
             shuffle=True,
             num_workers=0,
-            drop_last=True
+            drop_last=True,
             collate_fn=(SequenceBatchCollater(
-                keys=['image','label','age','etiology','sex'], 
+                keys=['image','age','etiology','sex'], 
                 seq_length=7))
             ) for x in phases}
     return dataloader
@@ -674,25 +651,29 @@ def load_encoder(
 
     if args.arch == 'femto':
         student = convnext3d_femto(
-            in_chans=1, kernel_size=args.kernel_size, drop_path_rate=args.stochastic_depth, use_v2=args.use_v2, eps=args.epsilon)
+            in_chans=1 if args.pretrain_encoder else len(args.mod_list), kernel_size=args.kernel_size, drop_path_rate=args.stochastic_depth, use_v2=args.use_v2, eps=args.epsilon)
         teacher = convnext3d_femto(
-            in_chans=1, kernel_size=args.kernel_size, use_v2=args.use_v2, eps=args.epsilon)
+            in_chans=1 if args.pretrain_encoder else len(args.mod_list), kernel_size=args.kernel_size, use_v2=args.use_v2, eps=args.epsilon)
     elif args.arch == 'pico':
         student = convnext3d_pico(
-            in_chans=1, kernel_size=args.kernel_size, drop_path_rate=args.stochastic_depth, use_v2=args.use_v2, eps=args.epsilon)
+            in_chans=1 if args.pretrain_encoder else len(args.mod_list), kernel_size=args.kernel_size, drop_path_rate=args.stochastic_depth, use_v2=args.use_v2, eps=args.epsilon)
         teacher = convnext3d_pico(
-            in_chans=1, kernel_size=args.kernel_size, use_v2=args.use_v2, eps=args.epsilon)
+            in_chans=1 if args.pretrain_encoder else len(args.mod_list), kernel_size=args.kernel_size, use_v2=args.use_v2, eps=args.epsilon)
     elif args.arch == 'nano':
         student = convnext3d_nano(
-            in_chans=1, kernel_size=args.kernel_size, drop_path_rate=args.stochastic_depth, use_v2=args.use_v2, eps=args.epsilon)
+            in_chans=1 if args.pretrain_encoder else len(args.mod_list), kernel_size=args.kernel_size, drop_path_rate=args.stochastic_depth, use_v2=args.use_v2, eps=args.epsilon)
         teacher = convnext3d_nano(
-            in_chans=1, kernel_size=args.kernel_size, use_v2=args.use_v2, eps=args.epsilon)
+            in_chans=1 if args.pretrain_encoder else len(args.mod_list), kernel_size=args.kernel_size, use_v2=args.use_v2, eps=args.epsilon)
     elif args.arch == 'tiny':
         student = convnext3d_tiny(
-            in_chans=1, kernel_size=args.kernel_size, drop_path_rate=args.stochastic_depth, use_v2=args.use_v2, eps=args.epsilon)
+            in_chans=1 if args.pretrain_encoder else len(args.mod_list), kernel_size=args.kernel_size, drop_path_rate=args.stochastic_depth, use_v2=args.use_v2, eps=args.epsilon)
         teacher = convnext3d_tiny(
-            in_chans=1, kernel_size=args.kernel_size, use_v2=args.use_v2, eps=args.epsilon)
-    return student, teacher
+            in_chans=1 if args.pretrain_encoder else len(args.mod_list), kernel_size=args.kernel_size, use_v2=args.use_v2, eps=args.epsilon)
+    
+    if args.pretrain_encoder:
+        return student, teacher
+    else:
+        return student
 
 def load_weights(
         weights_path: str
@@ -765,20 +746,20 @@ def main(
         model = [student, teacher]
         loss_fn, optimizer, schedules = load_pretrain_objs(args, student, learning_rate)
     else:
-        backbone, _ load_encoder(args)
+        backbone = load_encoder(args)
         model = MedNet(
             backbone=backbone, 
             num_classes=1,
             max_len=16,
             dropout=args.dropout,
-            eps=args.eps)
+            eps=args.epsilon)
         weights = load_weights(os.path.join(args.results_dir, 'model_weights/weights_fold8000_dmri_tiny_v1.pth'))
         model.backbone.load_state_dict(weights, strict=False)
         model = model.to(device_id)
-        if args.distributed:
-            model = nn.parallel.DistributedDataParallel(model, device_ids=[device_id])
         for p in model.backbone.parameters():
             p.requires_grad = False
+        if args.distributed:
+            model = nn.parallel.DistributedDataParallel(model, device_ids=[device_id])
         loss_fn, optimizer, schedules = load_pretrain_objs(args, model, learning_rate)
 
     pretrainer = Pretrainer(
@@ -806,7 +787,7 @@ def main(
             print(f'- The stochastic depth rate is set to {args.stochastic_depth}, dropout rate to {args.dropout}, and epsilon to {args.epsilon}.')
             print(f'Starting Decoder pretraining...')
 
-    pretrainer.pretrain(accum_steps, args.warmup_steps // 10)
+    pretrainer.pretrain(args.batch_size, accum_steps, args.warmup_steps // 10)
     pretrainer.visualize_training('train', 'loss')
     print('Script finished.')
 
