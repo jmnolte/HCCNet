@@ -1,3 +1,4 @@
+from typing import List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -162,7 +163,6 @@ class PositionalEncoding(nn.Module):
             for i in range(x.size(0)):
                 pos_perm = torch.randperm(self.max_len)
                 pos_sampled[i] = pos_perm[:x.size(1)].sort()[0]
-                pos_sampled[i, 0] = 0
                 pos_encod[i] = self.pe[:, pos_sampled[i].long(), :]
             return pos_encod
         else:
@@ -227,7 +227,7 @@ class MedNet(nn.Module):
             eps=eps)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=self.d_model, 
-            nhead=self.d_model // 64, 
+            nhead=self.d_model // 128, 
             dim_feedforward=self.d_model * 4, 
             dropout=dropout,
             activation=activation,

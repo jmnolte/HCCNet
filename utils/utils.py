@@ -52,6 +52,43 @@ def scale_learning_rate(
     alpha = {8: 0.0001, 16: 0.000141, 32: 0.0002, 64: 0.000282, 128: 0.0004, 256: 0.000565, 512: 0.0008}
     return alpha[batch_size] * np.sqrt(batch_size) / np.sqrt(128)
 
+def prep_batch(
+        data: dict, 
+        batch_size: int, 
+        pretrain: bool = False
+    ) -> tuple:
+
+    B, C, H, W, D = data['image'].shape
+    seq_length = B // batch_size
+    for key in data:
+        if key == 'image':
+            data[key] = data[key].reshape(batch_size, seq_length, C, H, W, D)
+        elif not isinstance(data[key], list):
+            try:
+                data[key] = data[key].reshape(batch_size, seq_length)
+            except:
+                pass
+    padding_mask = torch.where(data['age'] == 0.0, 1.0, 0.0)
+    pad_idx = torch.argmax(padding_mask, dim=1)
+    pad_idx = torch.where(pad_idx == 0, seq_length, pad_idx)
+    for key in ['etiology', 'sex']:
+        data[key] = torch.max(data[key], dim=1).values
+        data[key] = data[key].unsqueeze(-1).expand(-1, seq_length)
+    if pretrain:
+        data['label'] = torch.zeros(batch_size)
+        for i in range(batch_size):
+            rand_gen = torch.rand(1)
+            if rand_gen < 0.66:
+                shuffled_idx = torch.randperm(pad_idx[i])
+                sorted_idx = torch.sort(shuffled_idx).values
+                data['image'][i, :pad_idx[i]] = data['image'][i, shuffled_idx]
+                data['age'][i, :pad_idx[i]] = data['age'][i, shuffled_idx]
+                data['label'][i] = 0 if shuffled_idx.equal(sorted_idx) else 1
+    else:
+        data['label'] = torch.max(data['label'], dim=1).values
+    pt_info = [data['age'], data['etiology'], data['sex']]
+    return data['image'], data['label'], pt_info, padding_mask
+
 class MultiCropWrapper(nn.Module):
     """
     Perform forward pass separately on each resolution input.
