@@ -4,9 +4,11 @@ from torch.nn.utils.parametrizations import weight_norm
 from timm.models.layers import trunc_normal_
 
 class DINOHead(nn.Module):
-    def __init__(self, in_dim, out_dim, norm_last_layer=True, nlayers=3, hidden_dim=2048, bottleneck_dim=256):
+    def __init__(self, in_dim, out_dim, norm_last_layer=True, nlayers=3):
         super().__init__()
         nlayers = max(nlayers, 1)
+        hidden_dim = int(in_dim * 4)
+        bottleneck_dim = in_dim // 2
         if nlayers == 1:
             self.mlp = nn.Linear(in_dim, bottleneck_dim)
         else:

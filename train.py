@@ -9,7 +9,7 @@ import torch.optim.lr_scheduler as lr_scheduler
 import torch.distributed as dist
 from torch.cuda.amp import GradScaler, autocast
 from torchmetrics import MetricCollection
-from torchmetrics.classification import BinaryAveragePrecision, BinaryAUROC
+from torchmetrics.classification import BinaryAveragePrecision, BinaryAUROC, MulticlassAveragePrecision, MulticlassAUROC
 from sklearn.model_selection import StratifiedGroupKFold
 import argparse
 import os
@@ -58,7 +58,7 @@ from monai.data import (
 )
 from monai.utils.misc import ensure_tuple_rep
 from monai.utils import set_determinism
-from data.transforms import PercentileSpatialCropd, YeoJohnsond, SoftClipIntensityd
+from data.transforms import PercentileSpatialCropd, YeoJohnsond, SoftClipIntensityd, RobustNormalized
 from data.splits import GroupStratifiedSplit
 from data.datasets import CacheSeqDataset
 from data.utils import DatasetPreprocessor, convert_to_dict, convert_to_seqdict, SequenceBatchCollater
@@ -81,6 +81,7 @@ class Trainer:
             num_folds: int = 1,
             num_steps: int = 1000,
             amp: bool = True,
+            backbone_only: bool = False,
             suffix: str | None = None,
             output_dir: str | None = None
         ) -> None:
@@ -106,6 +107,7 @@ class Trainer:
         self.num_folds = num_folds
         self.num_steps = num_steps
         self.amp = amp
+        self.backbone_only = backbone_only
         self.suffix = suffix
         if self.suffix is None:
             raise ValueError('Please specify a unique suffix for results storage.')
@@ -120,7 +122,14 @@ class Trainer:
         self.lr_schedule, self.wd_schedule = scheduler[0], scheduler[1]
         self.params = self.model.parameters()
 
-        metrics = MetricCollection([BinaryAveragePrecision(), BinaryAUROC()])
+        if backbone_only:
+            metrics = MetricCollection([MulticlassAveragePrecision(num_classes=3), MulticlassAUROC(num_classes=3)])
+            self.train_metric_str = ['train_MulticlassAveragePrecision', 'train_MulticlassAUROC']
+            self.val_metric_str = ['val_MulticlassAveragePrecision', 'val_MulticlassAUROC']
+        else:
+            metrics = MetricCollection([BinaryAveragePrecision(), BinaryAUROC()])
+            self.train_metric_str = ['train_BinaryAveragePrecision', 'train_BinaryAUROC']
+            self.val_metric_str = ['val_BinaryAveragePrecision', 'val_BinaryAUROC']
         self.train_metrics = metrics.clone(prefix='train_').to(self.gpu_id)
         self.val_metrics = metrics.clone(prefix='val_').to(self.gpu_id)
         self.results_dict = {dataset: {metric: [] for metric in ['loss','auprc','auroc']} for dataset in ['train','val']}
@@ -186,17 +195,21 @@ class Trainer:
         ) -> float:
 
         self.model.train()
-        inputs, labels, pt_info, padding_mask = prep_batch(batch, batch_size=batch_size)
-        inputs, labels, padding_mask = inputs.to(self.gpu_id), labels.to(self.gpu_id), padding_mask.to(self.gpu_id)
-        pt_info = [info.to(self.gpu_id) for info in pt_info]
+        if self.backbone_only:
+            inputs, labels = batch['image'].to(self.gpu_id), batch['lirads'].to(self.gpu_id)
+        else:
+            inputs, labels, pt_info, padding_mask = prep_batch(batch, batch_size=batch_size)
+            inputs, labels, padding_mask = inputs.to(self.gpu_id), labels.to(self.gpu_id), padding_mask.to(self.gpu_id)
+            pt_info = [info.to(self.gpu_id) for info in pt_info]
 
         with autocast(enabled=self.amp):
-            logits = self.model(inputs, pad_mask=padding_mask, pt_info=pt_info)
-            loss = self.train_loss(logits.squeeze(-1), labels.float())
+            logits = self.model(inputs) if self.backbone_only else self.model(inputs, pad_mask=padding_mask, pt_info=pt_info)
+            logits = logits.squeeze(-1) if not self.backbone_only else logits
+            loss = self.train_loss(logits, labels.long() if self.backbone_only else labels.float())
             loss /= accum_steps
 
         self.scaler.scale(loss).backward()
-        preds = F.sigmoid(logits.squeeze(-1))
+        preds = F.softmax(logits, dim=-1) if self.backbone_only else F.sigmoid(logits)
         self.train_metrics.update(preds, labels.int())
 
         return loss.item()
@@ -237,15 +250,19 @@ class Trainer:
             tuple: Tuple containing the loss and F1-score.
         '''
         self.model.eval()
-        inputs, labels, pt_info, padding_mask = prep_batch(batch, batch_size=batch_size)
-        inputs, labels, padding_mask = inputs.to(self.gpu_id), labels.to(self.gpu_id), padding_mask.to(self.gpu_id)
-        pt_info = [info.to(self.gpu_id) for info in pt_info]
+        if self.backbone_only:
+            inputs, labels = batch['image'].to(self.gpu_id), batch['lirads'].to(self.gpu_id)
+        else:
+            inputs, labels, pt_info, padding_mask = prep_batch(batch, batch_size=batch_size)
+            inputs, labels, padding_mask = inputs.to(self.gpu_id), labels.to(self.gpu_id), padding_mask.to(self.gpu_id)
+            pt_info = [info.to(self.gpu_id) for info in pt_info]
 
         with autocast(enabled=self.amp):
-            logits = self.model(inputs, pad_mask=padding_mask, pt_info=pt_info)
-            loss = self.val_loss(logits.squeeze(-1), labels.float())
+            logits = self.model(inputs) if self.backbone_only else self.model(inputs, pad_mask=padding_mask, pt_info=pt_info)
+            logits = logits.squeeze(-1) if not self.backbone_only else logits
+            loss = self.val_loss(logits, labels.long() if self.backbone_only else labels.float())
 
-        preds = F.sigmoid(logits.squeeze(-1))
+        preds = F.softmax(logits, dim=-1) if self.backbone_only else F.sigmoid(logits)
         self.val_metrics.update(preds, labels.int())
 
         return loss.item()
@@ -275,7 +292,10 @@ class Trainer:
         step = 0
         accum_loss = 0.0
         running_train_loss = 0.0
+        best_loss = 1.0
         best_metric = 0.0
+        best_auprc = 0.0
+        best_auroc = 0.0
         self.optim.zero_grad(set_to_none=True)
 
         for epoch in range(self.num_steps * accum_steps // len(self.dataloaders['train']) + 1):
@@ -311,19 +331,19 @@ class Trainer:
                     self.train_metrics.reset()
                     self.val_metrics.reset()
                     val_loss = 1.0 if val_loss.item() > 1.0 else val_loss.item()
-                    val_metric = (val_results['val_BinaryAveragePrecision'] + val_results['val_BinaryAUROC']) / 2
+                    val_metric = (val_results[self.val_metric_str[0]] + val_results[self.val_metric_str[1]]) / 2
 
                     if self.gpu_id == 0:
-                        self.log_dict(phase='train', keys=['loss', 'auprc', 'auroc'], values=[train_loss, train_results['train_BinaryAveragePrecision'].cpu().item(), train_results['train_BinaryAUROC'].cpu().item()])
-                        self.log_dict(phase='val', keys=['loss', 'auprc', 'auroc'], values=[val_loss, val_results['val_BinaryAveragePrecision'].cpu().item(), val_results['val_BinaryAUROC'].cpu().item()])
-                        print(f"[GPU {self.gpu_id}] Step {update_step}/{self.num_steps}, Training Loss: {train_loss:.4f}, AUPRC: {train_results['train_BinaryAveragePrecision']:.4f}, and AUROC {train_results['train_BinaryAUROC']:.4f}")
-                        print(f"[GPU {self.gpu_id}] Step {update_step}/{self.num_steps}, Validation Loss: {val_loss:.4f}, AUPRC: {val_results['val_BinaryAveragePrecision']:.4f}, and AUROC {val_results['val_BinaryAUROC']:.4f}")
+                        self.log_dict(phase='train', keys=['loss', 'auprc', 'auroc'], values=[train_loss, train_results[self.train_metric_str[0]].cpu().item(), train_results[self.train_metric_str[1]].cpu().item()])
+                        self.log_dict(phase='val', keys=['loss', 'auprc', 'auroc'], values=[val_loss, val_results[self.val_metric_str[0]].cpu().item(), val_results[self.val_metric_str[1]].cpu().item()])
+                        print(f"[GPU {self.gpu_id}] Step {update_step}/{self.num_steps}, Training Loss: {train_loss:.4f}, AUPRC: {train_results[self.train_metric_str[0]]:.4f}, and AUROC {train_results[self.train_metric_str[1]]:.4f}")
+                        print(f"[GPU {self.gpu_id}] Step {update_step}/{self.num_steps}, Validation Loss: {val_loss:.4f}, AUPRC: {val_results[self.val_metric_str[0]]:.4f}, and AUROC {val_results[self.val_metric_str[1]]:.4f}")
 
                     if (val_metric * (1 - val_loss)) ** 0.5 > best_metric:
                         best_metric = (val_metric * (1 - val_loss)) ** 0.5
                         best_loss = val_loss
-                        best_auprc = val_results['val_BinaryAveragePrecision']
-                        best_auroc = val_results['val_BinaryAUROC']
+                        best_auprc = val_results[self.val_metric_str[0]]
+                        best_auroc = val_results[self.val_metric_str[1]]
                         dist.barrier()
                         if self.gpu_id == 0:
                             print(f'[GPU {self.gpu_id}] New best Validation Loss: {best_loss:.4f} and Metric: {val_metric:.4f}. Saving model weights...')
@@ -403,10 +423,14 @@ def parse_args() -> argparse.Namespace:
                         help="Flag to use ConvNeXt version 2.")
     parser.add_argument("--kernel-size", type=int, default=3,
                         help="Kernel size of the convolutional layers.")
+    parser.add_argument("--out-dim", type=int, default=4096,
+                        help="Output dimension of pretrained projection head.")
     parser.add_argument("--distributed", action='store_true',
                         help="Flag to enable distributed training.")
     parser.add_argument("--amp", action='store_true',
                         help="Flag to enable automated mixed precision training.")
+    parser.add_argument("--backbone-only", action='store_true',
+                        help="Flag to train the CNN backbone.")
 
     parser.add_argument("--num-classes", default=2, type=int,
                         help="Number of output classes. Defaults to 2.")
@@ -475,9 +499,18 @@ def load_train_data(
     phases = ['train', 'val']
     data_dict, label_df = DatasetPreprocessor(data_dir=args.data_dir).load_data(
         modalities=args.mod_list, 
-        keys=['label','age','etiology','sex'], 
-        file_name='labels.csv')
+        keys=['label','lirads','delta'], 
+        file_name='labels.csv',
+        verbose=False)
+    lirads_dict, lirads_df = DatasetPreprocessor(data_dir=args.data_dir).load_data(
+        modalities=args.mod_list, 
+        keys=['label','lirads','delta'], 
+        file_name='lirads.csv')
     dev, test = GroupStratifiedSplit(split_ratio=0.75).split_dataset(label_df)
+    if args.backbone_only:
+        lirads_test = lirads_df[lirads_df['patient_id'].isin(test['patient_id'])]
+        lirads_dev = lirads_df[-lirads_df['patient_id'].isin(lirads_test['patient_id'])]
+        dev, test, data_dict = lirads_dev, lirads_test, lirads_dict
     if args.k_folds > 1:
         cv_folds = StratifiedGroupKFold(n_splits=args.k_folds).split(dev, y=dev['label'], groups=dev['patient_id'])
         indices = [(dev.iloc[train_idx], dev.iloc[val_idx]) for train_idx, val_idx in list(cv_folds)]
@@ -490,38 +523,68 @@ def load_train_data(
         folds = range(1)
         split_dict = [convert_to_dict([dev], data_dict=data_dict, split_names=phases, verbose=True) for k in folds]
 
-    seq_split_dict = [convert_to_seqdict(split_dict[k], args.mod_list, phases) for k in folds]
-    seq_class_dict = {x: [[max(patient['label']) for patient in seq_split_dict[k][x][0]] for k in folds] for x in phases}
-    seq_split_dict = {x: [partition_dataset_classes(
-        data=seq_split_dict[k][x][0],
-        classes=seq_class_dict[x][k],
-        num_partitions=dist.get_world_size(),
-        shuffle=True,
-        even_divisible=False
-        )[dist.get_rank()] for k in folds] for x in phases}
-    datasets = {x: [CacheSeqDataset(
-        data=seq_split_dict[x][k],
-        image_keys=args.mod_list,
-        transform=transforms(
-            dataset=x, 
-            modalities=args.mod_list,
-            device=device,
-            crop_size=ensure_tuple_rep(args.crop_size, 3)),
-        num_workers=args.num_workers,
-        copy_cache=False
-        ) for k in folds] for x in phases}
-    dataloader = {x: [ThreadDataLoader(
-        datasets[x][k], 
-        batch_size=(args.batch_size if x == 'train' else 1), 
-        shuffle=(True if x == 'train' else False),   
-        drop_last=(True if x == 'train' else False),   
-        num_workers=0,
-        collate_fn=(SequenceBatchCollater(
-            keys=['image','label','age','etiology','sex'], 
-            seq_length=args.seq_length) if x == 'train' else list_data_collate)
-        ) for k in folds] for x in phases}
-    _, counts = np.unique(seq_class_dict['train'][0], return_counts=True)
-    pos_weight = counts[1] / counts.sum()
+    if args.backbone_only:
+        counts = dev['lirads'].value_counts()
+        pos_weight = counts.sum() / (counts * 2)
+        class_dict = {x: [[patient['lirads'] for patient in split_dict[k][x]] for k in folds] for x in phases}
+        split_dict = {x: [partition_dataset_classes(
+            data=split_dict[k][x],
+            classes=class_dict[x][k],
+            num_partitions=dist.get_world_size(),
+            shuffle=True,
+            even_divisible=True
+            )[dist.get_rank()] for k in folds] for x in phases}
+        datasets = {x: [CacheDataset(
+            data=split_dict[x][k], 
+            transform=transforms(
+                dataset=x,
+                modalities=args.mod_list, 
+                device=device,
+                crop_size=ensure_tuple_rep(args.crop_size, 3)),
+            num_workers=8,
+            copy_cache=False
+            ) for k in folds] for x in phases}
+        dataloader = {x: [ThreadDataLoader(
+            dataset=datasets[x][k], 
+            batch_size=args.batch_size,
+            shuffle=(True if x == 'train' else False),   
+            drop_last=(True if x == 'train' else False),
+            num_workers=0
+            ) for k in folds] for x in phases}
+
+    else:
+        seq_split_dict = [convert_to_seqdict(split_dict[k], args.mod_list, phases) for k in folds]
+        seq_class_dict = {x: [[max(patient['label']) for patient in seq_split_dict[k][x][0]] for k in folds] for x in phases}
+        seq_split_dict = {x: [partition_dataset_classes(
+            data=seq_split_dict[k][x][0],
+            classes=seq_class_dict[x][k],
+            num_partitions=dist.get_world_size(),
+            shuffle=True,
+            even_divisible=False
+            )[dist.get_rank()] for k in folds] for x in phases}
+        datasets = {x: [CacheSeqDataset(
+            data=seq_split_dict[x][k],
+            image_keys=args.mod_list,
+            transform=transforms(
+                dataset=x, 
+                modalities=args.mod_list,
+                device=device,
+                crop_size=ensure_tuple_rep(args.crop_size, 3)),
+            num_workers=args.num_workers,
+            copy_cache=False
+            ) for k in folds] for x in phases}
+        dataloader = {x: [ThreadDataLoader(
+            datasets[x][k], 
+            batch_size=(args.batch_size if x == 'train' else 1), 
+            shuffle=(True if x == 'train' else False),   
+            drop_last=(True if x == 'train' else False),   
+            num_workers=0,
+            collate_fn=(SequenceBatchCollater(
+                keys=['image','label','lirads','delta'], 
+                seq_length=args.seq_length) if x == 'train' else list_data_collate)
+            ) for k in folds] for x in phases}
+        _, counts = np.unique(seq_class_dict['train'][0], return_counts=True)
+        pos_weight = counts[1] / counts.sum()
 
     return dataloader, pos_weight
 
@@ -529,14 +592,16 @@ def load_train_objs(
         args: argparse.Namespace,
         model: nn.Module,
         learning_rate: float = 1e-4,
-        pos_weight: float | None = None
+        pos_weight: float | List[float] | None = None
     ) -> tuple:
 
     if args.loss_fn == 'focal':
         train_fn = FocalLoss(gamma=args.gamma, alpha=pos_weight, label_smoothing=args.label_smoothing)
     else:
         train_fn = BinaryCELoss(weights=pos_weight, label_smoothing=args.label_smoothing)
-    loss_fn = [train_fn, BinaryCELoss()]
+    if args.backbone_only:
+        train_fn = nn.CrossEntropyLoss(weight=torch.Tensor(pos_weight), label_smoothing=args.label_smoothing)
+    loss_fn = [train_fn, BinaryCELoss() if not args.backbone_only else nn.CrossEntropyLoss()]
     params = get_params_groups(model)
     optimizer = optim.AdamW(params, lr=learning_rate, weight_decay=args.weight_decay)
     lr_schedule = cosine_scheduler(
@@ -552,10 +617,13 @@ def load_train_objs(
     return loss_fn, optimizer, scheduler
 
 def load_weights(
+        args: argparse.Namespace,
         weights_path: str
     ) -> dict:
 
     weights = torch.load(weights_path, map_location='cpu')
+    weights = {k.replace('backbone.', ''): v for k, v in weights.items()}
+    weights['downsample_layers.0.0.weight'] = weights['downsample_layers.0.0.weight'].repeat(1, len(args.mod_list), 1, 1, 1)
     return weights
 
 def transforms(
@@ -585,7 +653,7 @@ def transforms(
             keys=modalities,
             roi_center=(0.5, 0.5, 0.5),
             roi_size=(0.85, 0.8, 0.99),
-            min_size=crop_size),
+            min_size=(82, 82, 82)),
         CopyItemsd(keys=modalities[0], names='mask'),
         Lambdad(
             keys='mask', 
@@ -600,42 +668,41 @@ def transforms(
         ConcatItemsd(keys=modalities, name='image'),
         DeleteItemsd(keys=modalities + ['mask']),
         YeoJohnsond(keys='image', lmbda=0.1, channel_wise=True),
-        NormalizeIntensityd(keys='image', channel_wise=True),
+        RobustNormalized(keys='image', channel_wise=True),
+        SoftClipIntensityd(keys='image', min_value=-2.5, max_value=2.5, channel_wise=True),
         PercentileSpatialCropd(
             keys='image',
             roi_center=(0.45, 0.25, 0.3),
             roi_size=(0.6, 0.45, 0.4),
-            min_size=crop_size),
-        SoftClipIntensityd(keys='image', min_value=-3.0, max_value=3.0, channel_wise=True)
+            min_size=(82, 82, 82)),
+        CenterSpatialCropd(keys='image', roi_size=(96, 96, 96))
     ]
 
     train = [
         EnsureTyped(keys='image', track_meta=False, device=device, dtype=torch.float),
-        RandSpatialCropd(keys='image', roi_size=(72, 72, 72), random_size=False),
-        SpatialPadd(keys='image', spatial_size=crop_size, method='symmetric'),
+        RandSpatialCropd(keys='image', roi_size=crop_size, random_size=False),
         RandFlipd(keys='image', prob=0.5, spatial_axis=0),
         RandFlipd(keys='image', prob=0.5, spatial_axis=1),
         RandFlipd(keys='image', prob=0.5, spatial_axis=2),
         RandRotate90d(keys='image', prob=0.5),
-        RandScaleIntensityd(keys='image', prob=1.0, factors=0.1),
-        RandShiftIntensityd(keys='image', prob=1.0, offsets=0.1),
+        # RandScaleIntensityd(keys='image', prob=1.0, factors=0.1),
+        # RandShiftIntensityd(keys='image', prob=1.0, offsets=0.1),
         # RandGibbsNoised(keys='image', prob=0.1, alpha=(0.1, 0.9)),
         # RandKSpaceSpikeNoised(keys='image', prob=0.1, channel_wise=True),
         # RandCoarseDropoutd(keys='image', prob=0.25, holes=1, spatial_size=(16, 16, 16), max_spatial_size=(48, 48, 48)),
         NormalizeIntensityd(
             keys='image', 
-            subtrahend=(0.4467, 0.4416, 0.4409, 0.4212),
-            divisor=(0.6522, 0.6429, 0.6301, 0.6041),
+            subtrahend=(0.3736, 0.4208, 0.4409, 0.4367),
+            divisor=(0.6728, 0.6765, 0.6912, 0.6864),
             channel_wise=True)
     ]
 
     test = [
         CenterSpatialCropd(keys='image', roi_size=(72, 72, 72)),
-        SpatialPadd(keys='image', spatial_size=crop_size, method='symmetric'),
         NormalizeIntensityd(
             keys='image', 
-            subtrahend=(0.4467, 0.4416, 0.4409, 0.4212),
-            divisor=(0.6522, 0.6429, 0.6301, 0.6041),
+            subtrahend=(0.3736, 0.4208, 0.4409, 0.4367),
+            divisor=(0.6728, 0.6765, 0.6912, 0.6864),
             channel_wise=True),
         EnsureTyped(keys='image', track_meta=False, device=device, dtype=torch.float)
     ]
@@ -688,56 +755,105 @@ def main(
     cv_dataloader, pos_weight = load_train_data(args, device_id)
     set_track_meta(False)
 
-    for k in range(args.k_folds):
-        dataloader = {x: cv_dataloader[x][k] for x in ['train','val']}
-        backbone = convnext3d_tiny(
-            in_chans=len(args.mod_list), 
-            kernel_size=args.kernel_size,
-            drop_path_rate=args.stochastic_depth,
-            use_v2=args.use_v2, 
-            eps=args.epsilon)
-        model = MedNet(
-            backbone, 
-            num_classes=num_classes, 
-            max_len=16,
-            dropout=args.dropout, 
-            eps=args.epsilon)
-        if args.pretrained:
-            weights = load_weights(os.path.join(args.results_dir, 'model_weights/weights_fold7000_pretrain_decoder.pth'))
-            model.load_state_dict(weights)
-        model = model.to(device_id)
-        for name, param in model.named_parameters():
-            if not name.startswith(('pooler','head')):
-                param.requires_grad = False
-        if args.distributed:
-            model = nn.parallel.DistributedDataParallel(model, device_ids=[device_id])
-        loss_fn, optimizer, scheduler = load_train_objs(
-            args, 
-            model=model, 
-            pos_weight=pos_weight,
-            learning_rate=learning_rate)
-        trainer = Trainer(
-            model=model, 
-            loss_fn=loss_fn,
-            dataloaders=dataloader, 
-            optimizer=optimizer,
-            scheduler=scheduler,
-            num_folds=(args.k_folds if args.k_folds > 0 else 1),
-            num_steps=args.num_steps,
-            amp=args.amp,
-            suffix=args.suffix,
-            output_dir=args.results_dir)
-        trainer.train(
-            fold=k,
-            batch_size=args.batch_size, 
-            accum_steps=accum_steps,
-            val_steps=args.val_interval)
+    if args.backbone_only:
+        steps = np.arange(2000, 32000 + 1, 2000)
+        for step in steps:
+            for k in range(args.k_folds): 
+                dataloader = {x: cv_dataloader[x][k] for x in ['train','val']}
+                model = convnext3d_tiny(
+                    in_chans=len(args.mod_list), 
+                    num_classes=3,
+                    kernel_size=args.kernel_size,
+                    drop_path_rate=args.stochastic_depth,
+                    use_v2=args.use_v2, 
+                    eps=args.epsilon)
+                weights_path = os.path.join(args.results_dir, f'model_weights/weights_fold{step}_dmri_tiny_{args.out_dim}.pth')
+                weights = load_weights(args, weights_path)
+                model.load_state_dict(weights, strict=False)
+                model = model.to(device_id)
+                for name, param in model.named_parameters():
+                    if not name.startswith(('head')):
+                        param.requires_grad = False
+                if args.distributed:
+                    model = nn.parallel.DistributedDataParallel(model, device_ids=[device_id])
+                loss_fn, optimizer, scheduler = load_train_objs(
+                    args, 
+                    model=model, 
+                    pos_weight=pos_weight,
+                    learning_rate=learning_rate)
+                trainer = Trainer(
+                    model=model, 
+                    loss_fn=loss_fn,
+                    dataloaders=dataloader, 
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    num_folds=(args.k_folds if args.k_folds > 0 else 1),
+                    num_steps=args.num_steps,
+                    amp=args.amp,
+                    backbone_only=args.backbone_only,
+                    suffix=args.suffix + f'_step{step}',
+                    output_dir=args.results_dir)
+                trainer.train(
+                    fold=k,
+                    batch_size=args.batch_size, 
+                    accum_steps=accum_steps,
+                    val_steps=args.val_interval)
+            trainer.visualize_training(['train','val'], 'loss')
+            trainer.visualize_training(['train','val'], 'auprc')
+            trainer.visualize_training(['train','val'], 'auroc')
+    
+    else:
+        for k in range(args.k_folds):
+            dataloader = {x: cv_dataloader[x][k] for x in ['train','val']}
+            backbone = convnext3d_tiny(
+                in_chans=len(args.mod_list), 
+                kernel_size=args.kernel_size,
+                drop_path_rate=args.stochastic_depth,
+                use_v2=args.use_v2, 
+                eps=args.epsilon)
+            model = MedNet(
+                backbone, 
+                num_classes=num_classes, 
+                max_len=22,
+                dropout=args.dropout, 
+                eps=args.epsilon)
+            if args.pretrained:
+                weights = load_weights(os.path.join(args.results_dir, 'model_weights/weights_fold8000_dmri_tiny_v1.pth'))
+                model.backbone.load_state_dict(weights, strict=False)
+            model = model.to(device_id)
+            for name, param in model.named_parameters():
+                if name.startswith(('backbone')):
+                    param.requires_grad = False
+            if args.distributed:
+                model = nn.parallel.DistributedDataParallel(model, device_ids=[device_id])
+            loss_fn, optimizer, scheduler = load_train_objs(
+                args, 
+                model=model, 
+                pos_weight=pos_weight,
+                learning_rate=learning_rate)
+            trainer = Trainer(
+                model=model, 
+                loss_fn=loss_fn,
+                dataloaders=dataloader, 
+                optimizer=optimizer,
+                scheduler=scheduler,
+                num_folds=(args.k_folds if args.k_folds > 0 else 1),
+                num_steps=args.num_steps,
+                amp=args.amp,
+                backbone_only=args.backbone_only,
+                suffix=args.suffix,
+                output_dir=args.results_dir)
+            trainer.train(
+                fold=k,
+                batch_size=args.batch_size, 
+                accum_steps=accum_steps,
+                val_steps=args.val_interval)
+        trainer.visualize_training(['train','val'], 'loss')
+        trainer.visualize_training(['train','val'], 'auprc')
+        trainer.visualize_training(['train','val'], 'auroc')
 
     if args.distributed:
         cleanup()
-    trainer.visualize_training('loss')
-    trainer.visualize_training('auprc')
-    trainer.visualize_training('auroc')
     print('Script finished')
     
 

@@ -6,6 +6,7 @@ import os
 import numpy as np
 import pandas as pd
 from sklearn import metrics
+from sklearn.neighbors import KNeighborsClassifier
 import matplotlib.pyplot as plt
 from torch.cuda.amp import GradScaler, autocast
 from torchmetrics import MetricCollection
@@ -17,6 +18,35 @@ from torchmetrics.classification import (
     BinaryAveragePrecision, 
     BinaryAUROC
 )
+from monai.transforms import (
+    Compose,
+    LoadImaged,
+    EnsureChannelFirstd,
+    Orientationd,
+    Spacingd,
+    CropForegroundd,
+    ConcatItemsd,
+    CenterSpatialCropd,
+    ResampleToMatchd,
+    RandFlipd,
+    RandRotate90d,
+    EnsureTyped,
+    DeleteItemsd,
+    RandSpatialCropd,
+    RandShiftIntensityd,
+    RandScaleIntensityd,
+    RandKSpaceSpikeNoised,
+    RandGibbsNoised,
+    RandCoarseShuffled,
+    RandCoarseDropoutd,
+    RandZoomd,
+    CopyItemsd,
+    KeepLargestConnectedComponentd,
+    Lambdad,
+    NormalizeIntensityd,
+    SpatialPadd
+)
+from monai import transforms
 from monai.data import (
     ThreadDataLoader,
     CacheDataset,
@@ -29,10 +59,11 @@ from monai.visualize import OcclusionSensitivity
 from monai.utils import set_determinism
 from data.splits import GroupStratifiedSplit
 from data.datasets import CacheSeqDataset
+from data.transforms import PercentileSpatialCropd, YeoJohnsond, SoftClipIntensityd
 from data.utils import DatasetPreprocessor, convert_to_dict, convert_to_seqdict, SequenceBatchCollater
 from models.mednet import MedNet
 from models.convnext3d import convnext3d_atto, convnext3d_femto, convnext3d_pico, convnext3d_nano, convnext3d_tiny
-from train import data_transforms
+from utils.utils import prep_batch
 import argparse
 
 class Tester:
@@ -42,6 +73,7 @@ class Tester:
             model: nn.Module, 
             dataloaders: dict, 
             num_folds: int = 5,
+            backbone_only: bool = False,
             amp: bool = True,
             suffix: str | None = None,
             output_dir: str | None = None
@@ -65,66 +97,106 @@ class Tester:
         self.amp = amp
         self.suffix = suffix
         self.output_dir = output_dir
+        self.knn = KNeighborsClassifier(n_neighbors=num_folds)
+        self.backbone_only = backbone_only
         # self.grad_cam = GradCAMpp(self.model, target_layers=)
         # self.occ_sens = OcclusionSensitivity(backbone, n_batch=1)
 
-        self.metrics = MetricCollection([
-            BinaryAccuracy(), BinaryRecall(), BinaryPrecision(), BinaryF1Score(),
-            BinaryAveragePrecision(), BinaryAUROC()
-        ]).to(self.gpu_id)
+        # self.metrics = MetricCollection([
+        #     BinaryAccuracy(), BinaryRecall(), BinaryPrecision(), BinaryF1Score(),
+        #     BinaryAveragePrecision(), BinaryAUROC()
+        # ]).to(self.gpu_id)
 
-    def test(
+    @torch.no_grad()
+    def test_step_backbone(
             self,
-            fold: int
-            ) -> None:
+            batch: dict
+        ) -> torch.Tensor:
+
+        self.model.eval()
+        inputs, labels = batch['image'].to(self.gpu_id), batch['lirads'].to(self.gpu_id)
+
+        with autocast(enabled=self.amp):
+            feats = self.model(inputs)
+            feats = F.normalize(feats, p=2, dim=-1)
+        return feats, labels
+
+    @torch.no_grad()
+    def test_step_encoder(
+            self,
+            batch: dict
+        ) -> None:
 
         '''
         Run inference on the test set.
         '''
 
-        results_dict = {'preds': [], 'labels': []}
         self.model.eval()
-        with torch.no_grad():
-            for step, batch_data in enumerate(self.dataloaders['test']):
-                inputs, labels, pos_token, mask = self.prep_batch(batch_data, batch_size=1, device_id=self.gpu_id)
+        inputs, labels, pt_info, padding_mask = prep_batch(batch, batch_size=1)
+        inputs, labels, padding_mask = inputs.to(self.gpu_id), labels.to(self.gpu_id), padding_mask.to(self.gpu_id)
+        pt_info = [info.to(self.gpu_id) for info in pt_info]
 
-                with autocast(enabled=self.amp):
-                    logits = self.model(inputs, pos_token=pos_token, padding_mask=None)
+        with autocast(enabled=self.amp):
+            logits = self.model(inputs, pad_mask=padding_mask, pt_info=pt_info)
 
-                preds = F.sigmoid(logits.squeeze(-1))
-                self.metrics.update(preds, labels)
-                results_dict['preds'].append(preds.cpu())
-                results_dict['labels'].append(labels.cpu())
+        preds = F.sigmoid(logits.squeeze(-1))
+        preds = torch.where(preds >= 0.5, 1, 0)
+        return preds, labels
 
-        results = self.metrics.compute()
-        self.metrics.reset()
+    def knn_classify(
+            self
+        ):
 
-        if self.gpu_id == 0:
-            for metric in results:
-                print(f'[Fold {fold}] {metric}: {results[metric].item()}')
-        self.save_output(results_dict, 'preds', fold)
-    
-    @staticmethod
-    def prep_batch(data: dict, batch_size: int, device_id: torch.device | None = None, normalize: bool = True) -> tuple:
+        out_dict = {x: [] for x in ['out','labels']}
+        for batch in self.dataloaders['train']:
+            if self.backbone_only:
+                feats, labels = self.test_step_backbone(batch)
+                out_dict['out'].append(feats.cpu())
+        
+        out = torch.cat(out_dict['out'])
+        labels = torch.cat(out_dict['labels'])
 
-        stats_dict = {'mean': 63.3394, 'std': 11.2231}
-        B, C, H, W, D = data['image'].shape
-        for key in data:
-            if key == 'image':
-                data[key] = data[key].reshape(batch_size, B // batch_size, C, H, W, D)
-            elif not isinstance(data[key], list):
-                try:
-                    data[key] = data[key].reshape(batch_size, B // batch_size)
-                except:
-                    pass
-        data['label'] = torch.max(data['label'], dim=1).values
-        data['age'] = torch.where(data['age'] != 0.0, (data['age'] - stats_dict['mean']) / stats_dict['std'], 0.0) if normalize else data['age']
-        mask = torch.where(data['age'] == 0.0, 1, 0)
+        self.knn.fit(out, labels)
+        preds = self.knn.predict(out)
+        self.compute_metrics(labels, preds)
 
-        if device_id is not None:
-            return data['image'].to(device_id), data['label'].to(device_id, dtype=torch.int), data['age'].to(device_id, dtype=torch.float), mask.to(device_id)
-        else:
-            return data['image'], data['label'].to(torch.int), data['age'].to(torch.float), mask
+    def test(
+            self
+        ) -> None:
+
+        if self.backbone_only:
+            self.knn_classify()
+
+        out_dict = {x: [] for x in ['preds','labels']}
+        for batch in self.dataloaders['test']:
+            if self.backbone_only:
+                feats, labels = self.test_step_backbone(batch)
+                out_dict['preds'].append(feats.cpu())
+            else:
+                preds, labels = self.test_step_encoder(batch)
+                out_dict['preds'].append(preds.cpu())
+            out_dict['labels'].append(labels.cpu())
+        
+        preds = torch.cat(out_dict['preds'])
+        labels = torch.cat(out_dict['labels'])
+
+        if self.backbone_only:
+            preds = self.knn.predict(preds)
+        self.compute_metrics(labels, preds)
+
+    def compute_metrics(
+            self,
+            labels: torch.Tensor,
+            preds: torch.Tensor
+        ) -> None:
+        
+        acc = metrics.accuracy_score(labels, preds)
+        prec = metrics.precision_score(labels, preds)
+        rec = metrics.recall_score(labels, preds)
+        fscore = metrics.f1_score(labels, preds)
+        auroc = metrics.roc_auc_score(labels, preds)
+        auprc = metrics.average_precision_score(labels, preds)
+        print(f'Accuracy: {acc}, Precision: {prec}, Recall: {rec}, F1-Score: {fscore}, AUROC: {auroc}, and AUPRC: {auprc}')
 
     def save_output(
             self, 
@@ -202,26 +274,81 @@ class Tester:
             plt.savefig(store_path, dpi=300, bbox_inches="tight")
             plt.close()
 
-        acc = metrics.accuracy_score(results['labels'], preds_array)
-        prec = metrics.precision_score(results['labels'], preds_array)
-        rec = metrics.recall_score(results['labels'], preds_array)
-        fscore = metrics.f1_score(results['labels'], preds_array)
-        print(f'Accuracy: {acc}, Precision: {prec}, Recall: {rec}, and F1-Score: {fscore}')
+def transforms(
+        dataset: str,
+        modalities: list,
+        device: torch.device,
+        crop_size: tuple = (72, 72, 72),
+        image_spacing: tuple = (1.5, 1.5, 1.5)
+    ) -> transforms:
 
-    def load_weights(
-            self,
-            fold: int,
-            weights_dir: str
-        ) -> None:
+    '''
+    Perform data transformations on image and image labels.
 
-        '''
-        Update the model dictionary with the weights from the best epoch.
-        '''
-        map_location = {'cuda:%d' % 0: 'cuda:%d' % self.gpu_id}
-        weights_path = os.path.join(weights_dir, f'weights_fold{fold}_' + self.suffix + '.pth')
-        weights = torch.load(weights_path, map_location=map_location)
-        self.model.load_state_dict(weights)
+    Args:
+        dataset (str): Dataset to apply transformations on. Can be 'train', 'val' or 'test'.
 
+    Returns:
+        transforms (monai.transforms): Data transformations to be applied.
+    '''
+    prep = [
+        LoadImaged(keys=modalities, image_only=True),
+        EnsureChannelFirstd(keys=modalities),
+        Orientationd(keys=modalities, axcodes='PLI'),
+        Spacingd(keys=modalities, pixdim=image_spacing, mode=3),
+        ResampleToMatchd(keys=modalities, key_dst=modalities[0], mode=3),
+        PercentileSpatialCropd(
+            keys=modalities,
+            roi_center=(0.5, 0.5, 0.5),
+            roi_size=(0.85, 0.8, 0.99),
+            min_size=crop_size),
+        CopyItemsd(keys=modalities[0], names='mask'),
+        Lambdad(
+            keys='mask', 
+            func=lambda x: torch.where(x > torch.mean(x), 1, 0)),
+        KeepLargestConnectedComponentd(keys='mask', connectivity=1),
+        CropForegroundd(
+            keys=modalities,
+            source_key='mask',
+            select_fn=lambda x: x > 0,
+            k_divisible=1,
+            allow_smaller=False),
+        ConcatItemsd(keys=modalities, name='image'),
+        DeleteItemsd(keys=modalities + ['mask']),
+        YeoJohnsond(keys='image', lmbda=0.1, channel_wise=True),
+        NormalizeIntensityd(keys='image', channel_wise=True),
+        PercentileSpatialCropd(
+            keys='image',
+            roi_center=(0.45, 0.25, 0.3),
+            roi_size=(0.6, 0.45, 0.4),
+            min_size=crop_size),
+        SoftClipIntensityd(keys='image', min_value=-3.0, max_value=3.0, channel_wise=True)
+    ]
+
+    test = [
+        CenterSpatialCropd(keys='image', roi_size=(72, 72, 72)),
+        SpatialPadd(keys='image', spatial_size=crop_size, method='symmetric'),
+        NormalizeIntensityd(
+            keys='image', 
+            subtrahend=(0.4467, 0.4416, 0.4409, 0.4212),
+            divisor=(0.6522, 0.6429, 0.6301, 0.6041),
+            channel_wise=True),
+        EnsureTyped(keys='image', track_meta=False, device=device, dtype=torch.float)
+    ]
+    return Compose(prep + test)
+
+def load_weights(
+        weights_path: str
+    ) -> dict:
+
+    weights = torch.load(weights_path, map_location='cpu')
+    for key in list(weights.keys()):
+        if 'backbone.' in key:
+            weights[key.replace('backbone.', '')] = weights.pop(key)
+        if 'head.' in key:
+            weights.pop(key)
+    weights['downsample_layers.0.0.weight'] = weights['downsample_layers.0.0.weight'].repeat(1, 4, 1, 1, 1)
+    return weights
 
 def parse_args() -> argparse.Namespace:
 
@@ -234,12 +361,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--num-classes", default=2, type=int,
                         help="Number of output classes. Defaults to 2.")
-    parser.add_argument("--pooling-mode", type=str, default='cls',
-                        help="Pooling to use. Defaults to cls pooling")
     parser.add_argument("--distributed", action='store_true',
                         help="Flag to enable distributed training.")
     parser.add_argument("--amp", action='store_true',
                         help="Flag to enable automated mixed precision training.")
+    parser.add_argument("--backbone-only", action='store_true',
+                        help="Flag to only test the backbone.")
     parser.add_argument("--k-folds", default=4, type=int, 
                         help="Number of folds to evaluate over.")
     parser.add_argument("--batch-size", default=4, type=int, 
@@ -278,30 +405,34 @@ def load_test_objs(
     Returns:
         tuple: Training objects consisting of the datasets, dataloaders, the model, and the performance metric.
     '''    
-    data_dict, label_df = DatasetPreprocessor(data_dir=args.data_dir).load_data(modalities=args.mod_list)
+    phases = ['train','test'] if args.backbone_only else ['test']
+    data_dict, label_df = DatasetPreprocessor(
+        data_dir=args.data_dir).load_data(modalities=args.mod_list, keys=['label','age'], file_name='labels.csv', verbose=False)
+    lirads_dict, lirads_df = DatasetPreprocessor(
+        data_dir=args.data_dir, no_labels=True).load_data(modalities=args.mod_list, keys=['lirads','age'], file_name='lirads.csv')
     dev, test = GroupStratifiedSplit(split_ratio=0.75).split_dataset(label_df)
-    train, val = GroupStratifiedSplit(split_ratio=0.8).split_dataset(dev)
-    # test = test[(test['delta'] < -365.25) | (test['delta'].isnull())]
-    split_dict = convert_to_dict([val], data_dict=data_dict, split_names=['test'], verbose=True)
+    lirads_test = lirads_df[lirads_df['patient_id'].isin(test['patient_id'])]
+    lirads_dev = lirads_df[-lirads_df['patient_id'].isin(lirads_test['patient_id'])]
+    split_dict = convert_to_dict([lirads_dev, lirads_test], data_dict=lirads_dict, split_names=phases, verbose=False)
 
-    if args.seq_length > 0:
-        seq_split_dict = convert_to_seqdict(split_dict, args.mod_list, ['test'])
-        seq_class_dict = {x: [max(patient['label']) for patient in seq_split_dict[x][0]] for x in ['test']}
+    if not args.backbone_only:
+        seq_split_dict = convert_to_seqdict(split_dict, args.mod_list, phases)
+        seq_class_dict = {x: [max(patient['label']) for patient in seq_split_dict[x][0]] for x in phases}
         seq_split_dict = {x: partition_dataset_classes(
             data=seq_split_dict[x][0],
             classes=seq_class_dict[x],
             num_partitions=dist.get_world_size(),
             shuffle=True,
-            even_divisible=(True if x == 'train' else False))[dist.get_rank()] for x in ['test']}
+            even_divisible=(True if x == 'train' else False))[dist.get_rank()] for x in phases}
         datasets = {x: CacheSeqDataset(
             data=seq_split_dict[x], 
             image_keys=args.mod_list,
-            transform=data_transforms(
+            transform=transforms(
                 dataset=x, 
                 modalities=args.mod_list,
                 device=device_id), 
             num_workers=8,
-            copy_cache=False) for x in ['test']}
+            copy_cache=False) for x in phases}
         dataloader = {x: ThreadDataLoader(
             dataset=datasets[x], 
             batch_size=(args.batch_size if x == 'train' else 1), 
@@ -310,29 +441,29 @@ def load_test_objs(
             drop_last=False,
             collate_fn=(SequenceBatchCollater(
                 keys=['image','label','age'], 
-                seq_length=args.seq_length) if x == 'train' else list_data_collate)) for x in ['test']}
+                seq_length=args.seq_length) if x == 'train' else list_data_collate)) for x in phases}
     else:
-        class_dict = {x: [patient['label'] for patient in split_dict[x]] for x in ['test']}
+        class_dict = {x: [patient['lirads'] for patient in split_dict[x]] for x in phases}
         split_dict = {x: partition_dataset_classes(
             data=split_dict[x],
             classes=class_dict[x],
             num_partitions=dist.get_world_size(),
             shuffle=True,
-            even_divisible=(True if x == 'train' else False))[dist.get_rank()] for x in ['test']}
+            even_divisible=(True if x == 'train' else False))[dist.get_rank()] for x in phases}
         datasets = {x: CacheDataset(
             data=split_dict[x], 
-            transform=data_transforms(
+            transform=transforms(
                 dataset=x, 
                 modalities=args.mod_list, 
                 device=device_id), 
             num_workers=8,
-            copy_cache=False) for x in ['test']}
+            copy_cache=False) for x in phases}
         dataloader = {x: ThreadDataLoader(
             dataset=datasets[x], 
             batch_size=(args.batch_size if x == 'train' else 1), 
             shuffle=(True if x == 'train' else False),   
             num_workers=0,
-            drop_last=(True if x == 'train' else False)) for x in ['test']}
+            drop_last=(True if x == 'train' else False)) for x in phases}
 
     return dataloader
 
@@ -376,29 +507,34 @@ def main(
     dataloader = load_test_objs(args, device_id)
     set_track_meta(False)
 
-    backbone = convnext3d_femto(
+    model = convnext3d_tiny(
         in_chans=len(args.mod_list), 
-        use_grn=True, 
-        eps=args.epsilon)
-    model = MedNet(
-        backbone, 
-        num_classes=num_classes, 
-        pooling_mode=args.pooling_mode, 
-        eps=args.epsilon)
+        kernel_size=3, 
+        drop_path_rate=0.1, 
+        use_v2=False,
+        eps=1e-6)
+    weights = load_weights(os.path.join(args.results_dir, 'model_weights/weights_fold8000_dmri_tiny_v1.pth'))
+    model.load_state_dict(weights, strict=False)
+    model.head = nn.Identity()
+    # model = MedNet(
+    #     backbone, 
+    #     num_classes=num_classes, 
+    #     pooling_mode=args.pooling_mode, 
+    #     eps=args.epsilon)
     model = model.to(device_id)
     if args.distributed:
         model = nn.parallel.DistributedDataParallel(model, device_ids=[device_id])
-    tester = Tester(
-        model=model, 
-        dataloaders=dataloader, 
-        num_folds=args.k_folds,
-        amp=args.amp,
-        suffix=args.suffix,
-        output_dir=args.results_dir)
-    for k in range(args.k_folds):
-        tester.load_weights(fold=k, weights_dir=args.weights_dir)
-        tester.test(fold=k)
-    tester.visualize_results()
+    for k in range(3, args.k_folds):
+        tester = Tester(
+            model=model, 
+            dataloaders=dataloader, 
+            num_folds=k,
+            backbone_only=True,
+            amp=args.amp,
+            suffix=args.suffix,
+            output_dir=args.results_dir)
+        tester.test()
+    # tester.visualize_results()
     # Cleanup distributed training.
     if args.distributed:
         cleanup()
