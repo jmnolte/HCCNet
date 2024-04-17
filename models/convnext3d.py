@@ -206,7 +206,7 @@ class GRN(nn.Module):
         return self.gamma * (x * Nx) + self.beta + x
         
 def convnext3d_atto(**kwargs):
-    model = ConvNeXt3d(depths=[2, 2, 6, 2], dims=[40, 80, 160, 320], **kwargs)
+    model = ConvNeXt3d(depths=[2, 2, 6, 2], dims=[32, 64, 128, 256], **kwargs)
     return model
 
 def convnext3d_femto(**kwargs):
@@ -234,5 +234,5 @@ def convnext3d_large(**kwargs):
     return model
 
 def convnext3d_huge(**kwargs):
-    model = ConvNeXt3d(depths=[3, 3, 27, 3], dims=[352, 704, 1408, 2816], **kwargs)
+    model = ConvNeXt3d(depths=[3, 3, 27, 3], dims=[256, 512, 1024, 2048], **kwargs)
     return model

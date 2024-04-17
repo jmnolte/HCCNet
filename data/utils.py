@@ -174,6 +174,7 @@ class DatasetPreprocessor:
         new_keys = ['uid'] + keys
         label_dict = {x: [] for x in new_keys}
         labels_df = pd.read_csv(label_path)
+        labels_df['observation'] = labels_df['observation'].astype(int)
         for idx, row in labels_df.iterrows():
             if labels_df.loc[idx, 'observation'] < 10:
                 labels_df.loc[idx, 'uid'] = row['id'] + '_00' + str(row['observation'])

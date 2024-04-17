@@ -68,12 +68,10 @@ def prep_batch(
                 data[key] = data[key].reshape(batch_size, seq_length)
             except:
                 pass
-    padding_mask = torch.where(data['age'] == 0.0, 1.0, 0.0)
+    padding_mask = torch.where(data['delta'] == 0.0, 1.0, 0.0)
+    data['lirads'] = torch.where(data['delta'] == 0.0, 0.0, data['lirads'] + 1)
     pad_idx = torch.argmax(padding_mask, dim=1)
     pad_idx = torch.where(pad_idx == 0, seq_length, pad_idx)
-    for key in ['etiology', 'sex']:
-        data[key] = torch.max(data[key], dim=1).values
-        data[key] = data[key].unsqueeze(-1).expand(-1, seq_length)
     if pretrain:
         data['label'] = torch.zeros(batch_size)
         for i in range(batch_size):
@@ -82,11 +80,10 @@ def prep_batch(
                 shuffled_idx = torch.randperm(pad_idx[i])
                 sorted_idx = torch.sort(shuffled_idx).values
                 data['image'][i, :pad_idx[i]] = data['image'][i, shuffled_idx]
-                data['age'][i, :pad_idx[i]] = data['age'][i, shuffled_idx]
                 data['label'][i] = 0 if shuffled_idx.equal(sorted_idx) else 1
     else:
         data['label'] = torch.max(data['label'], dim=1).values
-    pt_info = [data['age'], data['etiology'], data['sex']]
+    pt_info = [data['delta'], data['lirads']]
     return data['image'], data['label'], pt_info, padding_mask
 
 class MultiCropWrapper(nn.Module):

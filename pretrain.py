@@ -36,7 +36,8 @@ from monai.transforms import (
     CopyItemsd,
     KeepLargestConnectedComponentd,
     Lambdad,
-    NormalizeIntensityd
+    NormalizeIntensityd,
+    CenterSpatialCropd
 )
 from monai.data import (
     ThreadDataLoader,
@@ -46,11 +47,11 @@ from monai.data import (
 )
 from monai.utils.misc import ensure_tuple_rep
 from monai.utils import set_determinism
-from data.transforms import PercentileSpatialCropd, YeoJohnsond, SoftClipIntensityd, ResampleToMatchFirstd, RandSelectChanneld
+from data.transforms import PercentileSpatialCropd, YeoJohnsond, SoftClipIntensityd, ResampleToMatchFirstd, RandSelectChanneld, RobustNormalized
 from data.splits import GroupStratifiedSplit
 from data.datasets import CacheSeqDataset
 from data.utils import DatasetPreprocessor, convert_to_dict, convert_to_seqdict, SequenceBatchCollater
-from models.convnext3d import convnext3d_femto, convnext3d_pico, convnext3d_nano, convnext3d_tiny
+from models.convnext3d import convnext3d_atto, convnext3d_femto, convnext3d_pico, convnext3d_nano, convnext3d_tiny
 from models.dinohead import DINOHead
 from models.mednet import MedNet
 from losses.dinoloss import DINOLoss
@@ -81,10 +82,10 @@ class Pretrainer:
         if isinstance(model, list):
             self.student = model[0]
             self.teacher = model[1]
-            self.pretrain_encoder = True
+            self.backbone_only = True
         else:
             self.model = model
-            self.pretrain_encoder = False
+            self.backbone_only = False
         self.dataloaders = dataloaders
         self.num_steps = num_steps
         self.num_folds = 1
@@ -99,7 +100,7 @@ class Pretrainer:
 
         self.loss_fn = loss_fn.to(self.gpu_id)
         self.optim = optimizer
-        if self.pretrain_encoder:
+        if self.backbone_only:
             self.lr_schedule, self.wd_schedule, self.m_schedule = scheduler[0], scheduler[1], scheduler[2]
             self.params = self.student.parameters()
         else:
@@ -215,7 +216,7 @@ class Pretrainer:
         if clip_grad:
             self.scaler.unscale_(self.optim)
             nn.utils.clip_grad_norm_(self.params, max_norm=1.0, norm_type=2)
-        if self.pretrain_encoder:
+        if self.backbone_only:
             cancel_gradients_last_layer(self.student, step=step, warmup_steps=warmup_steps)
 
         self.scaler.step(self.optim)
@@ -255,7 +256,7 @@ class Pretrainer:
                     print(f'Step {update_step}/{self.num_steps}')
                     print('-' * 15)
 
-                if self.pretrain_encoder:
+                if self.backbone_only:
                     accum_loss += self.encoder_step(batch, update_step, accum_steps)
                 else:
                     accum_loss += self.decoder_step(batch, batch_size, accum_steps)
@@ -266,7 +267,7 @@ class Pretrainer:
                         print(f"Step Loss: {accum_loss:.4f}")
                     running_loss += accum_loss
                     accum_loss = 0.0
-                    if self.pretrain_encoder:
+                    if self.backbone_only:
                         self.update_teacher(update_step)
 
                 if (step + 1) % (accum_steps * log_every) == 0:
@@ -281,7 +282,7 @@ class Pretrainer:
                 if (step + 1) / accum_steps % 1000 == 0:
                     dist.barrier()
                     if self.gpu_id == 0:
-                        model_weights = self.teacher.module.state_dict() if self.pretrain_encoder else self.model.module.state_dict()
+                        model_weights = self.teacher.module.state_dict() if self.backbone_only else self.model.module.state_dict()
                         self.save_output(model_weights, 'weights', fold=int(update_step + 1))
                     dist.barrier()
 
@@ -375,7 +376,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--local-crop-size", default=48, type=int, 
                         help="Local crop size to use. Defaults to 48.")
 
-    parser.add_argument("--pretrain-encoder", action='store_true',
+    parser.add_argument("--backbone-only", action='store_true',
                         help="Whether to only pretrain the CNN backbone.")
     parser.add_argument("--arch", type=str, default='femto',
                         help="ConvNeXT model architecture. Choices are femto, pico, nano, tiny. Defaults to femto.")
@@ -439,7 +440,7 @@ def encoder_transforms(
             keys='image',
             roi_center=(0.5, 0.5, 0.5),
             roi_size=(0.85, 0.8, 0.99),
-            min_size=global_crop_size),
+            min_size=(82, 82, 82)),
         CopyItemsd(keys='image', names='mask'),
         Lambdad(keys='mask', func=lambda x: x[:1]),
         Lambdad(keys='mask', func=lambda x: torch.where(x > torch.mean(x), 1, 0)),
@@ -451,26 +452,25 @@ def encoder_transforms(
             k_divisible=1,
             allow_smaller=False),
         YeoJohnsond(keys='image', lmbda=0.1, channel_wise=True),
-        NormalizeIntensityd(keys='image', channel_wise=True),
+        RobustNormalized(keys='image', channel_wise=True),
+        SoftClipIntensityd(keys='image', min_value=-2.5, max_value=2.5, channel_wise=True),
         PercentileSpatialCropd(
             keys='image',
             roi_center=(0.45, 0.25, 0.3),
             roi_size=(0.6, 0.45, 0.4),
-            min_size=global_crop_size),
-        SoftClipIntensityd(keys='image', min_value=-3.0, max_value=3.0, channel_wise=True),
+            min_size=(82, 82, 82)),
+        CenterSpatialCropd(keys='image', roi_size=(96, 96, 96)),
         CopyItemsd(keys='image', times=4, names=['gv1','gv2','lv1','lv2']),
         DeleteItemsd(keys=modalities + ['image','mask']),
         EnsureTyped(keys=['gv1','gv2','lv1','lv2'], track_meta=False, device=device, dtype=torch.float),
     ]
 
     global_crop = [
-        RandSpatialCropd(keys=['gv1','gv2'], roi_size=global_crop_size, random_size=False),
-        SpatialPadd(keys=['gv1','gv2'], spatial_size=global_crop_size, method='symmetric')
+        RandSpatialCropd(keys=['gv1','gv2'], roi_size=global_crop_size, random_size=False)
     ]
 
     local_crop = [
-        RandSpatialCropd(keys=['lv1','lv2'], roi_size=local_crop_size, random_size=False),
-        SpatialPadd(keys=['lv1','lv2'], spatial_size=local_crop_size, method='symmetric')
+        RandSpatialCropd(keys=['lv1','lv2'], roi_size=local_crop_size, random_size=False)
     ]
 
     post = [
@@ -479,7 +479,7 @@ def encoder_transforms(
         RandFlipd(keys=['gv1','gv2','lv1','lv2'], prob=0.5, spatial_axis=2),
         RandRotate90d(keys=['gv1','gv2','lv1','lv2'], prob=0.5),
         RandSelectChanneld(keys=['gv1','gv2','lv1','lv2'], num_channels=1),
-        NormalizeIntensityd(keys=['gv1','gv2','lv1','lv2'], subtrahend=0.4376, divisor=0.6323)
+        NormalizeIntensityd(keys=['gv1','gv2','lv1','lv2'], subtrahend=0.4180, divisor=0.6817)
     ]
     return Compose(prep + global_crop + local_crop + post)
 
@@ -509,7 +509,7 @@ def decoder_transforms(
             keys=modalities,
             roi_center=(0.5, 0.5, 0.5),
             roi_size=(0.85, 0.8, 0.99),
-            min_size=crop_size),
+            min_size=(82, 82, 82)),
         CopyItemsd(keys=modalities[0], names='mask'),
         Lambdad(
             keys='mask', 
@@ -524,15 +524,16 @@ def decoder_transforms(
         ConcatItemsd(keys=modalities, name='image'),
         DeleteItemsd(keys=modalities + ['mask']),
         YeoJohnsond(keys='image', lmbda=0.1, channel_wise=True),
-        NormalizeIntensityd(keys='image', channel_wise=True),
+        RobustNormalized(keys='image', channel_wise=True),
+        SoftClipIntensityd(keys='image', min_value=-2.5, max_value=2.5, channel_wise=True),
         PercentileSpatialCropd(
             keys='image',
             roi_center=(0.45, 0.25, 0.3),
             roi_size=(0.6, 0.45, 0.4),
-            min_size=crop_size),
-        SoftClipIntensityd(keys='image', min_value=-3.0, max_value=3.0, channel_wise=True),
+            min_size=(82, 82, 82)),
+        CenterSpatialCropd(keys='image', roi_size=(96, 96, 96)),
+
         EnsureTyped(keys='image', track_meta=False, device=device, dtype=torch.float),
-        SpatialPadd(keys='image', spatial_size=crop_size, method='symmetric'),
         RandSpatialCropd(keys='image', roi_size=crop_size, random_size=False),
         RandFlipd(keys='image', prob=0.5, spatial_axis=0),
         RandFlipd(keys='image', prob=0.5, spatial_axis=1),
@@ -542,8 +543,8 @@ def decoder_transforms(
         RandShiftIntensityd(keys='image', prob=1.0, offsets=0.1),
         NormalizeIntensityd(
             keys='image', 
-            subtrahend=(0.4467, 0.4416, 0.4409, 0.4212),
-            divisor=(0.6522, 0.6429, 0.6301, 0.6041),
+            subtrahend=(0.3736, 0.4208, 0.4409, 0.4367),
+            divisor=(0.6728, 0.6765, 0.6912, 0.6864),
             channel_wise=True)
     ]
     return Compose(transforms)
@@ -555,24 +556,22 @@ def load_pretrain_data(
     
     phases = ['train']
     data_dict, label_df = DatasetPreprocessor(
-        data_dir=args.data_dir).load_data(
-            modalities=args.mod_list, keys=['label','age','etiology','sex'], file_name='labels.csv', verbose=False)
+        data_dir=args.data_dir).load_data(modalities=args.mod_list, keys=['label','lirads','delta'], file_name='labels.csv', verbose=False)
     ssl_dict, ssl_df = DatasetPreprocessor(
-        data_dir=args.data_dir, partial=(True if args.pretrain_encoder else False), no_labels=True).load_data(
-            modalities=args.mod_list, keys=['age','etiology','sex'], file_name='nolabels.csv')
+        data_dir=args.data_dir, partial=(True if args.backbone_only else False), no_labels=True).load_data(modalities=args.mod_list, keys=['lirads','delta'], file_name='lirads.csv')
     dev, test = GroupStratifiedSplit(split_ratio=0.75).split_dataset(label_df)
     ssl_test = ssl_df[ssl_df['patient_id'].isin(test['patient_id'])]
     ssl_dev = ssl_df[-ssl_df['patient_id'].isin(ssl_test['patient_id'])]
     split_dict = convert_to_dict([ssl_dev], data_dict=ssl_dict, split_names=phases, verbose=False)
     seq_split_dict = convert_to_seqdict(split_dict, args.mod_list, phases)
     split_dict = {x: partition_dataset(
-        data=split_dict[x] if args.pretrain_encoder else seq_split_dict[x][0],
+        data=split_dict[x] if args.backbone_only else seq_split_dict[x][0],
         num_partitions=dist.get_world_size(),
         shuffle=True,
         even_divisible=True
         )[dist.get_rank()] for x in phases}
 
-    if args.pretrain_encoder:
+    if args.backbone_only:
         datasets = {x: CacheDataset(
             data=split_dict[x], 
             transform=encoder_transforms(
@@ -608,7 +607,7 @@ def load_pretrain_data(
             num_workers=0,
             drop_last=True,
             collate_fn=(SequenceBatchCollater(
-                keys=['image','age','etiology','sex'], 
+                keys=['image','delta'], 
                 seq_length=7))
             ) for x in phases}
     return dataloader
@@ -625,8 +624,8 @@ def load_pretrain_objs(
         num_steps=args.num_steps,
         teacher_temp=args.teacher_temp,
         teacher_warmup_temp=args.teacher_warmup_temp,
-        teacher_warmup_steps=int(args.warmup_steps * 4)
-    ) if args.pretrain_encoder else nn.BCEWithLogitsLoss()
+        teacher_warmup_steps=int(args.warmup_steps * 2)
+    ) if args.backbone_only else nn.BCEWithLogitsLoss()
     params = get_params_groups(model)
     optimizer = optim.AdamW(params, lr=learning_rate, weight_decay=args.weight_decay)
     lr_schedule = cosine_scheduler(
@@ -642,35 +641,40 @@ def load_pretrain_objs(
         base_value=args.teacher_momentum,
         final_value=1,
         steps=args.num_steps)
-    schedules = [lr_schedule, wd_schedule, m_schedule] if args.pretrain_encoder else [lr_schedule, wd_schedule]
+    schedules = [lr_schedule, wd_schedule, m_schedule] if args.backbone_only else [lr_schedule, wd_schedule]
     return loss_fn, optimizer, schedules
 
 def load_encoder(
         args: argparse.Namespace
     ) -> Tuple[nn.Module]:
 
-    if args.arch == 'femto':
+    if args.arch == 'atto':
+        student = convnext3d_atto(
+            in_chans=1 if args.backbone_only else len(args.mod_list), kernel_size=args.kernel_size, drop_path_rate=args.stochastic_depth, use_v2=args.use_v2, eps=args.epsilon)
+        teacher = convnext3d_atto(
+            in_chans=1 if args.backbone_only else len(args.mod_list), kernel_size=args.kernel_size, use_v2=args.use_v2, eps=args.epsilon)
+    elif args.arch == 'femto':
         student = convnext3d_femto(
-            in_chans=1 if args.pretrain_encoder else len(args.mod_list), kernel_size=args.kernel_size, drop_path_rate=args.stochastic_depth, use_v2=args.use_v2, eps=args.epsilon)
+            in_chans=1 if args.backbone_only else len(args.mod_list), kernel_size=args.kernel_size, drop_path_rate=args.stochastic_depth, use_v2=args.use_v2, eps=args.epsilon)
         teacher = convnext3d_femto(
-            in_chans=1 if args.pretrain_encoder else len(args.mod_list), kernel_size=args.kernel_size, use_v2=args.use_v2, eps=args.epsilon)
+            in_chans=1 if args.backbone_only else len(args.mod_list), kernel_size=args.kernel_size, use_v2=args.use_v2, eps=args.epsilon)
     elif args.arch == 'pico':
         student = convnext3d_pico(
-            in_chans=1 if args.pretrain_encoder else len(args.mod_list), kernel_size=args.kernel_size, drop_path_rate=args.stochastic_depth, use_v2=args.use_v2, eps=args.epsilon)
+            in_chans=1 if args.backbone_only else len(args.mod_list), kernel_size=args.kernel_size, drop_path_rate=args.stochastic_depth, use_v2=args.use_v2, eps=args.epsilon)
         teacher = convnext3d_pico(
-            in_chans=1 if args.pretrain_encoder else len(args.mod_list), kernel_size=args.kernel_size, use_v2=args.use_v2, eps=args.epsilon)
+            in_chans=1 if args.backbone_only else len(args.mod_list), kernel_size=args.kernel_size, use_v2=args.use_v2, eps=args.epsilon)
     elif args.arch == 'nano':
         student = convnext3d_nano(
-            in_chans=1 if args.pretrain_encoder else len(args.mod_list), kernel_size=args.kernel_size, drop_path_rate=args.stochastic_depth, use_v2=args.use_v2, eps=args.epsilon)
+            in_chans=1 if args.backbone_only else len(args.mod_list), kernel_size=args.kernel_size, drop_path_rate=args.stochastic_depth, use_v2=args.use_v2, eps=args.epsilon)
         teacher = convnext3d_nano(
-            in_chans=1 if args.pretrain_encoder else len(args.mod_list), kernel_size=args.kernel_size, use_v2=args.use_v2, eps=args.epsilon)
+            in_chans=1 if args.backbone_only else len(args.mod_list), kernel_size=args.kernel_size, use_v2=args.use_v2, eps=args.epsilon)
     elif args.arch == 'tiny':
         student = convnext3d_tiny(
-            in_chans=1 if args.pretrain_encoder else len(args.mod_list), kernel_size=args.kernel_size, drop_path_rate=args.stochastic_depth, use_v2=args.use_v2, eps=args.epsilon)
+            in_chans=1 if args.backbone_only else len(args.mod_list), kernel_size=args.kernel_size, drop_path_rate=args.stochastic_depth, use_v2=args.use_v2, eps=args.epsilon)
         teacher = convnext3d_tiny(
-            in_chans=1 if args.pretrain_encoder else len(args.mod_list), kernel_size=args.kernel_size, use_v2=args.use_v2, eps=args.epsilon)
+            in_chans=1 if args.backbone_only else len(args.mod_list), kernel_size=args.kernel_size, use_v2=args.use_v2, eps=args.epsilon)
     
-    if args.pretrain_encoder:
+    if args.backbone_only:
         return student, teacher
     else:
         return student
@@ -727,7 +731,7 @@ def main(
 
     dataloader = load_pretrain_data(args, device_id)
     set_track_meta(False)
-    if args.pretrain_encoder:
+    if args.backbone_only:
         student, teacher = load_encoder(args)
         embed_dim = student.head.in_features
         student = MultiCropWrapper(
@@ -778,7 +782,7 @@ def main(
         print(f'Model pretraining is initialized using the following parameters:')
         print(f'- AdamW optimizer with cosine learning rate ({learning_rate} to {args.min_learning_rate}), weight decay ({args.weight_decay} to {args.max_weight_decay}), and momentum ({args.teacher_momentum} to {1.0}) decay.')
         print(f'- Pretraining is set to {args.num_steps} steps with {args.warmup_steps} warm-up steps, an effective batch size of {args.effective_batch_size}, and a world size of {num_devices}.')
-        if args.pretrain_encoder:
+        if args.backbone_only:
             print(f'- Model is ConvNeXt{version} {args.arch} using a {args.kernel_size}^3 downsampling kernel and projection head of dimensionality {args.out_dim}.') 
             print(f'- The teacher temperature ranges from ({args.teacher_warmup_temp} to {args.teacher_temp} in {args.warmup_steps} steps), stochastic depth rate is set to {args.stochastic_depth}, and epsilon to {args.epsilon}.')
             print(f'Starting DINO pretraining...')
