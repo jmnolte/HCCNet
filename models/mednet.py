@@ -13,34 +13,6 @@ def _extract_num_features(backbone) -> int:
         if isinstance(layer, nn.Linear):
             num_features = layer.in_features
     return num_features
-    
-class PositionalEncoding(nn.Module):
-
-    def __init__(
-            self, 
-            d_model: int, 
-            dropout: float = 0.1
-        ) -> None:
-
-        super().__init__()
-        self.dropout = nn.Dropout(p=dropout)
-        div_term = torch.exp(torch.arange(0, d_model, 2) * -(math.log(10000.0) / d_model))
-        self.register_buffer('div_term', div_term)
-        self.d_model = d_model
-
-    def forward(
-            self, 
-            x: torch.Tensor, 
-            pos_token: torch.Tensor
-        ) -> torch.Tensor:
-
-        device, dtype = x.device, x.dtype
-        pe = torch.zeros(x.shape, device=device, dtype=dtype)
-        pos_token = pos_token.unsqueeze(-1).expand(-1, -1, int(self.d_model / 2))
-        pe[:, :, 0::2] = torch.sin(pos_token * self.div_term.expand_as(pos_token))
-        pe[:, :, 1::2] = torch.cos(pos_token * self.div_term.expand_as(pos_token))
-        x = x + pe
-        return self.dropout(x)
 
 class CLSPooling(nn.Module):
 
@@ -172,11 +144,12 @@ class Embedding(nn.Module):
 
     def __init__(
             self, 
-            d_model: int
+            d_model: int,
+            num_tokens: int = 4
         ) -> None:
 
         super().__init__()
-        self.lirads_embed = nn.Embedding(4, d_model, padding_idx=0)
+        self.lirads_embed = nn.Embedding(num_tokens, d_model, padding_idx=0)
 
     def forward(
             self, 

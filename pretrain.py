@@ -754,6 +754,8 @@ def main(
         model = MedNet(
             backbone=backbone, 
             num_classes=1,
+            num_tokens=4,
+            classification=False,
             max_len=16,
             dropout=args.dropout,
             eps=args.epsilon)
