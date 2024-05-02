@@ -16,7 +16,7 @@ Model training follows a step-wise approach. That is, we first pretrain both CNN
 
 ### Pre-Training
 
-We pretrain the CNN backbone adopting the DINO pretraining framework proposed in [1]. Furthermore, we pretrain the Transformer encoder by masking 60% of the image embeddings obtained from the pretrained CNN backbone, and recover their original feature representation using a simple one-layer decoder.
+We pretrain the CNN backbone adopting the DINO pretraining framework proposed in [1]. Furthermore, for the Transformer encoder, we employ a custom variant of the original masked autoencoder pre-training approach [2]. As such, we mask 60% of the image embeddings obtained from the pretrained CNN backbone and recover their original feature representation using a simple one-layer decoder.
 
 ### Fine-Tuning
 
@@ -27,6 +27,11 @@ After pre-training, we initialize the model with the weights obtained after pre-
 - [x] Add baseline results, i.e., without pre-training, for diffusion weighted MRI
 - [ ] Add baseline results for contrast-enhanced T1, T2, and in- and out-of-phase T1 weighted MRIs
 - [ ] Add results after pre-training
+
+## References
+
+[1] Caron, M., Touvron, H., Misra, I., J ́egou, H., Mairal, J., Bojanowski, P., Joulin, A., 2021. Emerging Properties in Self-Supervised Vision Transformers. URL: http://arxiv.org/abs/2104.14294. arXiv:2104.14294.
+[2] Kaiming, H., Xinlei, C., Xie, S., Li, Y., Doll, P., Girshick, R., 2021. Masked Autoencoders Are Scalable Vision Learners. URL: http://arxiv.org/abs/2111.06377. arXiv:2111.06377.
 
 ## License
 
