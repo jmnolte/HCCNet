@@ -7,7 +7,6 @@ from collections.abc import Hashable, Mapping, Sequence
 from monai.utils import GridSampleMode
 import numpy as np
 
-
 class PercentileSpatialCropd(Transform):
 
     def __init__(
@@ -37,58 +36,6 @@ class PercentileSpatialCropd(Transform):
                 cropped_image.append(channel[roi_start[0]:roi_end[0], roi_start[1]:roi_end[1], roi_start[2]:roi_end[2]])
             image[key] = torch.stack(cropped_image)
         return image
-
-
-class SoftClipIntensityd(Transform):
-
-    def __init__(
-            self,
-            keys: str | list,
-            min_value: float | None = None,
-            max_value: float | None = None,
-            channel_wise: bool = False
-        ) -> None:
-
-        self.keys = [keys] if isinstance(keys, str) else keys
-        self.min_value = min_value
-        self.max_value = max_value
-        self.channel_wise = channel_wise
-
-    @staticmethod
-    def softplus(x: torch.Tensor):
-
-        other = torch.tensor([0])
-        return torch.log(1 + torch.exp(-torch.abs(x))) + torch.maximum(x, other)
-    
-    def softminus(self, x: torch.Tensor):
-
-        return -self.softplus(-x)
-    
-    def softclip(self, x: torch.Tensor, lower: float | None, upper: float | None):
-
-        tanh = 1 - torch.tanh(torch.tensor([1]))
-        const = torch.log(torch.tensor([2])) / tanh
-
-        if lower is not None and upper is not None:
-            const /= (upper - lower) / 2
-
-        v = x
-        if lower is not None:
-            v = v - self.softminus(const * (x - lower)) / const
-        if upper is not None:
-            v = v - self.softplus(const * (x - upper)) / const
-        return v
-    
-    def __call__(self, image: torch.Tensor):
-
-        for key in self.keys:
-            if self.channel_wise:
-                for channel in range(image[key].shape[0]):
-                    image[key][channel] = self.softclip(image[key][channel], self.min_value, self.max_value)
-            else:
-                image[key] = self.softclip(image[key], self.min_value, self.max_value)
-        return image
-    
 
 class YeoJohnsond(Transform):
 
@@ -132,7 +79,6 @@ class YeoJohnsond(Transform):
                     image[key][negatives] = -((-image[key][negatives] + 1) ** (2 - self.lmbda) - 1) / (2 - self.lmbda)
         return image
 
-
 class RandSelectChanneld(Transform, Randomizable):
 
     def __init__(
@@ -150,7 +96,6 @@ class RandSelectChanneld(Transform, Randomizable):
             shape = image[key].shape
             image[key] = image[key][torch.randperm(shape[0])[:self.num_channels]]
         return image
-
 
 class ResampleToMatchFirstd(ResampleToMatchd):
 
@@ -197,37 +142,6 @@ class ResampleToMatchFirstd(ResampleToMatchd):
                 lazy=lazy_,
             )
         return d
-
-class RobustNormalized(Transform):
-
-    def __init__(
-            self,
-            keys: str | list,
-            subtrahend: float | Sequence[float] | None = None,
-            divisor: float | Sequence[float] | None = None,
-            factor: float = 1.4826,
-            channel_wise: bool = False
-        ) -> None:
-
-        self.keys = [keys] if isinstance(keys, str) else keys
-        self.subtrahend = subtrahend
-        self.divisor = divisor
-        self.factor = factor
-        self.channel_wise = channel_wise
-
-    def __call__(self, image: torch.Tensor):
-
-        for key in self.keys:
-            if self.channel_wise:
-                for channel in range(image[key].shape[0]):
-                    median = torch.median(image[key][channel]) if self.subtrahend is None else self.subtrahend[channel]
-                    mad = torch.median(torch.abs(image[key][channel] - median)) if self.divisor is None else self.divisor[channel]
-                    image[key][channel] = (image[key][channel] - median) / (self.factor * mad)
-            else:
-                median = torch.median(image[key]) if self.subtrahend is None else self.subtrahend
-                mad = torch.median(torch.abs(image[key] - median)) if self.divisor is None else self.divisor
-                image[key] = (image[key] - median) / (self.factor * mad)
-        return image
 
 class SoftClipOutliersd(Transform):
 
