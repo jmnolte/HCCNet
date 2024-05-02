@@ -113,8 +113,7 @@ class PositionalEncoding(nn.Module):
             self, 
             d_model: int, 
             max_len: int = 512,
-            dropout: float = 0.1,
-            eps: float = 1e-6
+            dropout: float = 0.1
         ) -> None:
 
         super().__init__()
@@ -125,7 +124,6 @@ class PositionalEncoding(nn.Module):
         pe[:, :, 1::2] = torch.cos(position * div_term)
         self.register_buffer('pe', pe)
         self.dropout = nn.Dropout(p=dropout)
-        self.norm = nn.LayerNorm(d_model, eps=eps)
 
     def forward(
             self, 
@@ -137,28 +135,7 @@ class PositionalEncoding(nn.Module):
             x: Tensor, shape ``[batch_size, seq_length, embedding_dim]``
         """
         pos_encod = self.pe[:, pos.long(), :].squeeze(0)
-        pos_embed = self.dropout(x + pos_encod)
-        return self.norm(pos_embed)
-    
-class Embedding(nn.Module):
-
-    def __init__(
-            self, 
-            d_model: int,
-            num_tokens: int = 4
-        ) -> None:
-
-        super().__init__()
-        self.lirads_embed = nn.Embedding(num_tokens, d_model, padding_idx=0)
-
-    def forward(
-            self, 
-            x: torch.Tensor,
-            lirads: torch.Tensor
-        ) -> torch.Tensor:
-
-        embed = x + self.lirads_embed(lirads.long())
-        return embed
+        return self.dropout(x + pos_encod)
 
 class MedNet(nn.Module):
 
@@ -166,7 +143,6 @@ class MedNet(nn.Module):
             self, 
             backbone: nn.Module,
             num_classes: int = 1000,
-            num_tokens: int = 4,
             classification: bool = False,
             max_len: int = 512,
             num_layers: int = 6,
@@ -180,14 +156,10 @@ class MedNet(nn.Module):
         self.d_model = _extract_num_features(backbone)
         _remove_last_layer(backbone)
         self.backbone = backbone
-        self.embedding = Embedding(
-            d_model=self.d_model, 
-            num_tokens=num_tokens)
         self.positional_encoding = PositionalEncoding(
             d_model=self.d_model, 
             max_len=max_len, 
-            dropout=dropout, 
-            eps=eps)
+            dropout=dropout)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=self.d_model, 
             nhead=self.d_model // 128, 
@@ -204,7 +176,7 @@ class MedNet(nn.Module):
             self.pooler = CLSPooling(d_model=self.d_model)
             self.head = Classifier(self.d_model, num_classes=num_classes, eps=eps)
         else:
-            self.head = nn.Linear(self.d_model, num_tokens)
+            self.head = nn.Linear(self.d_model, self.d_model)
         self.classification = classification
         self.cls_token = nn.Parameter(torch.zeros(1, 1, self.d_model))
         self.mask_token = nn.Parameter(torch.zeros(1, 1, self.d_model)) if not classification else None
@@ -236,10 +208,11 @@ class MedNet(nn.Module):
 
         x, pad_mask, pos = self.add_cls_token(x, pad_mask, pos)
         if pretraining:
+            x_clone = x.detach().clone()
             x, prob_mask = self.add_mask_token(x, pad_mask)
         else:
-            prob_mask = None
-        return x, pad_mask, pos, prob_mask
+            x_clone, prob_mask = None, None
+        return x, pad_mask, pos, prob_mask, x_clone
     
     def add_cls_token(
             self,
@@ -262,7 +235,7 @@ class MedNet(nn.Module):
     def get_prob_mask(
             self,
             sequence: torch.Tensor,
-            prob: float = 0.15
+            prob: float = 0.6
         ) -> torch.Tensor:
 
         prob_mask = torch.rand(sequence.shape) 
@@ -280,15 +253,15 @@ class MedNet(nn.Module):
         pad_idx = torch.where(pad_idx == 0, S, pad_idx)
         pad_mask[:, 0] = 1
         prob_mask = self.get_prob_mask(pad_mask)
-        prob_mask = torch.where(pad_mask == 1, 0, prob_mask)
+        prob_mask = torch.where(pad_mask == 1, 0, prob_mask.to(x.device))    
 
-        prob_mask_exp = prob_mask.unsqueeze(-1).expand(-1, -1, H)
+        prob_mask = prob_mask.unsqueeze(-1).expand(-1, -1, H)
         rand_token = torch.zeros(B, 1, H).to(x.device)
         for i in range(B):
             rand_token_idx = torch.randint(1, pad_idx[i], (1,)).squeeze(-1)
             rand_token[i] = x[i, rand_token_idx, :]
-        x = torch.where((prob_mask_exp > 0) & (prob_mask_exp < 0.8), self.mask_token, x)
-        x = torch.where((prob_mask_exp >= 0.8) & (prob_mask_exp < 0.9), rand_token, x)
+        x = torch.where((prob_mask > 0) & (prob_mask < 0.8), self.mask_token, x)
+        x = torch.where((prob_mask >= 0.8) & (prob_mask < 0.9), rand_token, x)
         prob_mask = prob_mask > 0
         return x, prob_mask
 
@@ -306,14 +279,12 @@ class MedNet(nn.Module):
     def forward(
             self, 
             x: torch.Tensor,
-            pad_mask: torch.Tensor | None = None,
-            pt_info: List[torch.Tensor] | None = None
+            pad_mask: torch.Tensor,
+            pos: torch.Tensor
         ) -> torch.Tensor:
 
         x = self.extract_features(x)
-        pos, lirads = pt_info[0], pt_info[1]
-        x = self.embedding(x, lirads)
-        x, pad_mask, pos, prob_mask = self.add_special_tokens(
+        x, pad_mask, pos, prob_mask, labels = self.add_special_tokens(
             x, pad_mask, pos, pretraining=(False if self.classification else True))
         x = self.positional_encoding(x, pos)
         x = x.permute(1, 0, 2)
@@ -325,7 +296,6 @@ class MedNet(nn.Module):
             return x
         else:
             x = self.head(x)
-            x = x.permute(0, 2, 1)
-            cls_token_pad = torch.zeros(x.shape[0], 1).to(x.device)
-            labels = torch.cat([cls_token_pad, lirads], dim=1) * prob_mask
+            x = torch.masked_select(x, prob_mask)
+            labels = torch.masked_select(labels, prob_mask)
             return x, labels

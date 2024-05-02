@@ -55,6 +55,7 @@ def scale_learning_rate(
 def prep_batch(
         data: dict, 
         batch_size: int, 
+        device: torch.device,
         pretrain: bool = False
     ) -> tuple:
 
@@ -69,59 +70,9 @@ def prep_batch(
             except:
                 pass
     padding_mask = torch.where(data['delta'] == 0.0, 1.0, 0.0)
-    data['lirads'] = torch.where(data['delta'] == 0.0, 0.0, data['lirads'] + 1)
-    pad_idx = torch.argmax(padding_mask, dim=1)
-    pad_idx = torch.where(pad_idx == 0, seq_length, pad_idx)
-    if pretrain:
-        data['label'] = torch.zeros(batch_size)
-        for i in range(batch_size):
-            rand_gen = torch.rand(1)
-            if rand_gen < 0.66:
-                shuffled_idx = torch.randperm(pad_idx[i])
-                sorted_idx = torch.sort(shuffled_idx).values
-                data['image'][i, :pad_idx[i]] = data['image'][i, shuffled_idx]
-                data['label'][i] = 0 if shuffled_idx.equal(sorted_idx) else 1
-    else:
+    if not pretrain:
         data['label'] = torch.max(data['label'], dim=1).values
-    pt_info = [data['delta'], data['lirads']]
-    return data['image'], data['label'], pt_info, padding_mask
-
-class MultiCropWrapper(nn.Module):
-    """
-    Perform forward pass separately on each resolution input.
-    The inputs corresponding to a single resolution are clubbed and single
-    forward is run on the same resolution inputs. Hence we do several
-    forward passes = number of different resolutions used. We then
-    concatenate all the output features and run the head forward on these
-    concatenated features.
-    """
-    def __init__(self, backbone, head):
-        super(MultiCropWrapper, self).__init__()
-        # disable layers dedicated to ImageNet labels classification
-        backbone.fc, backbone.head = nn.Identity(), nn.Identity()
-        self.backbone = backbone
-        self.head = head
-
-    def forward(self, x):
-        # convert to list
-        if not isinstance(x, list):
-            x = [x]
-        idx_crops = torch.cumsum(torch.unique_consecutive(
-            torch.tensor([inp.shape[-1] for inp in x]),
-            return_counts=True,
-        )[1], 0)
-        start_idx, output = 0, torch.empty(0).to(x[0].device)
-        for end_idx in idx_crops:
-            _out = self.backbone(torch.cat(x[start_idx: end_idx]))
-            # The output is a tuple with XCiT model. See:
-            # https://github.com/facebookresearch/xcit/blob/master/xcit.py#L404-L405
-            if isinstance(_out, tuple):
-                _out = _out[0]
-            # accumulate outputs
-            output = torch.cat((output, _out))
-            start_idx = end_idx
-        # Run the head forward on the concatenated features.
-        return self.head(output)
+    return data['image'].to(device), data['label'].to(device), data['delta'].to(device), padding_mask.to(device)
 
 
 

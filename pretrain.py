@@ -7,6 +7,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 import torch.distributed as dist
 from torch.cuda.amp import GradScaler, autocast
+from torchmetrics.classification import MulticlassAUROC
 import argparse
 import os
 import time
@@ -15,53 +16,19 @@ import tempfile
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-
-from monai.transforms import (
-    Compose,
-    LoadImaged,
-    EnsureChannelFirstd,
-    Orientationd,
-    Spacingd,
-    SpatialPadd,
-    CropForegroundd,
-    ConcatItemsd,
-    ResampleToMatchd,
-    EnsureTyped,
-    DeleteItemsd,
-    RandSpatialCropd,
-    RandFlipd,
-    RandRotate90d,
-    RandScaleIntensityd,
-    RandShiftIntensityd,
-    CopyItemsd,
-    KeepLargestConnectedComponentd,
-    Lambdad,
-    NormalizeIntensityd,
-    CenterSpatialCropd
-)
-from monai.data import (
-    ThreadDataLoader,
-    CacheDataset,
-    set_track_meta,
-    partition_dataset
-)
+from monai.data import set_track_meta
 from monai.utils.misc import ensure_tuple_rep
 from monai.utils import set_determinism
-from data.transforms import PercentileSpatialCropd, YeoJohnsond, SoftClipIntensityd, ResampleToMatchFirstd, RandSelectChanneld, RobustNormalized
-from data.splits import GroupStratifiedSplit
-from data.datasets import CacheSeqDataset
-from data.utils import DatasetPreprocessor, convert_to_dict, convert_to_seqdict, SequenceBatchCollater
-from models.convnext3d import convnext3d_atto, convnext3d_femto, convnext3d_pico, convnext3d_nano, convnext3d_tiny
-from models.dinohead import DINOHead
+from models.dinohead import DINOHead, MultiCropWrapper
 from models.mednet import MedNet
 from losses.dinoloss import DINOLoss
+from utils.transforms import transforms, dino_transforms
+from utils.preprocessing import load_backbone, load_data, load_objs
+from utils.config import parse_args
 from utils.utils import (
     cancel_gradients_last_layer, 
-    cosine_scheduler, 
-    get_params_groups, 
     scale_learning_rate, 
-    prep_batch,
-    MultiCropWrapper)
+    prep_batch)
 
 class Pretrainer:
 
@@ -107,6 +74,7 @@ class Pretrainer:
             self.lr_schedule, self.wd_schedule = scheduler[0], scheduler[1]
             self.params = self.model.parameters()
         self.results_dict = {dataset: {metric: [] for metric in ['loss']} for dataset in ['train']}
+        self.auroc = MulticlassAUROC(num_classes=4, ignore_index=0)
 
     def save_output(
             self, 
@@ -179,7 +147,6 @@ class Pretrainer:
             loss = self.loss_fn(step, student_logits, teacher_logits)
             loss /= accum_steps
         self.scaler.scale(loss).backward()
-
         return loss.item()
 
     def decoder_step(
@@ -190,15 +157,16 @@ class Pretrainer:
         ) -> float:
 
         self.model.train()
-        inputs, labels, pt_info, padding_mask = prep_batch(batch, batch_size=batch_size, pretrain=True)
-        inputs, labels, padding_mask = inputs.to(self.gpu_id), labels.to(self.gpu_id), padding_mask.to(self.gpu_id)
-        pt_info = [info.to(self.gpu_id) for info in pt_info]
+        inputs, _, delta, padding_mask = prep_batch(batch, batch_size=batch_size, device=self.gpu_id, pretrain=True)
+
         with autocast(enabled=self.amp):
-            logits = self.model(inputs, pad_mask=padding_mask, pt_info=pt_info)
-            loss = self.loss_fn(logits.squeeze(-1), labels.float())
+            logits, labels = self.model(inputs, pad_mask=padding_mask, pos=delta)
+            loss = self.loss_fn(logits, labels.long())
             loss /= accum_steps
         self.scaler.scale(loss).backward()
 
+        preds = F.softmax(logits, dim=1)
+        self.auroc.update(preds, labels.int())
         return loss.item()
 
     def accumulation_step(
@@ -215,7 +183,7 @@ class Pretrainer:
 
         if clip_grad:
             self.scaler.unscale_(self.optim)
-            nn.utils.clip_grad_norm_(self.params, max_norm=1.0, norm_type=2)
+            nn.utils.clip_grad_norm_(self.params, max_norm=3.0, norm_type=2)
         if self.backbone_only:
             cancel_gradients_last_layer(self.student, step=step, warmup_steps=warmup_steps)
 
@@ -262,7 +230,7 @@ class Pretrainer:
                     accum_loss += self.decoder_step(batch, batch_size, accum_steps)
 
                 if (step + 1) % accum_steps == 0:
-                    self.accumulation_step(update_step, warmup_steps, clip_grad=False)
+                    self.accumulation_step(update_step, warmup_steps, clip_grad=True)
                     if self.gpu_id == 0:
                         print(f"Step Loss: {accum_loss:.4f}")
                     running_loss += accum_loss
@@ -274,19 +242,22 @@ class Pretrainer:
                     loss = torch.Tensor([running_loss / log_every])
                     running_loss = 0.0
                     dist.all_reduce(loss.to(self.gpu_id), op=dist.ReduceOp.AVG)
+                    if not self.backbone_only:
+                        auroc = self.auroc.compute()
+                        self.auroc.reset()
+                        if self.gpu_id == 0:
+                            print(f"[GPU {self.gpu_id}] Step {update_step}/{self.num_steps}, AUROC: {auroc:.4f}")
 
                     if self.gpu_id == 0:
                         self.log_dict(phase='train', keys='loss', values=loss)
                         print(f"[GPU {self.gpu_id}] Step {update_step}/{self.num_steps}, Loss: {loss.item():.4f}")
 
                 if (step + 1) / accum_steps % 1000 == 0:
-                    dist.barrier()
                     if self.gpu_id == 0:
                         model_weights = self.teacher.module.state_dict() if self.backbone_only else self.model.module.state_dict()
                         self.save_output(model_weights, 'weights', fold=int(update_step + 1))
-                    dist.barrier()
 
-                if (step + 1) == self.num_steps * accum_steps:
+                if (step + 1) % (self.num_steps * accum_steps) == 0:
                     break
 
         if self.gpu_id == 0:
@@ -340,356 +311,14 @@ class Pretrainer:
         plt.savefig(file_path, dpi=300, bbox_inches="tight")
         plt.close()
 
-def parse_args() -> argparse.Namespace:
-
-    '''
-    Parse command line arguments.
-
-    Returns:
-        argparse.Namespace: Command line arguments.
-    '''
-    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--num-steps", default=100, type=int, 
-                        help="Number of steps to train for. Defaults to 100.")
-    parser.add_argument("--warmup-steps", default=10, type=int, 
-                        help="Number of warmup steps. Defaults to 10.")
-    parser.add_argument("--log-every", default=10, type=int,
-                        help="Interval to log model results. Defaults to 10.")
-    parser.add_argument("--batch-size", default=4, type=int, 
-                        help="Batch size to use for training. Defaults to 4.")
-    parser.add_argument("--effective-batch-size", default=32, type=int,
-                        help="Total batch size: batch size x number of devices x number of accumulations steps.")
-    parser.add_argument("--min-learning-rate", default=1e-6, type=float, 
-                        help="Final learning rate. Defaults to 1e-6.")
-    parser.add_argument("--weight-decay", default=0.05, type=float, 
-                        help="Initial weight decay value. Defaults to 0.05.")
-    parser.add_argument("--max-weight-decay", default=0.5, type=float, 
-                        help="Final weight decay value. Defaults to 0.5.")
-    parser.add_argument("--stochastic-depth", default=0.0, type=float, 
-                        help="Stochastic depth rate to use for training. Defaults to 0.")
-    parser.add_argument("--dropout", default=0.0, type=float, 
-                        help="Dropout rate to use for training. Defaults to 0.")
-    parser.add_argument("--epsilon", default=1e-5, type=float, 
-                        help="Epsilon value to use for norm layers. Defaults to 1e-5.")
-    parser.add_argument("--global-crop-size", default=72, type=int, 
-                        help="Global crop size to use. Defaults to 72.")
-    parser.add_argument("--local-crop-size", default=48, type=int, 
-                        help="Local crop size to use. Defaults to 48.")
-
-    parser.add_argument("--backbone-only", action='store_true',
-                        help="Whether to only pretrain the CNN backbone.")
-    parser.add_argument("--arch", type=str, default='femto',
-                        help="ConvNeXT model architecture. Choices are femto, pico, nano, tiny. Defaults to femto.")
-    parser.add_argument("--use-v2", action='store_true',
-                        help="Whether to use ConvNext v1 or v2.")
-    parser.add_argument("--kernel-size", default=3, type=int,
-                        help="Kernel size of convolutional downsampling layers. Defaults to 2.")
-    parser.add_argument("--out-dim", default=4096, type=int,
-                        help="Output dimensionality of projection head. Defaults to 4096")
-    parser.add_argument("--norm-last-layer", action='store_true',
-                        help="Whether to weight normalize the last layer of the DINO head.")
-    parser.add_argument("--teacher-momentum", default=0.9995, type=float, 
-                        help="Inital momentum value to update teacher network with EMA. Defaults to 0.9995.")
-    parser.add_argument("--teacher-temp", default=0.04, type=float, 
-                        help="Final (i.e., after warmup) teacher temperature value. Defaults to 0.04")
-    parser.add_argument("--teacher-warmup-temp", default=0.04, type=float, 
-                        help="Initial teacher temperature value. Defaults to 0.04")
-
-    parser.add_argument("--mod-list", default=MOD_LIST, nargs='+', 
-                        help="List of modalities to use for training")
-    parser.add_argument("--distributed", action='store_true',
-                        help="Whether to enable distributed training.")
-    parser.add_argument("--amp", action='store_true',
-                        help="Whether to enable automated mixed precision training.")
-    parser.add_argument("--seed", default=1234, type=int, 
-                        help="Seed to use for reproducibility")
-    parser.add_argument("--num-workers", default=8, type=int,
-                        help="Number of workers to use for training. Defaults to 8.")
-    parser.add_argument("--suffix", default='MedNet', type=str, 
-                        help="File suffix for identification")
-    parser.add_argument("--data-dir", default=DATA_DIR, type=str, 
-                        help="Path to data directory")
-    parser.add_argument("--results-dir", default=RESULTS_DIR, type=str, 
-                        help="Path to results directory")
-    return parser.parse_args()
-
-def encoder_transforms(
-        modalities: list,
-        device: torch.device,
-        global_crop_size: tuple = (72, 72, 72),
-        local_crop_size: tuple = (48, 48, 48),
-        image_spacing: tuple = (1.5, 1.5, 1.5)
-    ) -> monai.transforms:
-    '''
-    Perform data transformations on image and image labels.
-
-    Args:
-        dataset (str): Dataset to apply transformations on. Can be 'train', 'val' or 'test'.
-
-    Returns:
-        transforms (monai.transforms): Data transformations to be applied.
-    '''
-    prep = [
-        LoadImaged(keys=modalities, image_only=True, allow_missing_keys=True),
-        EnsureChannelFirstd(keys=modalities, allow_missing_keys=True),
-        Orientationd(keys=modalities, axcodes='PLI', allow_missing_keys=True),
-        Spacingd(keys=modalities, pixdim=image_spacing, mode=3, allow_missing_keys=True),
-        ResampleToMatchFirstd(keys=modalities, mode=3, allow_missing_keys=True),
-        ConcatItemsd(keys=modalities, name='image', allow_missing_keys=True),
-        PercentileSpatialCropd(
-            keys='image',
-            roi_center=(0.5, 0.5, 0.5),
-            roi_size=(0.85, 0.8, 0.99),
-            min_size=(82, 82, 82)),
-        CopyItemsd(keys='image', names='mask'),
-        Lambdad(keys='mask', func=lambda x: x[:1]),
-        Lambdad(keys='mask', func=lambda x: torch.where(x > torch.mean(x), 1, 0)),
-        KeepLargestConnectedComponentd(keys='mask', connectivity=1),
-        CropForegroundd(
-            keys='image',
-            source_key='mask',
-            select_fn=lambda x: x > 0,
-            k_divisible=1,
-            allow_smaller=False),
-        YeoJohnsond(keys='image', lmbda=0.1, channel_wise=True),
-        RobustNormalized(keys='image', channel_wise=True),
-        SoftClipIntensityd(keys='image', min_value=-2.5, max_value=2.5, channel_wise=True),
-        PercentileSpatialCropd(
-            keys='image',
-            roi_center=(0.45, 0.25, 0.3),
-            roi_size=(0.6, 0.45, 0.4),
-            min_size=(82, 82, 82)),
-        CenterSpatialCropd(keys='image', roi_size=(96, 96, 96)),
-        CopyItemsd(keys='image', times=4, names=['gv1','gv2','lv1','lv2']),
-        DeleteItemsd(keys=modalities + ['image','mask']),
-        EnsureTyped(keys=['gv1','gv2','lv1','lv2'], track_meta=False, device=device, dtype=torch.float),
-    ]
-
-    global_crop = [
-        RandSpatialCropd(keys=['gv1','gv2'], roi_size=global_crop_size, random_size=False)
-    ]
-
-    local_crop = [
-        RandSpatialCropd(keys=['lv1','lv2'], roi_size=local_crop_size, random_size=False)
-    ]
-
-    post = [
-        RandFlipd(keys=['gv1','gv2','lv1','lv2'], prob=0.5, spatial_axis=0),
-        RandFlipd(keys=['gv1','gv2','lv1','lv2'], prob=0.5, spatial_axis=1),
-        RandFlipd(keys=['gv1','gv2','lv1','lv2'], prob=0.5, spatial_axis=2),
-        RandRotate90d(keys=['gv1','gv2','lv1','lv2'], prob=0.5),
-        RandSelectChanneld(keys=['gv1','gv2','lv1','lv2'], num_channels=1),
-        NormalizeIntensityd(keys=['gv1','gv2','lv1','lv2'], subtrahend=0.4180, divisor=0.6817)
-    ]
-    return Compose(prep + global_crop + local_crop + post)
-
-def decoder_transforms(
-        modalities: list,
-        device: torch.device,
-        crop_size: tuple = (72, 72, 72),
-        image_spacing: tuple = (1.5, 1.5, 1.5)
-    ) -> monai.transforms:
-
-    '''
-    Perform data transformations on image and image labels.
-
-    Args:
-        dataset (str): Dataset to apply transformations on. Can be 'train', 'val' or 'test'.
-
-    Returns:
-        transforms (monai.transforms): Data transformations to be applied.
-    '''
-    transforms = [
-        LoadImaged(keys=modalities, image_only=True),
-        EnsureChannelFirstd(keys=modalities),
-        Orientationd(keys=modalities, axcodes='PLI'),
-        Spacingd(keys=modalities, pixdim=image_spacing, mode=3),
-        ResampleToMatchd(keys=modalities, key_dst=modalities[0], mode=3),
-        PercentileSpatialCropd(
-            keys=modalities,
-            roi_center=(0.5, 0.5, 0.5),
-            roi_size=(0.85, 0.8, 0.99),
-            min_size=(82, 82, 82)),
-        CopyItemsd(keys=modalities[0], names='mask'),
-        Lambdad(
-            keys='mask', 
-            func=lambda x: torch.where(x > torch.mean(x), 1, 0)),
-        KeepLargestConnectedComponentd(keys='mask', connectivity=1),
-        CropForegroundd(
-            keys=modalities,
-            source_key='mask',
-            select_fn=lambda x: x > 0,
-            k_divisible=1,
-            allow_smaller=False),
-        ConcatItemsd(keys=modalities, name='image'),
-        DeleteItemsd(keys=modalities + ['mask']),
-        YeoJohnsond(keys='image', lmbda=0.1, channel_wise=True),
-        RobustNormalized(keys='image', channel_wise=True),
-        SoftClipIntensityd(keys='image', min_value=-2.5, max_value=2.5, channel_wise=True),
-        PercentileSpatialCropd(
-            keys='image',
-            roi_center=(0.45, 0.25, 0.3),
-            roi_size=(0.6, 0.45, 0.4),
-            min_size=(82, 82, 82)),
-        CenterSpatialCropd(keys='image', roi_size=(96, 96, 96)),
-
-        EnsureTyped(keys='image', track_meta=False, device=device, dtype=torch.float),
-        RandSpatialCropd(keys='image', roi_size=crop_size, random_size=False),
-        RandFlipd(keys='image', prob=0.5, spatial_axis=0),
-        RandFlipd(keys='image', prob=0.5, spatial_axis=1),
-        RandFlipd(keys='image', prob=0.5, spatial_axis=2),
-        RandRotate90d(keys='image', prob=0.5),
-        RandScaleIntensityd(keys='image', prob=1.0, factors=0.1),
-        RandShiftIntensityd(keys='image', prob=1.0, offsets=0.1),
-        NormalizeIntensityd(
-            keys='image', 
-            subtrahend=(0.3736, 0.4208, 0.4409, 0.4367),
-            divisor=(0.6728, 0.6765, 0.6912, 0.6864),
-            channel_wise=True)
-    ]
-    return Compose(transforms)
-
-def load_pretrain_data(
-        args: argsparse.Namespace,
-        device: torch.device
-    ) -> tuple:
-    
-    phases = ['train']
-    data_dict, label_df = DatasetPreprocessor(
-        data_dir=args.data_dir).load_data(modalities=args.mod_list, keys=['label','lirads','delta'], file_name='labels.csv', verbose=False)
-    ssl_dict, ssl_df = DatasetPreprocessor(
-        data_dir=args.data_dir, partial=(True if args.backbone_only else False), no_labels=True).load_data(modalities=args.mod_list, keys=['lirads','delta'], file_name='lirads.csv')
-    dev, test = GroupStratifiedSplit(split_ratio=0.75).split_dataset(label_df)
-    ssl_test = ssl_df[ssl_df['patient_id'].isin(test['patient_id'])]
-    ssl_dev = ssl_df[-ssl_df['patient_id'].isin(ssl_test['patient_id'])]
-    split_dict = convert_to_dict([ssl_dev], data_dict=ssl_dict, split_names=phases, verbose=False)
-    seq_split_dict = convert_to_seqdict(split_dict, args.mod_list, phases)
-    split_dict = {x: partition_dataset(
-        data=split_dict[x] if args.backbone_only else seq_split_dict[x][0],
-        num_partitions=dist.get_world_size(),
-        shuffle=True,
-        even_divisible=True
-        )[dist.get_rank()] for x in phases}
-
-    if args.backbone_only:
-        datasets = {x: CacheDataset(
-            data=split_dict[x], 
-            transform=encoder_transforms(
-                modalities=args.mod_list, 
-                device=device,
-                global_crop_size=ensure_tuple_rep(args.global_crop_size, 3),
-                local_crop_size=ensure_tuple_rep(args.local_crop_size, 3)),
-            num_workers=8,
-            copy_cache=False
-            ) for x in phases}
-        dataloader = {x: ThreadDataLoader(
-            dataset=datasets[x], 
-            batch_size=args.batch_size,
-            shuffle=True,
-            num_workers=0,
-            drop_last=True
-            ) for x in phases}
-    else:
-        datasets = {x: CacheSeqDataset(
-            data=split_dict[x], 
-            image_keys=args.mod_list,
-            transform=decoder_transforms(
-                modalities=args.mod_list, 
-                device=device,
-                crop_size=ensure_tuple_rep(args.global_crop_size, 3)),
-            num_workers=8,
-            copy_cache=False
-            ) for x in phases}
-        dataloader = {x: ThreadDataLoader(
-            dataset=datasets[x], 
-            batch_size=args.batch_size,
-            shuffle=True,
-            num_workers=0,
-            drop_last=True,
-            collate_fn=(SequenceBatchCollater(
-                keys=['image','delta'], 
-                seq_length=7))
-            ) for x in phases}
-    return dataloader
-
-def load_pretrain_objs(
-        args: argparse.Namespace,
-        model: nn.Module,
-        learning_rate: float = 1e-4
-    ) -> tuple:
-
-    loss_fn = DINOLoss(
-        out_dim=args.out_dim,
-        num_crops=4,
-        num_steps=args.num_steps,
-        teacher_temp=args.teacher_temp,
-        teacher_warmup_temp=args.teacher_warmup_temp,
-        teacher_warmup_steps=int(args.warmup_steps * 2)
-    ) if args.backbone_only else nn.BCEWithLogitsLoss()
-    params = get_params_groups(model)
-    optimizer = optim.AdamW(params, lr=learning_rate, weight_decay=args.weight_decay)
-    lr_schedule = cosine_scheduler(
-        base_value=learning_rate,
-        final_value=args.min_learning_rate,
-        steps=args.num_steps,
-        warmup_steps=args.warmup_steps)
-    wd_schedule = cosine_scheduler(
-        base_value=args.weight_decay,
-        final_value=args.max_weight_decay,
-        steps=args.num_steps)
-    m_schedule = cosine_scheduler(
-        base_value=args.teacher_momentum,
-        final_value=1,
-        steps=args.num_steps)
-    schedules = [lr_schedule, wd_schedule, m_schedule] if args.backbone_only else [lr_schedule, wd_schedule]
-    return loss_fn, optimizer, schedules
-
-def load_encoder(
-        args: argparse.Namespace
-    ) -> Tuple[nn.Module]:
-
-    if args.arch == 'atto':
-        student = convnext3d_atto(
-            in_chans=1 if args.backbone_only else len(args.mod_list), kernel_size=args.kernel_size, drop_path_rate=args.stochastic_depth, use_v2=args.use_v2, eps=args.epsilon)
-        teacher = convnext3d_atto(
-            in_chans=1 if args.backbone_only else len(args.mod_list), kernel_size=args.kernel_size, use_v2=args.use_v2, eps=args.epsilon)
-    elif args.arch == 'femto':
-        student = convnext3d_femto(
-            in_chans=1 if args.backbone_only else len(args.mod_list), kernel_size=args.kernel_size, drop_path_rate=args.stochastic_depth, use_v2=args.use_v2, eps=args.epsilon)
-        teacher = convnext3d_femto(
-            in_chans=1 if args.backbone_only else len(args.mod_list), kernel_size=args.kernel_size, use_v2=args.use_v2, eps=args.epsilon)
-    elif args.arch == 'pico':
-        student = convnext3d_pico(
-            in_chans=1 if args.backbone_only else len(args.mod_list), kernel_size=args.kernel_size, drop_path_rate=args.stochastic_depth, use_v2=args.use_v2, eps=args.epsilon)
-        teacher = convnext3d_pico(
-            in_chans=1 if args.backbone_only else len(args.mod_list), kernel_size=args.kernel_size, use_v2=args.use_v2, eps=args.epsilon)
-    elif args.arch == 'nano':
-        student = convnext3d_nano(
-            in_chans=1 if args.backbone_only else len(args.mod_list), kernel_size=args.kernel_size, drop_path_rate=args.stochastic_depth, use_v2=args.use_v2, eps=args.epsilon)
-        teacher = convnext3d_nano(
-            in_chans=1 if args.backbone_only else len(args.mod_list), kernel_size=args.kernel_size, use_v2=args.use_v2, eps=args.epsilon)
-    elif args.arch == 'tiny':
-        student = convnext3d_tiny(
-            in_chans=1 if args.backbone_only else len(args.mod_list), kernel_size=args.kernel_size, drop_path_rate=args.stochastic_depth, use_v2=args.use_v2, eps=args.epsilon)
-        teacher = convnext3d_tiny(
-            in_chans=1 if args.backbone_only else len(args.mod_list), kernel_size=args.kernel_size, use_v2=args.use_v2, eps=args.epsilon)
-    
-    if args.backbone_only:
-        return student, teacher
-    else:
-        return student
-
 def load_weights(
+        args: argparse.Namespace,
         weights_path: str
     ) -> dict:
 
     weights = torch.load(weights_path, map_location='cpu')
-    for key in list(weights.keys()):
-        if 'backbone.' in key:
-            weights[key.replace('backbone.', '')] = weights.pop(key)
-        if 'head.' in key:
-            weights.pop(key)
-    weights['downsample_layers.0.0.weight'] = weights['downsample_layers.0.0.weight'].repeat(1, 4, 1, 1, 1)
+    weights = {k.replace('backbone.', ''): v for k, v in weights.items()}
+    weights['downsample_layers.0.0.weight'] = weights['downsample_layers.0.0.weight'].repeat(1, len(args.mod_list), 1, 1, 1)
     return weights
 
 def setup() -> None:
@@ -728,11 +357,13 @@ def main(
     accum_steps = args.effective_batch_size // args.batch_size // num_devices
     learning_rate = scale_learning_rate(args.effective_batch_size)
     version = 'v2' if args.use_v2 else 'v1'
+    backbone_only = True if args.loss_fn == 'dino' else False
 
-    dataloader = load_pretrain_data(args, device_id)
+    dataloader, _ = load_data(args, device_id, pretraining=True, partial=True if backbone_only else False)
+    dataloader = {x: dataloader[x][0] for x in ['train']}
     set_track_meta(False)
-    if args.backbone_only:
-        student, teacher = load_encoder(args)
+    if backbone_only:
+        student, teacher = load_backbone(args, dino_pretraining=True)
         embed_dim = student.head.in_features
         student = MultiCropWrapper(
             student,
@@ -748,25 +379,22 @@ def main(
         for p in teacher.parameters():
             p.requires_grad = False
         model = [student, teacher]
-        loss_fn, optimizer, schedules = load_pretrain_objs(args, student, learning_rate)
     else:
-        backbone = load_encoder(args)
+        backbone = load_backbone(args)
         model = MedNet(
             backbone=backbone, 
-            num_classes=1,
-            num_tokens=4,
             classification=False,
-            max_len=16,
+            max_len=12,
             dropout=args.dropout,
             eps=args.epsilon)
-        weights = load_weights(os.path.join(args.results_dir, 'model_weights/weights_fold8000_dmri_tiny_v1.pth'))
+        weights = load_weights(args, os.path.join(args.results_dir, f'model_weights/weights_fold16000_dmri_{args.arch}_{args.out_dim}.pth'))
         model.backbone.load_state_dict(weights, strict=False)
         model = model.to(device_id)
         for p in model.backbone.parameters():
             p.requires_grad = False
         if args.distributed:
             model = nn.parallel.DistributedDataParallel(model, device_ids=[device_id])
-        loss_fn, optimizer, schedules = load_pretrain_objs(args, model, learning_rate)
+    loss_fn, optimizer, schedules = load_objs(args, model, learning_rate)
 
     pretrainer = Pretrainer(
         model=model,
@@ -784,7 +412,7 @@ def main(
         print(f'Model pretraining is initialized using the following parameters:')
         print(f'- AdamW optimizer with cosine learning rate ({learning_rate} to {args.min_learning_rate}), weight decay ({args.weight_decay} to {args.max_weight_decay}), and momentum ({args.teacher_momentum} to {1.0}) decay.')
         print(f'- Pretraining is set to {args.num_steps} steps with {args.warmup_steps} warm-up steps, an effective batch size of {args.effective_batch_size}, and a world size of {num_devices}.')
-        if args.backbone_only:
+        if backbone_only:
             print(f'- Model is ConvNeXt{version} {args.arch} using a {args.kernel_size}^3 downsampling kernel and projection head of dimensionality {args.out_dim}.') 
             print(f'- The teacher temperature ranges from ({args.teacher_warmup_temp} to {args.teacher_temp} in {args.warmup_steps} steps), stochastic depth rate is set to {args.stochastic_depth}, and epsilon to {args.epsilon}.')
             print(f'Starting DINO pretraining...')
@@ -796,11 +424,6 @@ def main(
     pretrainer.pretrain(args.batch_size, accum_steps, args.warmup_steps // 10)
     pretrainer.visualize_training('train', 'loss')
     print('Script finished.')
-
-RESULTS_DIR = '/Users/noltinho/thesis/results'
-DATA_DIR = '/Users/noltinho/thesis/sensitive_data'
-MOD_LIST = ['DWI_b0','DWI_b150','DWI_b400','DWI_b800']
-WEIGHTS_DIR = '/Users/noltinho/MedicalNet/pytorch_files/pretrain'
 
 if __name__ == '__main__':
     args = parse_args()
