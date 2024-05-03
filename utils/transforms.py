@@ -1,3 +1,4 @@
+import torch
 from monai import transforms
 from monai.transforms import (
     Compose,

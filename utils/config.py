@@ -34,6 +34,8 @@ def parse_args() -> argparse.Namespace:
                         help="Flag to use pretrained weights.")
     parser.add_argument("--k-folds", default=5, type=int, 
                         help="Number of folds to use in cross validation. Defaults to 5.")
+    parser.add_argument("--num-seeds", default=3, type=int, 
+                        help="Number of random seeds to run training over. Defaults to 3.")
 
     # Hyperparameters
     parser.add_argument("--num-steps", default=100, type=int, 
@@ -88,6 +90,8 @@ def parse_args() -> argparse.Namespace:
                         help="Path to data directory")
     parser.add_argument("--results-dir", default=RESULTS_DIR, type=str, 
                         help="Path to results directory")
+    parser.add_argument("--weights-dir", default=WEIGHTS_DIR, type=str, 
+                        help="Path to weights directory")
     return parser.parse_args()
 
 RESULTS_DIR = '/Users/noltinho/thesis/results'
