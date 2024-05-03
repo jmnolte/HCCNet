@@ -29,10 +29,10 @@ from monai.visualize import OcclusionSensitivity
 from monai.utils import set_determinism
 from data.splits import GroupStratifiedSplit
 from data.datasets import CacheSeqDataset
-from data.transforms import PercentileSpatialCropd, YeoJohnsond, SoftClipIntensityd
 from data.utils import DatasetPreprocessor, convert_to_dict, convert_to_seqdict, SequenceBatchCollater
 from models.mednet import MedNet
 from utils.preprocessing import load_backbone, load_data
+from utils.transforms import transforms
 from utils.config import parse_args
 from utils.utils import prep_batch
 import argparse
@@ -87,7 +87,7 @@ class Tester:
         '''
 
         self.model.eval()
-        inputs, labels, delta, padding_mask = prep_batch(batch, batch_size=batch_size, device=self.gpu_id)
+        inputs, labels, delta, padding_mask = prep_batch(batch, batch_size=1, device=self.gpu_id)
 
         with autocast(enabled=self.amp):
             logits = self.model(inputs, pad_mask=padding_mask, pos=delta)
@@ -236,7 +236,8 @@ def main(
     num_classes = args.num_classes if args.num_classes > 2 else 1
     num_folds = args.k_folds if args.k_folds > 0 else 1
 
-    dataloader, _ = load_data(args, device_id, test=True)
+    dataloader, _ = load_data(args, device_id, testing=True)
+    dataloader = {x: dataloader[x][0] for x in ['test']}
     set_track_meta(False)
 
     for k in range(num_folds):

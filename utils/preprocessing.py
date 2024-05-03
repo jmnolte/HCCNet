@@ -1,7 +1,10 @@
 import torch
 import torch.nn as nn
+import torch.distributed as dist
+import torch.optim as optim
 import numpy as np
 import argparse
+from typing import List, Tuple
 from models.convnext3d import (
     convnext3d_atto, 
     convnext3d_femto, 
@@ -15,6 +18,7 @@ from monai.data import (
     partition_dataset_classes,
     list_data_collate
 )
+from monai.utils.misc import ensure_tuple_rep
 from sklearn.model_selection import StratifiedGroupKFold
 from data.splits import GroupStratifiedSplit
 from data.datasets import CacheSeqDataset
@@ -24,7 +28,11 @@ from data.utils import (
     convert_to_seqdict, 
     SequenceBatchCollater
 )
-from utils import cosine_scheduler, get_params_groups
+from utils.transforms import transforms, dino_transforms
+from utils.utils import cosine_scheduler, get_params_groups
+from losses.focalloss import FocalLoss
+from losses.binaryceloss import BinaryCELoss
+from losses.dinoloss import DINOLoss
 
 def load_backbone(
         args: argparse.Namespace,
@@ -67,7 +75,7 @@ def load_backbone(
 def load_data(
         args: argparse.Namespace,
         device: torch.device,
-        test: bool = False,
+        testing: bool = False,
         pretraining: bool = False,
         partial: bool = False
     ) -> tuple:
@@ -82,7 +90,7 @@ def load_data(
         tuple: Training objects consisting of the datasets, dataloaders, the model, and the performance metric.
     '''
     folds = range(args.k_folds) if args.k_folds > 0 else range(1)
-    if test:
+    if testing:
         phases = ['test']
     else:
         phases = ['train','val'] if args.k_folds > 0 else ['train']
@@ -102,16 +110,18 @@ def load_data(
     default_dev, default_test = GroupStratifiedSplit(split_ratio=0.75).split_dataset(default_df)
     test = label_df[label_df['patient_id'].isin(default_test['patient_id'])]
     dev = label_df[-label_df['patient_id'].isin(test['patient_id'])]
-    if args.k_folds > 1:
-        cv_folds = StratifiedGroupKFold(n_splits=args.k_folds, shuffle=True, random_state=args.seed).split(dev, y=dev['label'], groups=dev['patient_id'])
-        indices = [(dev.iloc[train_idx], dev.iloc[val_idx]) for train_idx, val_idx in list(cv_folds)]
-        split_dict = [convert_to_dict([indices[k][0], indices[k][1]], data_dict=data_dict, split_names=phases) for k in folds]
-    elif args.k_folds == 1:
-        train, val = GroupStratifiedSplit(split_ratio=0.8).split_dataset(dev)
-        split_dict = [convert_to_dict([train, val], data_dict=data_dict, split_names=phases, verbose=True) for k in folds]
+    if not testing:
+        if args.k_folds > 1:
+            cv_folds = StratifiedGroupKFold(n_splits=args.k_folds, shuffle=True, random_state=args.seed).split(dev, y=dev['label'], groups=dev['patient_id'])
+            indices = [(dev.iloc[train_idx], dev.iloc[val_idx]) for train_idx, val_idx in list(cv_folds)]
+            split_dict = [convert_to_dict([indices[k][0], indices[k][1]], data_dict=data_dict, split_names=phases) for k in folds]
+        elif args.k_folds == 1:
+            train, val = GroupStratifiedSplit(split_ratio=0.8).split_dataset(dev)
+            split_dict = [convert_to_dict([train, val], data_dict=data_dict, split_names=phases, verbose=True) for k in folds]
+        else:
+            split_dict = [convert_to_dict([dev], data_dict=data_dict, split_names=phases, verbose=True) for k in folds]
     else:
-        split_dict = [convert_to_dict([dev], data_dict=data_dict, split_names=phases, verbose=True) for k in folds]
-    if test:
+        folds = range(1)
         split_dict = [convert_to_dict([test], data_dict=data_dict, split_names=phases, verbose=True) for k in folds]
     seq_split_dict = [convert_to_seqdict(split_dict[k], args.mod_list, phases) for k in folds]
 
@@ -155,9 +165,9 @@ def load_data(
         num_workers=0,
         collate_fn=(SequenceBatchCollater(
             keys=['image','label','delta'], 
-            seq_length=args.seq_length) if x == 'train' & not partial else list_data_collate)
+            seq_length=args.seq_length) if (x == 'train') & (not partial) else list_data_collate)
         ) for k in folds] for x in phases}
-    _, counts = np.unique(seq_class_dict['train'][0], return_counts=True)
+    _, counts = np.unique(seq_class_dict['train' if not testing else 'test'][0], return_counts=True)
     pos_weight = counts[1] / counts.sum()
 
     return dataloader, pos_weight
@@ -171,12 +181,14 @@ def load_objs(
 
     if args.loss_fn == 'bce':
         train_fn = BinaryCELoss(weights=pos_weight, label_smoothing=args.label_smoothing)
+        loss_fn = [train_fn, BinaryCELoss(weights=pos_weight)]
     elif args.loss_fn == 'focal':
         train_fn = FocalLoss(gamma=args.gamma, alpha=pos_weight, label_smoothing=args.label_smoothing)
+        loss_fn = [train_fn, BinaryCELoss(weights=pos_weight)]
     elif args.loss_fn == 'mse':
-        train_fn = nn.MSELoss()
+        loss_fn = nn.MSELoss()
     elif args.loss_fn == 'dino':
-        train_fn = DINOLoss(
+        loss_fn = DINOLoss(
             out_dim=args.out_dim,
             num_crops=4,
             num_steps=args.num_steps,

@@ -378,6 +378,7 @@ def main(
         teacher.load_state_dict(student.state_dict())
         for p in teacher.parameters():
             p.requires_grad = False
+        loss_fn, optimizer, schedules = load_objs(args, student, learning_rate)
         model = [student, teacher]
     else:
         backbone = load_backbone(args)
@@ -394,7 +395,7 @@ def main(
             p.requires_grad = False
         if args.distributed:
             model = nn.parallel.DistributedDataParallel(model, device_ids=[device_id])
-    loss_fn, optimizer, schedules = load_objs(args, model, learning_rate)
+        loss_fn, optimizer, schedules = load_objs(args, model, learning_rate)
 
     pretrainer = Pretrainer(
         model=model,

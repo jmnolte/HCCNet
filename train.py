@@ -5,7 +5,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-import torch.optim.lr_scheduler as lr_scheduler
 import torch.distributed as dist
 from torch.cuda.amp import GradScaler, autocast
 from torchmetrics import MetricCollection
@@ -19,11 +18,8 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from monai.data import set_track_meta
-from monai.utils.misc import ensure_tuple_rep
 from monai.utils import set_determinism
 from models.mednet import MedNet
-from losses.focalloss import FocalLoss
-from losses.binaryceloss import BinaryCELoss
 from utils.transforms import transforms
 from utils.preprocessing import load_backbone, load_data, load_objs
 from utils.config import parse_args
@@ -318,6 +314,7 @@ class Trainer:
         elif log_type == 'auroc':
             axis_label = 'AUROC'
         plot_name = log_type + '_' + self.suffix + '.png' if self.suffix is not None else log_type + '.png'
+        x_axis = np.arange(0, self.num_steps, 1)
 
         for dataset in phases:
             log_book = []
@@ -325,10 +322,10 @@ class Trainer:
                 file_name = f'hist_fold{fold}_' + self.suffix + '.npy'
                 fold_log = np.load(os.path.join(self.output_dir, 'model_history', file_name), allow_pickle='TRUE').item()
                 log_book.append(fold_log[dataset][log_type])
-                plt.plot(fold_log[dataset][log_type], color=('blue' if dataset == 'train' else 'orange'), alpha=0.2)
+                plt.plot(fold_log[dataset][log_type], x_axis, color=('blue' if dataset == 'train' else 'orange'), alpha=0.2)
             log_df = pd.DataFrame(log_book)
             mean_log = log_df.mean(axis=0).tolist()
-            plt.plot(mean_log, color=('blue' if dataset == 'train' else 'orange'), label=('Training' if dataset == 'train' else 'Validation'), alpha=1.0)
+            plt.plot(mean_log, x_axis, color=('blue' if dataset == 'train' else 'orange'), label=('Training' if dataset == 'train' else 'Validation'), alpha=1.0)
             
         plt.ylabel(axis_label, fontsize=20, labelpad=10)
         plt.xlabel('Training Steps', fontsize=20, labelpad=10)
@@ -380,53 +377,54 @@ def main(
     learning_rate = scale_learning_rate(args.effective_batch_size)
     num_classes = args.num_classes if args.num_classes > 2 else 1
     num_folds = args.k_folds if args.k_folds > 0 else 1
-    # seeds = np.random.randint(1000, 10000, 10)
+    seeds = np.random.randint(1000, 10000, args.num_seeds)
 
     cv_dataloader, pos_weight = load_data(args, device_id)
     set_track_meta(False)
 
-    for k in range(num_folds):
-        # set_determinism(seed=seeds[k])
-        dataloader = {x: cv_dataloader[x][k] for x in ['train','val']}
-        backbone = load_backbone(args)
-        model = MedNet(
-            backbone, 
-            num_classes=num_classes, 
-            classification=True,
-            max_len=12,
-            dropout=args.dropout, 
-            eps=args.epsilon)
-        if args.pretrained:
-            weights_path = os.path.join(args.results_dir, 'model_weights/weights_fold1000_dmri_te_tiny_fixed.pth')
-            weights = torch.load(weights_path, map_location='cpu')
-            model.load_state_dict(weights, strict=False)
-        model = model.to(device_id)
-        # for name, param in model.named_parameters():
-        #     if not name.startswith(('pooler','head')):
-        #         param.requires_grad = False
-        if args.distributed:
-            model = nn.parallel.DistributedDataParallel(model, device_ids=[device_id])
-        loss_fn, optimizer, scheduler = load_objs(
-            args, 
-            model=model, 
-            pos_weight=pos_weight,
-            learning_rate=learning_rate)
-        trainer = Trainer(
-            model=model, 
-            loss_fn=loss_fn,
-            dataloaders=dataloader, 
-            optimizer=optimizer,
-            scheduler=scheduler,
-            num_folds=(args.k_folds if args.k_folds > 0 else 1),
-            num_steps=args.num_steps,
-            amp=args.amp,
-            suffix=args.suffix,
-            output_dir=args.results_dir)
-        trainer.train(
-            fold=k,
-            batch_size=args.batch_size, 
-            accum_steps=accum_steps,
-            val_steps=args.log_every)
+    for i, seed in enumerate(seeds):
+        set_determinism(seed=seed)
+        for k in range(num_folds):
+            dataloader = {x: cv_dataloader[x][k] for x in ['train','val']}
+            backbone = load_backbone(args)
+            model = MedNet(
+                backbone, 
+                num_classes=num_classes, 
+                classification=True,
+                max_len=12,
+                dropout=args.dropout, 
+                eps=args.epsilon)
+            if args.pretrained:
+                weights_path = os.path.join(args.results_dir, 'model_weights/weights_fold1000_dmri_te_tiny_fixed.pth')
+                weights = torch.load(weights_path, map_location='cpu')
+                model.load_state_dict(weights, strict=False)
+            model = model.to(device_id)
+            # for name, param in model.named_parameters():
+            #     if not name.startswith(('pooler','head')):
+            #         param.requires_grad = False
+            if args.distributed:
+                model = nn.parallel.DistributedDataParallel(model, device_ids=[device_id])
+            loss_fn, optimizer, scheduler = load_objs(
+                args, 
+                model=model, 
+                pos_weight=pos_weight,
+                learning_rate=learning_rate)
+            trainer = Trainer(
+                model=model, 
+                loss_fn=loss_fn,
+                dataloaders=dataloader, 
+                optimizer=optimizer,
+                scheduler=scheduler,
+                num_folds=int(num_folds * len(seeds)),
+                num_steps=args.num_steps,
+                amp=args.amp,
+                suffix=args.suffix,
+                output_dir=args.results_dir)
+            trainer.train(
+                fold=int(i * num_folds + num_folds),
+                batch_size=args.batch_size, 
+                accum_steps=accum_steps,
+                val_steps=args.log_every)
 
     if args.distributed:
         cleanup()
