@@ -16,7 +16,7 @@ Model training follows a step-wise approach. That is, we first pretrain both CNN
 
 ### Pre-Training
 
-We pretrain the CNN backbone adopting the DINO pretraining framework proposed in [^1]. Furthermore, for the Transformer encoder, we employ a custom variant of the original masked autoencoder pre-training approach [^2]. As such, we mask 60% of the image embeddings obtained from the pretrained CNN backbone and recover their original feature representation using a simple one-layer decoder.
+We pretrain the CNN backbone adapting the DINO pretraining framework proposed in [^1] to 3D medical images. Furthermore, for the Transformer encoder, we employ a custom variant of the original masked autoencoder pre-training approach [^2]. As such, we mask 60% of the image embeddings obtained from the pretrained CNN backbone and recover their original feature representation using a simple one-layer decoder.
 
 ### Fine-Tuning
 
