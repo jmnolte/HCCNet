@@ -8,6 +8,13 @@ def cancel_gradients_last_layer(
         warmup_steps: int
     ) -> None:
 
+    '''
+    Args:
+        model (nn.Module): Pytorch module object.
+        step (int): Current training step.
+        warmup_step (int): Number of steps to wait before updating the model's last layer.
+    '''
+
     if step >= warmup_steps:
         return
     for n, p in model.named_parameters():
@@ -21,6 +28,14 @@ def cosine_scheduler(
         warmup_steps: int = 0
     ) -> np.array:
 
+    '''
+    Args:
+        base_value (float): Base value.
+        final_value (float): Final value after cosine schedule.
+        steps (int): Number of training steps.
+        warmup_step (int): Number of steps to linearly increase the value to its base value. Defaults to 0.
+    '''
+
     warmup_schedule = np.array([])
     if warmup_steps > 0:
         warmup_schedule = np.linspace(final_value, base_value, warmup_steps)
@@ -32,7 +47,15 @@ def cosine_scheduler(
     assert len(schedule) == steps
     return schedule
 
-def get_params_groups(model):
+def get_params_groups(
+        model: nn.Module
+    ):
+
+    '''
+    Args:
+        model (nn.Module): Pytorch module object.
+    '''
+
     regularized = []
     not_regularized = []
     for name, param in model.named_parameters():
@@ -49,6 +72,11 @@ def scale_learning_rate(
         batch_size: int
     ) -> float:
 
+    '''
+    Args:
+        batch_size (int): Number of unique observations in a given batch.
+    '''
+
     alpha = {8: 0.0001, 16: 0.000141, 32: 0.0002, 64: 0.000282, 128: 0.0004, 256: 0.000565, 512: 0.0008}
     return alpha[batch_size] * np.sqrt(batch_size) / np.sqrt(128)
 
@@ -58,6 +86,14 @@ def prep_batch(
         device: torch.device,
         pretrain: bool = False
     ) -> tuple:
+
+    '''
+    Args:
+        data (dict): Batch obtained from a pytorch dataloader.
+        batch_size (int): Number of unique observations in a given batch.
+        device (torch.device): Pytorch device.
+        pretrain (bool): Boolean flag to indicate the pretraining stage.
+    '''
 
     B, C, H, W, D = data['image'].shape
     seq_length = B // batch_size

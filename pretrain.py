@@ -45,6 +45,19 @@ class Pretrainer:
             output_dir: str | None = None
         ) -> None:
 
+        '''
+        Args:
+            model (nn.Module): Pytorch module object for Transformer pretraining or list of pytorch module objects for CNN backbone pretraining. 
+            loss_fn (nn.Module): Loss function.
+            dataloaders (dict): Dataloader objects. Have to be provided as a dictionary, where the the entries are 'train' and 'val'. 
+            optimizer (optim): Pytorch optimizer.
+            scheduler (List[np.array]): List of learing rate, weight decay, and momentum schedules. Has to be of length 2 or 3.
+            num_steps (int): Number of training steps. Defaults to 1000.
+            amp (bool): Boolean flag to enable automatic mixed precision training. Defaults to true.
+            suffix (str | None): Unique string under which model results are stored.
+            output_dir (str | None): Directory to store model outputs.
+        '''
+
         self.gpu_id = int(os.environ['LOCAL_RANK'])
         if isinstance(model, list):
             self.student = model[0]
@@ -89,6 +102,7 @@ class Pretrainer:
         Args:
             output_dict (dict): Dictionary containing the model outputs.
             output_type (str): Type of output. Can be 'weights', 'history', or 'preds'.
+            fold (int): Current training step.
         '''
         try: 
             assert any(output_type == output_item for output_item in ['weights','history','preds'])
@@ -122,6 +136,13 @@ class Pretrainer:
             values: float | List[float]
         ) -> None:
 
+        '''
+        Args:
+            phase (str): String specifying the training phase. Can be 'train' or 'val'.
+            keys (str | List[str]): Metric name or list of metric names that should be logged.
+            values (float | List[float]): Metric value or list of metric values corresponding to their keys. 
+        '''
+
         if not isinstance(keys, list):
             keys = [keys]
         if not isinstance(values, list):
@@ -135,6 +156,13 @@ class Pretrainer:
             step: int,
             accum_steps: int
         ) -> float:
+
+        '''
+        Args:
+            batch (dict): Batch obtained from a Pytorch dataloader.
+            step (int): Current training step.
+            accum_steps (int): Number of steps to accumulate before updating the gradients.
+        '''
 
         self.student.train()
         self.teacher.train()
@@ -156,6 +184,13 @@ class Pretrainer:
             accum_steps: int
         ) -> float:
 
+        '''
+        Args:
+            batch (dict): Batch obtained from a Pytorch dataloader.
+            batch_size (int): Number of unique observations in the batch.
+            accum_steps (int): Number of steps to accumulate before updating the gradients.
+        '''
+
         self.model.train()
         inputs, _, delta, padding_mask = prep_batch(batch, batch_size=batch_size, device=self.gpu_id, pretrain=True)
 
@@ -175,6 +210,13 @@ class Pretrainer:
             warmup_steps: int,
             clip_grad: bool = True
         ) -> None:
+
+        '''
+        Args:
+            step (int): Current training step.
+            warmup_steps (int): Number of steps to wait before updating last layer.
+            clip_grad (bool): Boolean flag to clip parameter gradients.
+        '''
 
         for i, param_group in enumerate(self.optim.param_groups):
             param_group['lr'] = self.lr_schedule[step]
@@ -201,6 +243,11 @@ class Pretrainer:
         for param_q, param_k in zip(self.student.parameters(), self.teacher.parameters()):
             param_k.data.mul_(m).add_((1 - m) * param_q.detach().data)
 
+        '''
+        Args:
+            step (int): Current training step.
+        '''
+
     def pretrain(
             self,
             batch_size: int,
@@ -208,6 +255,14 @@ class Pretrainer:
             warmup_steps: int,
             log_every: int = 10
         ) -> None:
+
+        '''
+        Args:
+            batch_size (int): Number of unique observations in the batch.
+            accum_steps (int): Number of steps to accumulate before updating parameter gradients.
+            warmup_steps (int): Number of steps to wait before updating last layer.
+            log_every (int): Number of steps to wait before storing current model weights.
+        '''
 
         accum_loss = 0.0
         running_loss = 0.0
@@ -273,10 +328,9 @@ class Pretrainer:
         ) -> None:
 
         '''
-        Visualize the training and validation history.
-
         Args:
-            metric (str): String specifying the metric to be visualized. Can be 'loss' or 'f1score'.
+            phase (str | List[str]): String or list of strings. Should be 'train' and 'val'.
+            log_type (str): String specifying the metric that should be visualized.
         '''
 
         if log_type == 'loss':
@@ -316,6 +370,12 @@ def load_weights(
         weights_path: str
     ) -> dict:
 
+    '''
+    Args:
+        args (argparse.Namespace): Command line arguments.
+        weights_path (str): Path to weights directory.
+    '''
+
     weights = torch.load(weights_path, map_location='cpu')
     weights = {k.replace('backbone.', ''): v for k, v in weights.items()}
     weights['downsample_layers.0.0.weight'] = weights['downsample_layers.0.0.weight'].repeat(1, len(args.mod_list), 1, 1, 1)
@@ -340,11 +400,6 @@ def main(
     ) -> None:
 
     '''
-    Main function. The function loads the dataloader, model, and metric, and trains the model. After
-    training, the function plots the training and validation loss and F1 score. It saves the updated
-    model weights, the training and validation history (i.e., loss and F1 score), and the corresponding
-    plots.
-
     Args:
         args (argparse.Namespace): Command line arguments.
     '''
@@ -359,7 +414,7 @@ def main(
     version = 'v2' if args.use_v2 else 'v1'
     backbone_only = True if args.loss_fn == 'dino' else False
 
-    dataloader, _ = load_data(args, device_id, pretraining=True, partial=True if backbone_only else False)
+    dataloader, _ = load_data(args, device_id, phase='pretrain', partial=True if backbone_only else False)
     dataloader = {x: dataloader[x][0] for x in ['train']}
     set_track_meta(False)
     if backbone_only:
@@ -386,6 +441,7 @@ def main(
             backbone=backbone, 
             classification=False,
             max_len=12,
+            num_layers=4,
             dropout=args.dropout,
             eps=args.epsilon)
         weights = load_weights(args, os.path.join(args.results_dir, f'model_weights/weights_fold16000_dmri_{args.arch}_{args.out_dim}.pth'))

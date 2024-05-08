@@ -43,19 +43,17 @@ class Trainer:
         ) -> None:
 
         '''
-        Initialize the training class.
-
         Args:
-            model (torch.nn): Model to train.
-            backbone (str): Backbone architecture to use. Has to be 'resnet50', or 'densenet121'.
-            amp (bool): Flag to use automated mixed precision.
-            dataloaders (dict): Dataloader objects. Have to be provided as a dictionary, where the the entries are 'train', 'val', and/or 'test'. 
-            learning_rate (float): Float specifiying the learning rate.
-            weight_decay (float): Float specifying the Weight decay.
-            accum_steps (int): Number of accumulations steps.
-            weights (torch.Tensor): Tensor to rescale the weights given to each class C. Has to be of size C.
-            smoothing_coef (float): Float to specify the amount of smoothing applied to the class labels. Has to be in range [0.0 to 1.0].
-            output_dir (str): Directory to store model outputs.
+            model (nn.Module): Pytorch module object.
+            loss_fn (List[nn.Module]): List containing the train and validation loss functions. Has to be of length 2.
+            dataloaders (dict): Dataloader objects. Have to be provided as a dictionary, where the the entries are 'train' and 'val'. 
+            optimizer (optim): Pytorch optimizer.
+            scheduler (List[np.array]): List of learing rate and weight decay schedules. Has to be of length 2.
+            num_folds (int): Number of cross-validation folds. Defaults to 1.
+            num_steps (int): Number of training steps. Defaults to 1000.
+            amp (bool): Boolean flag to enable automatic mixed precision training. Defaults to true.
+            suffix (str | None): Unique string under which model results are stored.
+            output_dir (str | None): Directory to store model outputs.
         '''
         self.gpu_id = int(os.environ['LOCAL_RANK'])
         self.model = model
@@ -91,11 +89,10 @@ class Trainer:
         ) -> None:
 
         '''
-        Save the model's output.
-
         Args:
             output_dict (dict): Dictionary containing the model outputs.
             output_type (str): Type of output. Can be 'weights', 'history', or 'preds'.
+            fold (int): Current cross-valdiation fold.
         '''
         try: 
             assert any(output_type == output_item for output_item in ['weights','history','preds'])
@@ -129,6 +126,13 @@ class Trainer:
             values: float | List[float]
         ) -> None:
 
+        '''
+        Args:
+            phase (str): String specifying the training phase. Can be 'train' or 'val'.
+            keys (str | List[str]): Metric name or list of metric names that should be logged.
+            values (float | List[float]): Metric value or list of metric values corresponding to their keys. 
+        '''
+
         if not isinstance(keys, list):
             keys = [keys]
         if not isinstance(values, list):
@@ -138,10 +142,17 @@ class Trainer:
 
     def training_step(
             self,
-            batch,
+            batch: dict,
             batch_size: int,
             accum_steps: int
         ) -> float:
+
+        '''
+        Args:
+            batch (dict): Batch obtained from a Pytorch dataloader.
+            batch_size (int): Number of unique observations in the batch.
+            accum_steps (int): Number of steps to accumulate before updating the gradients.
+        '''
 
         self.model.train()
         inputs, labels, delta, padding_mask = prep_batch(batch, batch_size=batch_size, device=self.gpu_id)
@@ -162,6 +173,12 @@ class Trainer:
             clip_grad: bool = True
         ) -> None:
 
+        '''
+        Args:
+            step (int): Current training step.
+            clip_grad (bool): Boolean flag to clip parameter gradients.
+        '''
+
         for i, param_group in enumerate(self.optim.param_groups):
             param_group['lr'] = self.lr_schedule[step]
             if i == 0:  # only the first group is regularized
@@ -178,19 +195,16 @@ class Trainer:
     @torch.no_grad()
     def validation_step(
             self, 
-            batch,
+            batch: dict,
             batch_size: int = 1
         ) -> float:
 
         '''
-        Validate the model.
-
         Args:
-            epoch (int): Current epoch.
-        
-        Returns:
-            tuple: Tuple containing the loss and F1-score.
+            batch (dict): Batch obtained from a Pytorch dataloader.
+            batch_size (int): Number of unique observations in the batch.
         '''
+
         self.model.eval()
         inputs, labels, delta, padding_mask = prep_batch(batch, batch_size=batch_size, device=self.gpu_id)
 
@@ -211,17 +225,11 @@ class Trainer:
         ) -> None:
 
         '''
-        Training loop.
-
         Args:
-            train_ds (monai.data): Training dataset.
-            metric (torch.nn): Metric to assess model performance while training/validating.
-            min_epochs (int): Minimum number of epochs to train.
-            val_every (int): Integer specifying the interval the model is validated.
-            accum_steps (int): Number of accumulation steps to use before updating the model weights.
-            early_stopping (bool): Whether to use early stopping.
-            patience (int): Number of epochs to wait before aborting the training process.
-            num_patches (int): Number of slice patches to use for training.
+            fold (int): Current cross-validation fold.
+            batch_size (int): Number of unique observations in the batch.
+            accum_steps (int): Number of steps to accumulate before updating parameter gradients.
+            val_steps (int): Number of steps to wait before evaluating the model on the validation set.
         '''
         start_time = time.time()
         step = 0
@@ -281,9 +289,9 @@ class Trainer:
                         best_auroc = val_results[self.val_metric_str[1]]
                         if self.gpu_id == 0:
                             print(f'[GPU {self.gpu_id}] New best Validation Loss: {best_loss:.4f} and Metric: {val_metric:.4f}. Saving model weights...')
-                            best_weights = copy.deepcopy(self.model.module.state_dict())
 
                 if (step + 1) == self.num_steps * accum_steps:
+                    best_weights = copy.deepcopy(self.model.module.state_dict())
                     break
 
         if self.gpu_id == 0:
@@ -301,10 +309,9 @@ class Trainer:
         ) -> None:
 
         '''
-        Visualize the training and validation history.
-
         Args:
-            metric (str): String specifying the metric to be visualized. Can be 'loss' or 'f1score'.
+            phase (List[str]): List of strings. Should be 'train' and 'val'.
+            log_type (str): String specifying the metric that should be visualized.
         '''
 
         if log_type == 'loss':
@@ -314,7 +321,6 @@ class Trainer:
         elif log_type == 'auroc':
             axis_label = 'AUROC'
         plot_name = log_type + '_' + self.suffix + '.png' if self.suffix is not None else log_type + '.png'
-        x_axis = np.arange(0, self.num_steps, 1)
 
         for dataset in phases:
             log_book = []
@@ -322,10 +328,10 @@ class Trainer:
                 file_name = f'hist_fold{fold}_' + self.suffix + '.npy'
                 fold_log = np.load(os.path.join(self.output_dir, 'model_history', file_name), allow_pickle='TRUE').item()
                 log_book.append(fold_log[dataset][log_type])
-                plt.plot(fold_log[dataset][log_type], x_axis, color=('blue' if dataset == 'train' else 'orange'), alpha=0.2)
+                plt.plot(fold_log[dataset][log_type], color=('blue' if dataset == 'train' else 'orange'), alpha=0.2)
             log_df = pd.DataFrame(log_book)
             mean_log = log_df.mean(axis=0).tolist()
-            plt.plot(mean_log, x_axis, color=('blue' if dataset == 'train' else 'orange'), label=('Training' if dataset == 'train' else 'Validation'), alpha=1.0)
+            plt.plot(mean_log, color=('blue' if dataset == 'train' else 'orange'), label=('Training' if dataset == 'train' else 'Validation'), alpha=1.0)
             
         plt.ylabel(axis_label, fontsize=20, labelpad=10)
         plt.xlabel('Training Steps', fontsize=20, labelpad=10)
@@ -358,28 +364,26 @@ def main(
     ) -> None:
 
     '''
-    Main function. The function loads the dataloader, model, and metric, and trains the model. After
-    training, the function plots the training and validation loss and F1 score. It saves the updated
-    model weights, the training and validation history (i.e., loss and F1 score), and the corresponding
-    plots.
-
     Args:
         args (argparse.Namespace): Command line arguments.
     '''
+
+    # Seed to enable deterministic training
     set_determinism(seed=args.seed)
     if args.distributed:
         setup()
     rank = dist.get_rank()
     num_devices = torch.cuda.device_count()
     device_id = rank % num_devices
+    # Accumulation steps = effective batch size / batch size per GPU / number of GPUs
     accum_steps = args.effective_batch_size // args.batch_size // num_devices
-    batch_size_gpu = args.batch_size * accum_steps
     learning_rate = scale_learning_rate(args.effective_batch_size)
     num_classes = args.num_classes if args.num_classes > 2 else 1
     num_folds = args.k_folds if args.k_folds > 0 else 1
     seeds = np.random.randint(1000, 10000, args.num_seeds)
 
     cv_dataloader, pos_weight = load_data(args, device_id)
+    # We disable tracking of metadata for optimized performance
     set_track_meta(False)
 
     for i, seed in enumerate(seeds):
@@ -391,6 +395,7 @@ def main(
                 backbone, 
                 num_classes=num_classes, 
                 classification=True,
+                num_layers=4,
                 max_len=12,
                 dropout=args.dropout, 
                 eps=args.epsilon)
@@ -415,13 +420,13 @@ def main(
                 dataloaders=dataloader, 
                 optimizer=optimizer,
                 scheduler=scheduler,
-                num_folds=int(num_folds * len(seeds)),
+                num_folds=int(num_folds * args.num_seeds),
                 num_steps=args.num_steps,
                 amp=args.amp,
                 suffix=args.suffix,
                 output_dir=args.results_dir)
             trainer.train(
-                fold=int(i * num_folds + num_folds),
+                fold=int(i * num_folds + k),
                 batch_size=args.batch_size, 
                 accum_steps=accum_steps,
                 val_steps=args.log_every)
