@@ -8,13 +8,16 @@ from timm.models.registry import register_model
 
 class Block(nn.Module):
     r""" ConvNeXt Block. There are two equivalent implementations:
-    (1) DwConv -> LayerNorm (channels_first) -> 1x1 Conv -> GELU -> 1x1 Conv; all in (N, C, H, W)
-    (2) DwConv -> Permute to (N, H, W, C); LayerNorm (channels_last) -> Linear -> GELU -> Linear; Permute back
+    (1) DwConv -> LayerNorm (channels_first) -> 1x1 Conv -> GELU -> 1x1 Conv; all in (N, C, H, W, D)
+    (2) DwConv -> Permute to (N, H, W, D, C); LayerNorm (channels_last) -> Linear -> GELU -> Linear; Permute back
     We use (2) as we find it slightly faster in PyTorch
     
     Args:
         dim (int): Number of input channels.
+        kernel_size (int): Kernel size of downsampling convolutional layer.
         drop_path (float): Stochastic depth rate. Default: 0.0
+        use_v2 (bool): Whether to use ConvNeXt version 1 or version 2.
+        layer_scale_init (float): Initial scaling factor of gamma parameter.
         eps (float): Epsilon to stabilize training. Default: 1e-6.
     """
     def __init__(
@@ -63,17 +66,19 @@ class Block(nn.Module):
 
 class ConvNeXt3d(nn.Module):
     r""" ConvNeXt
-        A PyTorch impl of : `A ConvNet for the 2020s`  -
+        A 3D adaptation of the offical pytorch impl of : `A ConvNet for the 2020s`  -
           https://arxiv.org/pdf/2201.03545.pdf
 
     Args:
         in_chans (int): Number of input image channels. Default: 3
         num_classes (int): Number of classes for classification head. Default: 1000
+        kernel_size (int): Kernel size of downsampling convolutional layer. Defaults to 3.
         depths (tuple(int)): Number of blocks at each stage. Default: [3, 3, 9, 3]
         dims (int): Feature dimension at each stage. Default: [96, 192, 384, 768]
         drop_path_rate (float): Stochastic depth rate. Default: 0.
-        eps (float): Epsilon value. Default: 1e-6.
-        head_init_scale (float): Init scaling value for classifier weights and biases. Default: 1.
+        use_v2 (bool): Whether to use ConvNeXt version 1 or version 2.
+        layer_scale_init (float): Initial scaling factor of gamma parameter.
+        eps (float): Epsilon to stabilize training. Default: 1e-6.
     """
     def __init__(
             self, 
@@ -149,8 +154,8 @@ class ConvNeXt3d(nn.Module):
 class LayerNorm(nn.Module):
     r""" LayerNorm that supports two data formats: channels_last (default) or channels_first. 
     The ordering of the dimensions in the inputs. channels_last corresponds to inputs with 
-    shape (batch_size, height, width, channels) while channels_first corresponds to inputs 
-    with shape (batch_size, channels, height, width).
+    shape (batch_size, height, width, depth, channels) while channels_first corresponds to inputs 
+    with shape (batch_size, channels, height, width, depth).
     """
     def __init__(
             self, 
@@ -183,7 +188,8 @@ class LayerNorm(nn.Module):
             return x
         
 class GRN(nn.Module):
-    """ GRN (Global Response Normalization) layer
+    """ 
+    GRN (Global Response Normalization) layer
     """
     def __init__(
             self, 

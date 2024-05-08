@@ -30,10 +30,17 @@ class DINOLoss(nn.Module):
             np.ones(num_steps - teacher_warmup_steps) * teacher_temp
         ))
 
-    def forward(self, step, student_output, teacher_output):
+    def forward(
+            self, 
+            step: int, 
+            student_output: torch.Tensor, 
+            teacher_output: torch.Tensor
+        ) -> torch.Tensor:
+
         """
         Cross-entropy between softmax outputs of the teacher and student networks.
         """
+
         student_out = student_output / self.student_temp
         student_out = student_out.chunk(self.ncrops)
 
@@ -57,7 +64,11 @@ class DINOLoss(nn.Module):
         return total_loss
 
     @torch.no_grad()
-    def update_center(self, teacher_output):
+    def update_center(
+            self, 
+            teacher_output: torch.Tensor
+        ) -> None:
+        
         """
         Update center used for teacher output.
         """

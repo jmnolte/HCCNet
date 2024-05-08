@@ -51,15 +51,13 @@ class Tester:
             ) -> None:
 
         '''
-        Initialize the training class.
-
         Args:
-            model (torch.nn): Model to train.
-            version (str): Model version. Can be 'resnet10', 'resnet18', 'resnet34', 'resnet50',
-                'resnet101', 'resnet152', or 'resnet200'.
-            device (torch.device): Device to use.
-            dataloaders (dict): Dataloader objects.
-            output_dir (str): Output directory.
+            model (nn.Module): Pytorch module object.
+            dataloaders (dict): Dataloader objects. Have to be provided as a dictionary, where the the entries are 'train' and 'val'. 
+            num_folds (int): Number of cross-validation folds. Defaults to 5.
+            amp (bool): Boolean flag to enable automatic mixed precision training. Defaults to true.
+            suffix (str | None): Unique string under which model results are stored.
+            output_dir (str | None): Directory to store model outputs.
         '''
         self.gpu_id = int(os.environ['LOCAL_RANK'])
         self.model = model
@@ -68,8 +66,6 @@ class Tester:
         self.amp = amp
         self.suffix = suffix
         self.output_dir = output_dir
-        # self.grad_cam = GradCAMpp(self.model, target_layers=)
-        # self.occ_sens = OcclusionSensitivity(backbone, n_batch=1)
 
         self.metrics = MetricCollection([
             BinaryAccuracy(), BinaryRecall(), BinaryPrecision(), BinaryF1Score(),
@@ -83,7 +79,8 @@ class Tester:
         ) -> None:
 
         '''
-        Run inference on the test set.
+        Args:
+            batch (dict): Batch obtained from a Pytorch dataloader.
         '''
 
         self.model.eval()
@@ -100,6 +97,11 @@ class Tester:
             self,
             fold: int
         ) -> None:
+
+        '''
+        Args:
+            fold (int): Current cross-validation fold.
+        '''
 
         out_dict = {x: [] for x in ['probs','labels']}
         for batch in self.dataloaders['test']:
@@ -124,11 +126,10 @@ class Tester:
         ) -> None:
 
         '''
-        Save the model's output.
-
         Args:
             output_dict (dict): Dictionary containing the model outputs.
             output_type (str): Type of output. Can be 'weights', 'history', or 'preds'.
+            fold (int): Current cross-validation fold.
         '''
         try: 
             assert any(output_type == output_item for output_item in ['weights','history','preds'])
@@ -195,6 +196,11 @@ def load_weights(
         weights_path: str
     ) -> dict:
 
+    '''
+    Args:
+        weights_path (str): Path to weights directory.
+    '''
+
     weights = torch.load(weights_path, map_location='cpu')
     return weights
 
@@ -217,17 +223,10 @@ def main(
         ) -> None:
 
     '''
-    Main function. The function loads the dataloader, model, and metric, and trains the model. After
-    training, the function plots the training and validation loss and F1 score. It saves the updated
-    model weights, the training and validation history (i.e., loss and F1 score), and the corresponding
-    plots.
-
     Args:
         args (argparse.Namespace): Command line arguments.
     '''
-    # Set a seed for reproducibility.
     set_determinism(seed=args.seed)
-    # Setup distributed training.
     if args.distributed:
         setup()
     rank = dist.get_rank()
@@ -236,7 +235,7 @@ def main(
     num_classes = args.num_classes if args.num_classes > 2 else 1
     num_folds = args.k_folds if args.k_folds > 0 else 1
 
-    dataloader, _ = load_data(args, device_id, testing=True)
+    dataloader, _ = load_data(args, device_id, phase='test')
     dataloader = {x: dataloader[x][0] for x in ['test']}
     set_track_meta(False)
 
@@ -263,16 +262,9 @@ def main(
             output_dir=args.results_dir)
         tester.test(fold=k)
     tester.visualize_results()
-    # Cleanup distributed training.
     if args.distributed:
         cleanup()
     print('Script finished')
-    
-
-RESULTS_DIR = '/Users/noltinho/thesis/results'
-DATA_DIR = '/Users/noltinho/thesis_private/data'
-MODALITY_LIST = ['T1W_OOP','T1W_IP','T1W_DYN','T2W_TES','T2W_TEL','DWI_b150','DWI_b400','DWI_b800']
-WEIGHTS_DIR = '/Users/noltinho/MedicalNet/pytorch_files/pretrain'
 
 if __name__ == '__main__':
     args = parse_args()

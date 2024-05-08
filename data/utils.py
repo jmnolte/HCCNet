@@ -11,11 +11,21 @@ from monai.data.utils import collate_meta_tensor
 
 class SequenceBatchCollater:
 
+    '''
+    A generic collate function that pads or truncates sequences of images to a specified sequence length.
+    '''
+
     def __init__(
             self,
             keys: list,
             seq_length: int
         ) -> None:
+
+        '''
+        Args:
+            keys (list): A list of keys to retain when data loading.
+            seq_length (int): The maximum sequence length. All sequences are automatically padded to truncated to its maximum length.
+        '''
 
         self.keys = keys
         self.seq_length = seq_length
@@ -50,9 +60,14 @@ class SequenceBatchCollater:
         return collate_meta_tensor([item for sublist in data for item in sublist])
 
 
-def convert_to_dict(data_frames: list, data_dict: dict, split_names: list, verbose: bool = False) -> dict:
+def convert_to_dict(
+        data_frames: list, 
+        data_dict: dict, 
+        split_names: list, 
+        verbose: bool = False
+    ) -> dict:
+
     split_dict = {}
-    
     for idx, df in enumerate(data_frames):
         name = split_names[idx]
         split_dict[name] = df[['uid']].values
@@ -92,14 +107,9 @@ class DatasetPreprocessor:
             partial: bool = False,
         ) -> None:
         '''
-        Initialize the dataset preprocessor class.
-
         Args:
-            data_dir (str): Path to the data.
-            test_run (bool): Run the code on a small subset of the data.
-
-        Returns:
-            data_dict (dict): Dictionary containing the paths to the images and corresponding labels.
+            data_dir (str): Path to the data directory.
+            partial (bool): Whether to also load images that only include part of the specified modalities.
         '''
         self.nifti_dir = os.path.join(data_dir, 'nifti')
         self.nifti_patients = glob(os.path.join(self.nifti_dir, '*'), recursive = True)
@@ -112,13 +122,9 @@ class DatasetPreprocessor:
             verbose: bool = True
         ) -> list:
         '''
-        Assert that all observations include all required images.
-
         Args:
+            modalities (list): List of image modalities to load.
             verbose (bool): Print the number of observations that include all required images.
-
-        Returns:
-            observation_list (list): List of observations that include all required images.
         '''
         image_names_list = [image_name + '.nii.gz' for image_name in modalities]
         observation_list = []
@@ -142,14 +148,9 @@ class DatasetPreprocessor:
             modality: str
         ) -> list:
         '''
-        Create a dictionary of paths to images.
-
         Args:
             observation_list (list): List of observations to split.
             modality (str): Modality to split by.
-
-        Returns:
-            image_paths (list): List of paths to images.
         '''
         return [glob(os.path.join(observation, modality + '.nii.gz')) for observation in observation_list]
     
@@ -160,14 +161,10 @@ class DatasetPreprocessor:
             label_path: str
         ) -> dict:
         '''
-        Extract the labels from the dataframe.
-
         Args:
             observation_list (list): List of observations to create labels for.
+            keys (List[str]): List of keys to preserve when data loading.
             label_path (str): Path to the dataframe containing the labels.
-
-        Returns:
-            label_dict (dict): Dictionary containing the labels.
         '''
         new_keys = ['uid'] + keys
         label_dict = {x: [] for x in new_keys}
@@ -194,14 +191,9 @@ class DatasetPreprocessor:
             input_dict: dict
         ) -> dict:
         '''
-        Transpose the dictionary.
-
         Args:
             observation_list (list): List of observations to create labels for.
             input_dict (dict): Dictionary containing the paths to the images.
-        
-        Returns:
-            data_dict (dict): Dictionary containing the paths to the images.
         '''
         input_dict['uid'] = [os.path.basename(observation) for observation in observation_list]
         return [dict(zip(input_dict.keys(), vals)) for vals in zip(*(input_dict[k] for k in input_dict.keys()))]
@@ -214,15 +206,11 @@ class DatasetPreprocessor:
             verbose: bool = True
         ) -> list:
         '''
-        Call the dataset preprocessor class.
-
         Args:
             modality_list (list): List of modalities to load.
-            label_column (str): Column name of the label.
+            keys (List[str]): List of keys to retain when data loading. 
+            file_name (str): Label file name.
             verbose (bool): Print statement indicating the number of observations that include all required images.
-
-        Returns:
-            data_dict (dict): Dictionary containing the paths to the images and corresponding labels.
         '''
         observation_list = self.assert_observation_completeness(modalities, verbose)
         modality_dict = {modality: self.split_observations_by_modality(observation_list, modality) for modality in modalities}

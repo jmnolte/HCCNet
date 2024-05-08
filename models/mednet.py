@@ -130,14 +130,16 @@ class PositionalEncoding(nn.Module):
             x: torch.Tensor, 
             pos: torch.Tensor
         ) -> torch.Tensor:
-        """
-        Arguments:
-            x: Tensor, shape ``[batch_size, seq_length, embedding_dim]``
-        """
+
         pos_encod = self.pe[:, pos.long(), :].squeeze(0)
         return self.dropout(x + pos_encod)
 
 class MedNet(nn.Module):
+
+    '''
+    CNN-Transformer model where the CNN extracts image features and the Transformer models the sequence of feature
+    vectors.
+    '''
 
     def __init__(
             self, 
@@ -151,6 +153,19 @@ class MedNet(nn.Module):
             eps: float = 1e-6,
             norm_first: bool = True
         ) -> None:
+
+        '''
+        Args:
+            backbone (nn.Module): The CNN backbone model.
+            num_classes (int): The number of classes.
+            classification (bool): Whether to perform classification on downstream task or masked pretraining.
+            max_len (int): The maximum sequence length.
+            num_layers (int): The number of transformer encoder layers.
+            droput (float): The dropout rate.
+            activation (str): The activation function in the encoder layers.
+            eps (float): Epsilon to stabilize training. Default: 1e-6.
+            norm_first (bool): Whether the use the Pre-LN transformer encoder.
+        '''
 
         super().__init__()
         self.d_model = _extract_num_features(backbone)

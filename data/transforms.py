@@ -9,6 +9,11 @@ import numpy as np
 
 class PercentileSpatialCropd(Transform):
 
+    '''
+    Generic transform that crops images based on provided percentiles. For a given image of shape 80x80x80
+    and a roi_size of (0.75, 0.75, 0.75), the resulting image is of shape 60x60x60.
+    '''
+
     def __init__(
             self,
             keys: str | list,
@@ -16,6 +21,14 @@ class PercentileSpatialCropd(Transform):
             roi_size: Sequence[float],
             min_size: Sequence[int]
         ) -> None:
+
+        '''
+        Args:
+            keys (str | list): String or list of strings to perform transform on.
+            roi_center (Sequence[float]): Percentile of the center voxels per axis.
+            roi_size (Sequence[float]): Size of the region of interest in percent.
+            min_size (Sequence[float]): Minimum size of the cropped image in absolute values.
+        '''
 
         self.keys = [keys] if isinstance(keys, str) else keys
         self.roi_center = roi_center
@@ -39,6 +52,10 @@ class PercentileSpatialCropd(Transform):
 
 class YeoJohnsond(Transform):
 
+    '''
+    Transform to adjust the intensity values of the provided images using the Yeo-Johnson transformation.
+    '''
+
     def __init__(
             self,
             keys: str | list,
@@ -46,6 +63,14 @@ class YeoJohnsond(Transform):
             channel_wise: bool = False,
             allow_missing_keys: bool = False
         ) -> None:
+
+        '''
+        Args:
+            keys (str | list): String or list of strings to perform transform on.
+            lmbda (float | Sequence[float]): Strength of the transformation. Smaller values represents a stronger intensity adjustment.
+            channel_wise (bool): Whether to perform the transform on all channels independently.
+            allow_missing_keys (bool): Whether to raise an exception when encountering missing keys. 
+        '''
 
         self.keys = [keys] if isinstance(keys, str) else keys
         self.lmbda = lmbda
@@ -81,11 +106,21 @@ class YeoJohnsond(Transform):
 
 class RandSelectChanneld(Transform, Randomizable):
 
+    '''
+    Transform that randomly selects a channel from a multi-channel image.
+    '''
+
     def __init__(
             self,
             keys: str | list,
             num_channels: int
         ) -> None:
+
+        '''
+        Args:
+            keys (str | list): String or list of strings to perform transform on.
+            num_channels (int): Number of channels to select randomly.
+        '''
 
         self.keys = [keys] if isinstance(keys, str) else keys
         self.num_channels = num_channels
@@ -99,6 +134,11 @@ class RandSelectChanneld(Transform, Randomizable):
 
 class ResampleToMatchFirstd(ResampleToMatchd):
 
+    '''
+    Adaptation of ResampleToMatchd transform that automatically selects the first channel to resample the remaining 
+    channels to. 
+    '''
+
     def __init__(
             self,
             keys: KeysCollection,
@@ -108,6 +148,16 @@ class ResampleToMatchFirstd(ResampleToMatchd):
             allow_missing_keys: bool = False,
             lazy: bool = False
         ) -> None:
+
+        '''
+        Args:
+            keys (str | list): String or list of strings to perform transform on.
+            mode (SequenceStr): Resampling mode.
+            align_corners (Sequence[bool] | bool): Whether to align corners.
+            dtype (Sequence[DtypeLike] | DtypeLike): Output data type.
+            allow_missing_keys (bool): Whether to raise an exception when encountering missing keys. 
+            lazy (bool): Whether to allow lazy transformation.
+        '''
 
         super().__init__(
             keys=keys,
@@ -145,12 +195,23 @@ class ResampleToMatchFirstd(ResampleToMatchd):
 
 class SoftClipOutliersd(Transform):
 
+    '''
+    Transform that clips the intensity values of a provided image based on the median absolute deviation.
+    '''
+
     def __init__(
             self,
             keys: str | list,
             scale_factor: float = 1.5,
             channel_wise: bool = False
         ) -> None:
+
+        '''
+        Args:
+            keys (str | list): String or list of strings to perform transform on.
+            scale_factor (float): Maximum median absolute deviation.
+            Whether to perform the transform on all channels independently.
+        '''
 
         self.keys = [keys] if isinstance(keys, str) else keys
         self.scale_factor = scale_factor

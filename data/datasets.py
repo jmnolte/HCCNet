@@ -143,7 +143,6 @@ class CacheSeqDataset(SeqDataset, CacheDataset):
 
     """
 
-
     def __init__(
         self,
         data: Sequence,

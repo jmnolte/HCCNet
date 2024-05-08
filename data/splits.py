@@ -14,10 +14,8 @@ class GroupStratifiedSplit(GroupShuffleSplit):
         )
         
         '''
-        Initialize the group stratified split class.
-
         Args:
-            test_ratio (float): Ratio of the data to be used for testing.
+            split_ratio (float): Ratio of the data to be used for training.
             n_splits (int): Number of splits to perform.
         '''
         self.test_ratio = 1 - split_ratio
@@ -29,14 +27,9 @@ class GroupStratifiedSplit(GroupShuffleSplit):
             ) -> pd.DataFrame:
 
         '''
-        Split the data into training, validation and test sets.
-
         Args:
             dataframe (pd.DataFrame): Dataframe to split.
             splits (list): List of splits.
-
-        Returns:
-            dataframes (pd.DataFrame): Dataframes split according to the test ratio.
         '''
         label_ratio = 1
         for split in splits:
@@ -53,14 +46,8 @@ class GroupStratifiedSplit(GroupShuffleSplit):
             ) -> pd.DataFrame:
         
         '''
-        Call the group stratified split class.
-
         Args:
             dataframe (pd.DataFrame): Dataframe to split.
-            group_id (str): Column name of the group id.
-
-        Returns:
-            dataframes (pd.DataFrame): Dataframes split according to the test ratio.
         '''
         splits = super().split(dataframe, groups=dataframe['patient_id'])
         split1, split2 = self.select_best_split(dataframe, splits)

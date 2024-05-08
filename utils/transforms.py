@@ -40,13 +40,12 @@ def transforms(
     ) -> transforms:
 
     '''
-    Perform data transformations on image and image labels.
-
     Args:
         dataset (str): Dataset to apply transformations on. Can be 'train', 'val' or 'test'.
-
-    Returns:
-        transforms (monai.transforms): Data transformations to be applied.
+        modalities (list): List of image modalities to perform transformations on.
+        device (torch.device): Pytorch device.
+        crop_size (tuple): Tuple of integers specifying the image size.
+        image_spacing (tuple): Tuple of floats specifying the spacing between MRI slides.
     '''
     if any('DWI' in mod for mod in modalities):
         mean = (0.5396, 0.5280, 0.5601, 0.5737)
@@ -130,13 +129,12 @@ def dino_transforms(
         image_spacing: tuple = (1.5, 1.5, 1.5)
     ) -> transforms:
     '''
-    Perform data transformations on image and image labels.
-
     Args:
-        dataset (str): Dataset to apply transformations on. Can be 'train', 'val' or 'test'.
-
-    Returns:
-        transforms (monai.transforms): Data transformations to be applied.
+        modalities (list): List of image modalities to perform transformations on.
+        device (torch.device): Pytorch device.
+        global_crop_size (tuple): Tuple of integers specifying the size of the global views.
+        global_crop_size (tuple): Tuple of integers specifying the size of the local views.
+        image_spacing (tuple): Tuple of floats specifying the spacing between MRI slides.
     '''
     prep = [
         LoadImaged(keys=modalities, image_only=True, allow_missing_keys=True),

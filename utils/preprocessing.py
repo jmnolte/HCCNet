@@ -39,6 +39,12 @@ def load_backbone(
         dino_pretraining: bool = False
     ) -> nn.Module | Tuple[nn.Module]:
 
+    '''
+    Args:
+        args (argparse.Namespace): Command line arguments.
+        dino_pretraining (bool): Boolean flag to indicate pretraining of the CNN backbone
+    '''
+
     in_chans = 1 if dino_pretraining else len(args.mod_list)
 
     if args.arch == 'atto':
@@ -75,34 +81,34 @@ def load_backbone(
 def load_data(
         args: argparse.Namespace,
         device: torch.device,
-        testing: bool = False,
-        pretraining: bool = False,
+        phase: str = 'train',
         partial: bool = False
     ) -> tuple:
 
     '''
-    Load training objects.
-
     Args:
         args (argparse.Namespace): Command line arguments.
-
-    Returns:
-        tuple: Training objects consisting of the datasets, dataloaders, the model, and the performance metric.
+        device (torch.device): Pytorch device.
+        phase (str): Current training phase. Can be 'train', 'pretrain', or 'test'.
+        partial (bool): Boolean flag to indicate whether loaded images need to include all specified modalities. Defaults to false.
     '''
     folds = range(args.k_folds) if args.k_folds > 0 else range(1)
-    if testing:
+    if phase == 'test':
         phases = ['test']
+    elif phase == 'pretrain':
+        phases = ['train']
     else:
-        phases = ['train','val'] if args.k_folds > 0 else ['train']
-
+        phases = ['train','val']
+        
     preprocessor = DatasetPreprocessor(
         data_dir=args.data_dir, 
         partial=True if partial else False)
     data_dict, label_df = preprocessor.load_data(
         modalities=args.mod_list, 
         keys=['label','delta'], 
-        file_name='lirads.csv' if pretraining else 'labels.csv',
+        file_name='lirads.csv' if phase == 'pretrain' else 'labels.csv',
         verbose=False)
+    # We always load diffusion weighted MRIs to ensure that the data in the test is consistent across training and pretraining.
     default_dict, default_df = DatasetPreprocessor(data_dir=args.data_dir).load_data(
         modalities=['DWI_b0','DWI_b150','DWI_b400','DWI_b800'], 
         keys=['label','delta'], 
@@ -110,7 +116,7 @@ def load_data(
     default_dev, default_test = GroupStratifiedSplit(split_ratio=0.75).split_dataset(default_df)
     test = label_df[label_df['patient_id'].isin(default_test['patient_id'])]
     dev = label_df[-label_df['patient_id'].isin(test['patient_id'])]
-    if not testing:
+    if phase == 'train':
         if args.k_folds > 1:
             cv_folds = StratifiedGroupKFold(n_splits=args.k_folds, shuffle=True, random_state=args.seed).split(dev, y=dev['label'], groups=dev['patient_id'])
             indices = [(dev.iloc[train_idx], dev.iloc[val_idx]) for train_idx, val_idx in list(cv_folds)]
@@ -119,24 +125,27 @@ def load_data(
             train, val = GroupStratifiedSplit(split_ratio=0.8).split_dataset(dev)
             split_dict = [convert_to_dict([train, val], data_dict=data_dict, split_names=phases, verbose=True) for k in folds]
         else:
-            split_dict = [convert_to_dict([dev], data_dict=data_dict, split_names=phases, verbose=True) for k in folds]
-    else:
+            split_dict = [convert_to_dict([dev, test], data_dict=data_dict, split_names=phases, verbose=True) for k in folds]
+    elif phase == 'pretrain':
+        folds = range(1)
+        split_dict = [convert_to_dict([dev], data_dict=data_dict, split_names=phases, verbose=True) for k in folds]
+    elif phase == 'test':
         folds = range(1)
         split_dict = [convert_to_dict([test], data_dict=data_dict, split_names=phases, verbose=True) for k in folds]
     seq_split_dict = [convert_to_seqdict(split_dict[k], args.mod_list, phases) for k in folds]
 
     class_dict = {x: [[patient['label'] for patient in split_dict[k][x]] for k in folds] for x in phases}
     seq_class_dict = {x: [[max(patient['label']) for patient in seq_split_dict[k][x][0]] for k in folds] for x in phases}
-    seq_split_dict = {x: [partition_dataset_classes(
+    data_partition_dict = {x: [partition_dataset_classes(
         data=split_dict[k][x] if partial else seq_split_dict[k][x][0],
-        classes=class_dict[k][x] if partial else seq_class_dict[x][k],
+        classes=class_dict[x][k] if partial else seq_class_dict[x][k],
         num_partitions=dist.get_world_size(),
         shuffle=True,
         even_divisible=False
         )[dist.get_rank()] for k in folds] for x in phases}
     if partial:
         datasets = {x: [CacheDataset(
-            data=split_dict[x][k], 
+            data=data_partition_dict[x][k], 
             transform=dino_transforms(
                 modalities=args.mod_list, 
                 device=device,
@@ -147,7 +156,7 @@ def load_data(
             ) for k in folds] for x in phases}
     else:
         datasets = {x: [CacheSeqDataset(
-            data=seq_split_dict[x][k],
+            data=data_partition_dict[x][k],
             image_keys=args.mod_list,
             transform=transforms(
                 dataset=x, 
@@ -167,7 +176,7 @@ def load_data(
             keys=['image','label','delta'], 
             seq_length=args.seq_length) if (x == 'train') & (not partial) else list_data_collate)
         ) for k in folds] for x in phases}
-    _, counts = np.unique(seq_class_dict['train' if not testing else 'test'][0], return_counts=True)
+    _, counts = np.unique(seq_class_dict['test' if phase == 'test' else 'train'][0], return_counts=True)
     pos_weight = counts[1] / counts.sum()
 
     return dataloader, pos_weight
@@ -178,6 +187,14 @@ def load_objs(
         learning_rate: float = 1e-4,
         pos_weight: float | List[float] | None = None
     ) -> tuple:
+
+    '''
+    Args:
+        args (argparse.Namespace): Command line arguments.
+        model (nn.Module): Pytorch module object.
+        learning_rate (float): Base learning rate.
+        pos_weight (float | List[float] | None): Class weight of the positive class, class weights of both classes, or None. Defaults to None.
+    '''
 
     if args.loss_fn == 'bce':
         train_fn = BinaryCELoss(weights=pos_weight, label_smoothing=args.label_smoothing)
