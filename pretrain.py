@@ -225,7 +225,7 @@ class Pretrainer:
 
         if clip_grad:
             self.scaler.unscale_(self.optim)
-            nn.utils.clip_grad_norm_(self.params, max_norm=3.0, norm_type=2)
+            nn.utils.clip_grad_norm_(self.params, max_norm=1.0, norm_type=2)
         if self.backbone_only:
             cancel_gradients_last_layer(self.student, step=step, warmup_steps=warmup_steps)
 
@@ -307,12 +307,12 @@ class Pretrainer:
                         self.log_dict(phase='train', keys='loss', values=loss)
                         print(f"[GPU {self.gpu_id}] Step {update_step}/{self.num_steps}, Loss: {loss.item():.4f}")
 
-                if (step + 1) / accum_steps % 1000 == 0:
+                if (step + 1) / accum_steps in [2000, 4000, 8000, 16000, 32000]:
                     if self.gpu_id == 0:
                         model_weights = self.teacher.module.state_dict() if self.backbone_only else self.model.module.state_dict()
                         self.save_output(model_weights, 'weights', fold=int(update_step + 1))
 
-                if (step + 1) % (self.num_steps * accum_steps) == 0:
+                if (step + 1) == self.num_steps * accum_steps:
                     break
 
         if self.gpu_id == 0:
