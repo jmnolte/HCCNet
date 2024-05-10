@@ -290,8 +290,10 @@ class Trainer:
                         if self.gpu_id == 0:
                             print(f'[GPU {self.gpu_id}] New best Validation Loss: {best_loss:.4f} and Metric: {val_metric:.4f}. Saving model weights...')
 
-                if (step + 1) == self.num_steps * accum_steps:
+                if (step + 1) == self.num_steps * accum_steps / 2:
                     best_weights = copy.deepcopy(self.model.module.state_dict())
+
+                if (step + 1) == self.num_steps * accum_steps:
                     break
 
         if self.gpu_id == 0:
