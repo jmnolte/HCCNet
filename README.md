@@ -24,14 +24,14 @@ After pre-training, we initialize the model with the weights obtained after pre-
 
 ### Results
 
-| Modality | Init weights | mAP | AUC |
+| Modality | Init weights | AUC-PR | AUC-ROC |
 | --- | --- | --- | --- | 
 | Diffusion MRI | Random | 0.426 | 0.776 |
 | T1 pre- and post contrast MRI | Random | 0.360 | 0.768 |
 | T1 in- and out-of-phase MRI | Random | 0.202 | 0.621 |
 | T2 MRI | Random | 0.374 | 0.705 |
 
-All models results are averaged over 10 runs with different random seeds.
+Models results are averaged over 10 runs with different random seeds.
 
 ## Future Additions
 
