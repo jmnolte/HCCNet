@@ -111,12 +111,9 @@ class Tester:
         
         results = self.metrics.compute()
         self.metrics.reset()
-        if self.gpu_id == 0:
-            print(results)
         probs = torch.cat(out_dict['probs'])
         labels = torch.cat(out_dict['labels'])
         self.save_output(out_dict, 'preds', fold)
-        print(probs, labels)
 
     def save_output(
             self, 
@@ -244,8 +241,9 @@ def main(
         model = MedNet(
             backbone, 
             num_classes=num_classes, 
-            classification=True,
+            pretrain=False,
             max_len=12,
+            num_layers=4,
             dropout=args.dropout, 
             eps=args.epsilon)
         weights = load_weights(os.path.join(args.weights_dir, f'weights_fold{k}_{args.suffix}.pth'))
