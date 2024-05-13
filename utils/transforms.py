@@ -136,6 +136,13 @@ def dino_transforms(
         global_crop_size (tuple): Tuple of integers specifying the size of the local views.
         image_spacing (tuple): Tuple of floats specifying the spacing between MRI slides.
     '''
+    if any('DWI' in mod for mod in modalities):
+        mean = 0.545
+        std = 0.778
+    elif any('T1WI' in mod for mod in modalities):
+        mean = 0.748
+        std = 0.784
+
     prep = [
         LoadImaged(keys=modalities, image_only=True, allow_missing_keys=True),
         EnsureChannelFirstd(keys=modalities, allow_missing_keys=True),
@@ -188,6 +195,6 @@ def dino_transforms(
         RandScaleIntensityd(keys=['gv1','gv2','lv1','lv2'], prob=1.0, factors=0.1, channel_wise=True),
         RandShiftIntensityd(keys=['gv1','gv2','lv1','lv2'], prob=1.0, offsets=0.1, channel_wise=True),
         RandSelectChanneld(keys=['gv1','gv2','lv1','lv2'], num_channels=1),
-        NormalizeIntensityd(keys=['gv1','gv2','lv1','lv2'], subtrahend=0.545, divisor=0.778)
+        NormalizeIntensityd(keys=['gv1','gv2','lv1','lv2'], subtrahend=mean, divisor=std)
     ]
     return Compose(prep + global_crop + local_crop + post)

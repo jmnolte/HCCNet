@@ -439,7 +439,7 @@ def main(
         backbone = load_backbone(args)
         model = MedNet(
             backbone=backbone, 
-            classification=False,
+            pretrain=True,
             max_len=12,
             num_layers=4,
             dropout=args.dropout,
