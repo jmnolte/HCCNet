@@ -22,7 +22,7 @@ We pretrain the CNN backbone adapting the DINO pretraining framework proposed in
 
 After pre-training, we initialize the model with the weights obtained after pre-training, add a linear pooling layer to the architecture, and fine-tune the full model on our downstream task.
 
-### Results
+## Results
 
 | Modality | Init weights | AUC-PR | AUC-ROC |
 | --- | --- | --- | --- | 
