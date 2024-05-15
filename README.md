@@ -24,14 +24,14 @@ After pre-training, we initialize the model with the weights obtained after pre-
 
 ## Results
 
-| Modality | Init weights | AUC-PR | AUC-ROC |
+| MRI Modality | Init weights | AUC-PR | AUC-ROC |
 | --- | --- | --- | --- | 
-| Diffusion MRI | Random | 0.426 | 0.776 |
-| T1 pre- and post contrast MRI | Random | 0.360 | 0.768 |
-| T1 in- and out-of-phase MRI | Random | 0.202 | 0.621 |
-| T2 MRI | Random | 0.374 | 0.705 |
+| Diffusion | Random | 0.426 | 0.776 |
+| T1 pre- and post contrast | Random | 0.360 | 0.768 |
+| T1 in- and out-of-phase | Random | 0.202 | 0.621 |
+| T2 | Random | 0.374 | 0.705 |
 
-Models results are averaged over 10 runs with different random seeds.
+Models results are averaged over 10 runs with different random seeds. Diffusion MRI scans include images with diffusion coefficient b = 0, 150, 400, and 800. T1 post-contrast images comprise, late aterial, portal venous, and delayed phase scans. Finally, T2 weighted images include scans with short and long echo time.
 
 ## Future Additions
 
