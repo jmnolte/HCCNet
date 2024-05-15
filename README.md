@@ -16,7 +16,7 @@ Model training follows a step-wise approach. That is, we first pretrain both CNN
 
 ### Pre-Training
 
-We pretrain the CNN backbone adapting the DINO pretraining framework proposed in [^3] to 3D medical images. Furthermore, for the Transformer encoder, we employ a custom pre-training approach, where we randomly shuffle 50% of embedded image sequences and train the model to differeniate shuffled from non-shuffled sequences. Note that during Transformer pre-training, we keep the parameters of the CNN backbone froozen.
+We pretrain the CNN backbone adapting the DINO pretraining framework proposed in [^3] to 3D medical images. Furthermore, for the Transformer encoder, we employ a custom pre-training approach, where we randomly shuffle 50% of embedded image sequences and train the model to differentiate shuffled from non-shuffled sequences. Note that during Transformer pre-training, we keep the parameters of the CNN backbone frozen.
 
 ### Fine-Tuning
 
