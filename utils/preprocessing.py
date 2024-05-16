@@ -197,8 +197,7 @@ def load_objs(
     '''
 
     if args.loss_fn == 'bce':
-        train_fn = BinaryCELoss(weights=pos_weight, label_smoothing=args.label_smoothing)
-        loss_fn = [train_fn, BinaryCELoss(weights=pos_weight)]
+        loss_fn = BinaryCELoss(weights=pos_weight, label_smoothing=args.label_smoothing)
     elif args.loss_fn == 'focal':
         train_fn = FocalLoss(gamma=args.gamma, alpha=pos_weight, label_smoothing=args.label_smoothing)
         loss_fn = [train_fn, BinaryCELoss(weights=pos_weight)]
