@@ -7,7 +7,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 import torch.distributed as dist
 from torch.cuda.amp import GradScaler, autocast
-from torchmetrics.classification import MulticlassAUROC
+from torchmetrics.classification import BinaryAUROC
 import argparse
 import os
 import time
@@ -78,7 +78,11 @@ class Pretrainer:
             raise ValueError('Please specify a path to the data directory.')
         self.scaler = GradScaler(enabled=amp)
 
-        self.loss_fn = loss_fn.to(self.gpu_id)
+        if isinstance(loss_fn, list):
+            self.loss_fn = loss_fn[0].to(self.gpu_id)
+        else:
+            self.loss_fn = loss_fn.to(self.gpu_id)
+
         self.optim = optimizer
         if self.backbone_only:
             self.lr_schedule, self.wd_schedule, self.m_schedule = scheduler[0], scheduler[1], scheduler[2]
@@ -87,7 +91,7 @@ class Pretrainer:
             self.lr_schedule, self.wd_schedule = scheduler[0], scheduler[1]
             self.params = self.model.parameters()
         self.results_dict = {dataset: {metric: [] for metric in ['loss']} for dataset in ['train']}
-        self.auroc = MulticlassAUROC(num_classes=4, ignore_index=0)
+        self.auroc = BinaryAUROC()
 
     def save_output(
             self, 
@@ -196,11 +200,11 @@ class Pretrainer:
 
         with autocast(enabled=self.amp):
             logits, labels = self.model(inputs, pad_mask=padding_mask, pos=delta)
-            loss = self.loss_fn(logits, labels.long())
+            loss = self.loss_fn(logits.squeeze(-1), labels.float())
             loss /= accum_steps
         self.scaler.scale(loss).backward()
 
-        preds = F.softmax(logits, dim=1)
+        preds = F.sigmoid(logits.squeeze(-1))
         self.auroc.update(preds, labels.int())
         return loss.item()
 
@@ -312,7 +316,7 @@ class Pretrainer:
                         model_weights = self.teacher.module.state_dict() if self.backbone_only else self.model.module.state_dict()
                         self.save_output(model_weights, 'weights', fold=int(update_step + 1))
 
-                if (step + 1) == self.num_steps * accum_steps:
+                if (step + 1) / accum_steps == self.num_steps:
                     break
 
         if self.gpu_id == 0:
@@ -377,8 +381,7 @@ def load_weights(
     '''
 
     weights = torch.load(weights_path, map_location='cpu')
-    weights = {k.replace('backbone.', ''): v for k, v in weights.items()}
-    weights['downsample_layers.0.0.weight'] = weights['downsample_layers.0.0.weight'].repeat(1, len(args.mod_list), 1, 1, 1)
+    weights['backbone.downsample_layers.0.0.weight'] = weights['backbone.downsample_layers.0.0.weight'].repeat(1, len(args.mod_list), 1, 1, 1)
     return weights
 
 def setup() -> None:
@@ -413,6 +416,7 @@ def main(
     learning_rate = scale_learning_rate(args.effective_batch_size)
     version = 'v2' if args.use_v2 else 'v1'
     backbone_only = True if args.loss_fn == 'dino' else False
+    modality = args.suffix.split('_')[0]
 
     dataloader, _ = load_data(args, device_id, phase='pretrain', partial=True if backbone_only else False)
     dataloader = {x: dataloader[x][0] for x in ['train']}
@@ -439,19 +443,20 @@ def main(
         backbone = load_backbone(args)
         model = MedNet(
             backbone=backbone, 
+            num_classes=1,
             pretrain=True,
             max_len=12,
-            num_layers=4,
+            num_layers=4 if any(args.arch in x for x in ['femto', 'pico']) else 6,
             dropout=args.dropout,
             eps=args.epsilon)
-        weights = load_weights(args, os.path.join(args.results_dir, f'model_weights/weights_fold16000_dmri_{args.arch}_{args.out_dim}.pth'))
-        model.backbone.load_state_dict(weights, strict=False)
+        weights = load_weights(args, os.path.join(args.results_dir, f'model_weights/weights_fold32000_{modality}_{args.arch}.pth'))
+        model.load_state_dict(weights, strict=False)
         model = model.to(device_id)
         for p in model.backbone.parameters():
             p.requires_grad = False
         if args.distributed:
             model = nn.parallel.DistributedDataParallel(model, device_ids=[device_id])
-        loss_fn, optimizer, schedules = load_objs(args, model, learning_rate)
+        loss_fn, optimizer, schedules = load_objs(args, model, learning_rate, pos_weight=None)
 
     pretrainer = Pretrainer(
         model=model,

@@ -244,7 +244,7 @@ class MedNet(nn.Module):
                 rand_idx += 1
                 x[i, 1:pad_idx[i]] = x[i, rand_idx]
         labels = prob_mask.float()
-        return x, labels
+        return x, labels.to(x.device)
 
     def extract_features(
             self,
@@ -267,7 +267,7 @@ class MedNet(nn.Module):
         x = self.extract_features(x)
         x, pad_mask, pos = self.add_cls_token(x, pad_mask, pos)
         if self.pretrain:
-            x, labels = self.shuffle_sequence(x, pad_mask, prob=0.5)
+            x, labels = self.shuffle_sequence(x, pad_mask, prob=0.66)
         x = self.positional_encoding(x, pos)
         x = x.permute(1, 0, 2)
         x = self.transformer_encoder(x, src_key_padding_mask=pad_mask)
