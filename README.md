@@ -127,7 +127,7 @@ After pre-training, we initialize the model with the weights obtained after pre-
   </tbody>
 </table>
 
-Diffusion MRI scans include images with diffusion coefficient `b = 0, 150, 400, and 800`, while T1 post-contrast images comprise, late aterial, portal venous, and delayed phase scans.
+Diffusion weighted MRI's (i.e., DW-MRI) compose a four channel image with diffusion coefficients `b = 0, 150, 400, and 800`. Contrarily, dynamic contrast enhanced T1 weighted MRIs comprise of one pre-contrast and three post-contrast (i.e., late aterial, portal venous, and delayed phase) scans.
 
 ## Future Additions
 
