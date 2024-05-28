@@ -36,10 +36,10 @@ After pre-training, we initialize the model with the weights obtained after pre-
       <th>MRI modality</th>
       <th>Architecture</th>
       <th>Params</th>
-      <th>AUC-PR</th>
-      <th>AUC-ROC</th>
-      <th>AUC-PR</th>
-      <th>AUC-ROC</th>
+      <th>AUPRC</th>
+      <th>AUROC</th>
+      <th>AUPRC</th>
+      <th>AUROC</th>
       <th>Downloads</th>
     </tr>
   </thead>
