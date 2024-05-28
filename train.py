@@ -290,10 +290,8 @@ class Trainer:
                         if self.gpu_id == 0:
                             print(f'[GPU {self.gpu_id}] New best Validation Loss: {best_loss:.4f} and Metric: {val_metric:.4f}. Saving model weights...')
 
-                if (step + 1) == self.num_steps * accum_steps / 2:
-                    best_weights = copy.deepcopy(self.model.module.state_dict())
-
                 if (step + 1) == self.num_steps * accum_steps:
+                    best_weights = copy.deepcopy(self.model.module.state_dict())
                     break
 
         if self.gpu_id == 0:
@@ -383,6 +381,7 @@ def main(
     num_classes = args.num_classes if args.num_classes > 2 else 1
     num_folds = args.k_folds if args.k_folds > 0 else 1
     seeds = np.random.randint(1000, 10000, args.num_seeds)
+    modality = args.suffix.split('_')[0]
 
     cv_dataloader, pos_weight = load_data(args, device_id)
     # We disable tracking of metadata for optimized performance
@@ -397,18 +396,15 @@ def main(
                 backbone, 
                 num_classes=num_classes, 
                 pretrain=False,
-                num_layers=4,
+                num_layers=4 if any(args.arch in x for x in ['femto', 'pico']) else 6,
                 max_len=12,
                 dropout=args.dropout, 
                 eps=args.epsilon)
             if args.pretrained:
-                weights_path = os.path.join(args.results_dir, 'model_weights/weights_fold1000_dmri_te_tiny_fixed.pth')
+                weights_path = os.path.join(args.results_dir, f'model_weights/weights_fold8000_{modality}_{args.arch}_te_1gpu.pth')
                 weights = torch.load(weights_path, map_location='cpu')
-                model.load_state_dict(weights, strict=False)
+                model.load_state_dict(weights)
             model = model.to(device_id)
-            # for name, param in model.named_parameters():
-            #     if not name.startswith(('pooler','head')):
-            #         param.requires_grad = False
             if args.distributed:
                 model = nn.parallel.DistributedDataParallel(model, device_ids=[device_id])
             loss_fn, optimizer, scheduler = load_objs(

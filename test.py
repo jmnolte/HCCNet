@@ -1,3 +1,4 @@
+from typing import List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -110,6 +111,8 @@ class Tester:
             out_dict['labels'].append(labels.cpu())
         
         results = self.metrics.compute()
+        if self.gpu_id == 0:
+            print(results)
         self.metrics.reset()
         probs = torch.cat(out_dict['probs'])
         labels = torch.cat(out_dict['labels'])
@@ -155,39 +158,57 @@ class Tester:
 
     def visualize_results(
             self,
+            metric_type: str,
+            models: List[str],
+            suffixes: List[str],
+            modality: str
         ) -> None:
 
-        log_book = []
-        for metric in ['AUROC','AUPRC']:
-            store_path = os.path.join(self.output_dir, 'model_diagnostics/roc_pr_curves', self.suffix + '_' + metric + '.png')
-            for fold in range(self.num_folds):
-                file_name = os.path.join(self.output_dir, 'model_preds', f'preds_fold{fold}_' + self.suffix + '.npy')
-                results = np.load(file_name, allow_pickle=True).item()
-                log_book.append(results['probs'])
-                if metric == 'AUROC':
-                    x_axis, y_axis, _ = metrics.roc_curve(results['labels'], results['probs'])
-                else:
-                    y_axis, x_axis, _ = metrics.precision_recall_curve(results['labels'], results['probs'])
-                plt.plot(x_axis, y_axis, color='blue', alpha=0.2)
-            
-            proba_array = np.mean(np.array(log_book), axis=0)
-            if metric == 'AUROC':
-                x_axis, y_axis, _ = metrics.roc_curve(results['labels'], proba_array)
-                metric_val = metrics.roc_auc_score(results['labels'], proba_array)
-                chance_val = 0.500
-                chance = [0.0, 1.0]
-            else:
-                y_axis, x_axis, _ = metrics.precision_recall_curve(results['labels'], proba_array)
-                metric_val = metrics.average_precision_score(results['labels'], proba_array)
-                chance_val = 0.138
-                chance = [chance_val, chance_val]
-            plt.plot(x_axis, y_axis, color='blue', label='MedNet: ' + str(metric) + '=' + str(round(metric_val, 3)))
-            plt.plot([0.0, 1.0], chance, color='darkgray', linestyle='--', label='Random Chance: ' + str(metric) + '=' + str(round(chance_val, 3)))
-            plt.ylabel('True Positive Rate' if metric == 'AUROC' else 'Precision', fontsize=20, labelpad=10)
-            plt.xlabel('False Positive Rate' if metric == 'AUROC' else 'Recall', fontsize=20, labelpad=10)
-            plt.legend(loc=4)
-            plt.savefig(store_path, dpi=300, bbox_inches="tight")
-            plt.close()
+        store_path = os.path.join(self.output_dir, 'model_diagnostics/roc_pr_curves', modality + '_' + metric_type + '.png')
+        preds_dict = {x: {y: [] for y in suffixes} for x in models}
+        labels_dict = {x: {y: [] for y in suffixes} for x in models}
+        for model, version in preds_dict.items():
+            for suffix in version.keys():
+                for fold in range(self.num_folds):
+                    file_name = f'preds_fold{fold}_{modality}_{model}_{suffix}' + '.npy'
+                    preds_path = os.path.join(self.output_dir, 'model_preds', file_name)
+                    preds = np.load(preds_path, allow_pickle=True).item()
+                    preds_dict[model][suffix].append(preds['probs'])
+                    labels_dict[model][suffix].append(preds['labels'])
+
+        metric_dict = {}
+        for model, version in preds_dict.items():
+            metric_dict[model] = {}
+            for suffix, pred_probs in version.items():
+                avg_pred_probs = np.mean(pred_probs, axis=0)
+                labels = np.mean(labels_dict[model][suffix], axis=0)
+                if metric_type == 'AUROC':
+                    x_axis, y_axis, _ = metrics.roc_curve(labels, avg_pred_probs)
+                    mean_metric = metrics.roc_auc_score(labels, avg_pred_probs)
+                elif metric_type == 'AUPRC':
+                    y_axis, x_axis, _ = metrics.precision_recall_curve(labels, avg_pred_probs)
+                    mean_metric = metrics.average_precision_score(labels, avg_pred_probs)
+                metric_dict[model][suffix] = (x_axis, y_axis, mean_metric)
+
+        colors = ['blue', 'green', 'red', 'purple']
+        linestyles = ['-', '--']
+
+        for i, (model, model_data) in enumerate(metric_dict.items()):
+            for j, suffix in enumerate(suffixes):
+                x_axis, y_axis, mean_metric = model_data[suffix]
+                version = 'pretrained' if suffix.startswith('pre') else ''
+                plt.plot(x_axis, y_axis, color=colors[i], linestyle=linestyles[j],
+                        label=f'HCCNet-{model.capitalize()} {version} (AUC = {mean_metric:.2f})')
+
+        if metric_type == 'AUROC':
+            plt.plot([0, 1], [0, 1], linestyle='--')
+        else:
+            plt.plot([0, 1], [0.138, 0.138], linestyle='--')
+        plt.ylabel('True Positive Rate' if metric_type == 'AUROC' else 'Precision', fontsize=20, labelpad=10)
+        plt.xlabel('False Positive Rate' if metric_type == 'AUROC' else 'Recall', fontsize=20, labelpad=10)
+        plt.legend(loc=4)
+        plt.savefig(store_path, dpi=300, bbox_inches="tight")
+        plt.close()
 
 def load_weights(
         weights_path: str
@@ -235,31 +256,38 @@ def main(
     dataloader, _ = load_data(args, device_id, phase='test')
     dataloader = {x: dataloader[x][0] for x in ['test']}
     set_track_meta(False)
+    modality = args.suffix.split('_')[0]
+    models = ['femto','pico','nano','tiny']
+    suffixes = ['pre_800steps','1600steps']
 
-    for k in range(num_folds):
-        backbone = load_backbone(args)
-        model = MedNet(
-            backbone, 
-            num_classes=num_classes, 
-            pretrain=False,
-            max_len=12,
-            num_layers=4,
-            dropout=args.dropout, 
-            eps=args.epsilon)
-        weights = load_weights(os.path.join(args.weights_dir, f'weights_fold{k}_{args.suffix}.pth'))
-        model.load_state_dict(weights)
-        model = model.to(device_id)
-        if args.distributed:
-            model = nn.parallel.DistributedDataParallel(model, device_ids=[device_id])
-        tester = Tester(
-            model=model, 
-            dataloaders=dataloader, 
-            num_folds=k,
-            amp=args.amp,
-            suffix=args.suffix,
-            output_dir=args.results_dir)
-        tester.test(fold=k)
-    tester.visualize_results()
+    for arch in models:
+        for suffix in suffixes:
+            for k in range(num_folds):
+                backbone = load_backbone(args, arch)
+                model = MedNet(
+                    backbone, 
+                    num_classes=num_classes, 
+                    pretrain=False,
+                    max_len=12,
+                    num_layers=4 if any(arch in x for x in ['femto', 'pico']) else 6,
+                    dropout=args.dropout, 
+                    eps=args.epsilon)
+                file_name = f'weights_fold{k}_{modality}_{arch}_{suffix}.pth'
+                weights = load_weights(os.path.join(args.weights_dir, file_name))
+                model.load_state_dict(weights)
+                model = model.to(device_id)
+                if args.distributed:
+                    model = nn.parallel.DistributedDataParallel(model, device_ids=[device_id])
+                tester = Tester(
+                    model=model, 
+                    dataloaders=dataloader, 
+                    num_folds=k,
+                    amp=args.amp,
+                    suffix=f'{modality}_{arch}_{suffix}',
+                    output_dir=args.results_dir)
+                tester.test(fold=k)
+    tester.visualize_results(metric_type='AUROC', models=models, suffixes=suffixes, modality=modality)
+    tester.visualize_results(metric_type='AUPRC', models=models, suffixes=suffixes, modality=modality)
     if args.distributed:
         cleanup()
     print('Script finished')

@@ -36,6 +36,7 @@ from losses.dinoloss import DINOLoss
 
 def load_backbone(
         args: argparse.Namespace,
+        arch: str,
         dino_pretraining: bool = False
     ) -> nn.Module | Tuple[nn.Module]:
 
@@ -47,27 +48,27 @@ def load_backbone(
 
     in_chans = 1 if dino_pretraining else len(args.mod_list)
 
-    if args.arch == 'atto':
+    if arch == 'atto':
         student = convnext3d_atto(
             in_chans=in_chans, kernel_size=args.kernel_size, drop_path_rate=args.stochastic_depth, use_v2=args.use_v2, eps=args.epsilon)
         teacher = convnext3d_atto(
             in_chans=in_chans, kernel_size=args.kernel_size, use_v2=args.use_v2, eps=args.epsilon)
-    elif args.arch == 'femto':
+    elif arch == 'femto':
         student = convnext3d_femto(
             in_chans=in_chans, kernel_size=args.kernel_size, drop_path_rate=args.stochastic_depth, use_v2=args.use_v2, eps=args.epsilon)
         teacher = convnext3d_femto(
             in_chans=in_chans, kernel_size=args.kernel_size, use_v2=args.use_v2, eps=args.epsilon)
-    elif args.arch == 'pico':
+    elif arch == 'pico':
         student = convnext3d_pico(
             in_chans=in_chans, kernel_size=args.kernel_size, drop_path_rate=args.stochastic_depth, use_v2=args.use_v2, eps=args.epsilon)
         teacher = convnext3d_pico(
             in_chans=in_chans, kernel_size=args.kernel_size, use_v2=args.use_v2, eps=args.epsilon)
-    elif args.arch == 'nano':
+    elif arch == 'nano':
         student = convnext3d_nano(
             in_chans=in_chans, kernel_size=args.kernel_size, drop_path_rate=args.stochastic_depth, use_v2=args.use_v2, eps=args.epsilon)
         teacher = convnext3d_nano(
             in_chans=in_chans, kernel_size=args.kernel_size, use_v2=args.use_v2, eps=args.epsilon)
-    elif args.arch == 'tiny':
+    elif arch == 'tiny':
         student = convnext3d_tiny(
             in_chans=in_chans, kernel_size=args.kernel_size, drop_path_rate=args.stochastic_depth, use_v2=args.use_v2, eps=args.epsilon)
         teacher = convnext3d_tiny(
@@ -197,7 +198,8 @@ def load_objs(
     '''
 
     if args.loss_fn == 'bce':
-        loss_fn = BinaryCELoss(weights=pos_weight, label_smoothing=args.label_smoothing)
+        train_fn = BinaryCELoss(weights=pos_weight, label_smoothing=args.label_smoothing)
+        loss_fn = [train_fn, BinaryCELoss(weights=pos_weight)]
     elif args.loss_fn == 'focal':
         train_fn = FocalLoss(gamma=args.gamma, alpha=pos_weight, label_smoothing=args.label_smoothing)
         loss_fn = [train_fn, BinaryCELoss(weights=pos_weight)]

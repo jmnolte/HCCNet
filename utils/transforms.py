@@ -142,6 +142,12 @@ def dino_transforms(
     elif any('T1WI' in mod for mod in modalities):
         mean = 0.748
         std = 0.784
+    elif any('T1W_IP' in mod for mod in modalities):
+        mean = -0.116
+        std = 0.567
+    elif any('T2W' in mod for mod in modalities):
+        mean = -0.299
+        std = 0.670
 
     prep = [
         LoadImaged(keys=modalities, image_only=True, allow_missing_keys=True),
