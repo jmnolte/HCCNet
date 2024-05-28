@@ -20,23 +20,121 @@ We pretrain the CNN backbone adapting the DINO pretraining framework proposed in
 
 ### Fine-Tuning
 
-After pre-training, we initialize the model with the weights obtained after pre-training, add a linear pooling layer to the architecture, and fine-tune the full model on our downstream task.
+After pre-training, we initialize the model with the weights obtained after pre-training, add a linear pooling layer to the architecture, and fine-tune the full model on our downstream task. We train the model over 10 runs with different random seeds and ensemble the runs' predictions by averaging over the predicted probabilities. 
 
 ## Results
 
-| MRI Modality | Init weights | AUC-PR | AUC-ROC |
-| --- | --- | --- | --- | 
-| Diffusion | Random | 0.426 | 0.776 |
-| T1 pre- and post contrast | Random | 0.360 | 0.768 |
-| T1 in- and out-of-phase | Random | 0.202 | 0.621 |
-| T2 | Random | 0.374 | 0.705 |
+<table>
+  <thead>
+    <tr>
+      <th colspan="3"></th>
+      <th colspan="2">Random init</th>
+      <th colspan="2">Pretrained init</th>
+      <th colspan="1"></th>
+    </tr>
+    <tr>
+      <th>MRI modality</th>
+      <th>Architecture</th>
+      <th>Params</th>
+      <th>AUC-PR</th>
+      <th>AUC-ROC</th>
+      <th>AUC-PR</th>
+      <th>AUC-ROC</th>
+      <th>Downloads</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Diffusion</td>
+      <td>HCCNet-F</td>
+      <td>12.4M</td>
+      <td>0.26</td>
+      <td>0.72</td>
+      <td>0.54</td>
+      <td>0.89</td>
+      <td><a href="https://drive.google.com/file/d/1NE32AjbCksuk_0DMJgyRGmQjP0loNYfw/view?usp=share_link" >model weights</a></td>
+    </tr>
+    <tr>
+      <td></td>
+      <td>HCCNet-P</td>
+      <td>22.0M</td>
+      <td>0.29</td>
+      <td>0.72</td>
+      <td>0.74</td>
+      <td>0.92</td>
+      <td><a href="https://drive.google.com/file/d/1R8AiBwWq3VMRwgU32AWCFqL8luNckV81/view?usp=share_link" >model weights</a></td>
+    </tr>
+    <tr>
+      <td></td>
+      <td>HCCNet-N</td>
+      <td>45.9M</td>
+      <td>0.31</td>
+      <td>0.72</td>
+      <td>0.79</td>
+      <td>0.95</td>
+      <td><a href="https://drive.google.com/file/d/1PRxlPqMqF17RsQJ9lW6tAsxcG7kX8bDI/view?usp=share_link" >model weights</a></td>
+    </tr>
+    <tr>
+      <td></td>
+      <td>HCCNet-T</td>
+      <td>72.4M</td>
+      <td>0.30</td>
+      <td>0.73</td>
+      <td>0.73</td>
+      <td>0.93</td>
+      <td><a href="https://drive.google.com/file/d/1TnFdq85wVLL_T17jo3pOSvvBjtua9KAJ/view?usp=share_link" >model weights</a></td>
+    </tr>
+    <tr>
+      <td>T1 pre-/ post-contrast</td>
+      <td>HCCNet-F</td>
+      <td>12.4M</td>
+      <td>0.30</td>
+      <td>0.74</td>
+      <td>0.53</td>
+      <td>0.76</td>
+      <td><a href="https://drive.google.com/file/d/1VIIfsGj2NwPkB5NMrPpPmDQ5VymUnFA-/view?usp=share_link" >model weights</a></td>
+    </tr>
+    <tr>
+      <td></td>
+      <td>HCCNet-P</td>
+      <td>22.0M</td>
+      <td>0.35</td>
+      <td>0.78</td>
+      <td>0.59</td>
+      <td>0.81</td>
+      <td><a href="https://drive.google.com/file/d/10HtFZ8miAN7z3U2V7R-cs5CsBGlbeUje/view?usp=share_link" >model weights</a></td>
+    </tr>
+    <tr>
+      <td></td>
+      <td>HCCNet-N</td>
+      <td>45.9M</td>
+      <td>0.39</td>
+      <td>0.78</td>
+      <td>0.48</td>
+      <td>0.76</td>
+      <td><a href="https://drive.google.com/file/d/1Ic952xETjs-dyHD5Sw18BT4hPBdQIHJS/view?usp=share_link" >model weights</a></td>
+    </tr>
+    <tr>
+      <td></td>
+      <td>HCCNet-T</td>
+      <td>72.4M</td>
+      <td>0.56</td>
+      <td>0.77</td>
+      <td>0.65</td>
+      <td>0.88</td>
+      <td><a href="https://drive.google.com/file/d/1wXpCS8sdYbQ18jdB6hVKIm6fKZSeuaq_/view?usp=share_link" >model weights</a></td>
+    </tr>
+  </tbody>
+</table>
 
-Models results are averaged over 10 runs with different random seeds. Diffusion MRI scans include images with diffusion coefficient b = 0, 150, 400, and 800. T1 post-contrast images comprise, late aterial, portal venous, and delayed phase scans. Finally, T2 weighted images include scans with short and long echo time.
+Diffusion MRI scans include images with diffusion coefficient `b = 0, 150, 400, and 800`, while T1 post-contrast images comprise, late aterial, portal venous, and delayed phase scans.
 
 ## Future Additions
 
-- [x] Add baseline results, i.e., without pre-training, for diffusion, T1, and T2 weighted MRI
-- [ ] Add results after pre-training
+- [x] Add results for diffusion MRI
+- [x] Add results for T1 contrast enhanced MRI
+- [ ] Add results for T1 in- and out-of-phase MRI
+- [ ] Add results for T2 MRI
 
 ## License
 
