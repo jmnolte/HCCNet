@@ -422,7 +422,7 @@ def main(
     dataloader = {x: dataloader[x][0] for x in ['train']}
     set_track_meta(False)
     if backbone_only:
-        student, teacher = load_backbone(args, dino_pretraining=True)
+        student, teacher = load_backbone(args, args.arch, dino_pretraining=True)
         embed_dim = student.head.in_features
         student = MultiCropWrapper(
             student,
