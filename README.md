@@ -33,7 +33,7 @@ After pre-training, we initialize the model with the weights obtained after pre-
       <th colspan="1"></th>
     </tr>
     <tr>
-      <th>MRI modality</th>
+      <th>Modality</th>
       <th>Architecture</th>
       <th>Params</th>
       <th>AUPRC</th>
@@ -45,7 +45,7 @@ After pre-training, we initialize the model with the weights obtained after pre-
   </thead>
   <tbody>
     <tr>
-      <td>Diffusion</td>
+      <td>DW-MRI</td>
       <td>HCCNet-F</td>
       <td>12.4M</td>
       <td>0.26</td>
@@ -85,7 +85,7 @@ After pre-training, we initialize the model with the weights obtained after pre-
       <td><a href="https://drive.google.com/file/d/1TnFdq85wVLL_T17jo3pOSvvBjtua9KAJ/view?usp=share_link" >model weights</a></td>
     </tr>
     <tr>
-      <td>T1 pre-/ post-contrast</td>
+      <td>T1 DCE-MRI</td>
       <td>HCCNet-F</td>
       <td>12.4M</td>
       <td>0.30</td>
