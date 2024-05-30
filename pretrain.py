@@ -440,7 +440,7 @@ def main(
         loss_fn, optimizer, schedules = load_objs(args, student, learning_rate)
         model = [student, teacher]
     else:
-        backbone = load_backbone(args)
+        backbone = load_backbone(args, args.arch)
         model = MedNet(
             backbone=backbone, 
             num_classes=1,

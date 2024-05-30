@@ -104,11 +104,14 @@ class Tester:
             fold (int): Current cross-validation fold.
         '''
 
-        out_dict = {x: [] for x in ['probs','labels']}
+        out_dict = {x: [] for x in ['probs','labels','uid']}
         for batch in self.dataloaders['test']:
+            uid = batch['uid']
+            uid = uid[0].split('_')[0] + '_' + uid[0].split('_')[1]
             probs, labels = self.test_step(batch)
             out_dict['probs'].append(probs.cpu())
             out_dict['labels'].append(labels.cpu())
+            out_dict['uid'].append(uid)
         
         results = self.metrics.compute()
         if self.gpu_id == 0:

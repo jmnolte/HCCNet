@@ -391,7 +391,7 @@ def main(
         set_determinism(seed=seed)
         for k in range(num_folds):
             dataloader = {x: cv_dataloader[x][k] for x in ['train','val']}
-            backbone = load_backbone(args)
+            backbone = load_backbone(args, args.arch)
             model = MedNet(
                 backbone, 
                 num_classes=num_classes, 
@@ -401,7 +401,8 @@ def main(
                 dropout=args.dropout, 
                 eps=args.epsilon)
             if args.pretrained:
-                weights_path = os.path.join(args.results_dir, f'model_weights/weights_fold8000_{modality}_{args.arch}_te_1gpu.pth')
+                weights_version = 'te' if any(args.arch in x for x in ['femto', 'pico']) else 'te_1gpu'
+                weights_path = os.path.join(args.results_dir, f'model_weights/weights_fold8000_{modality}_{args.arch}_{weights_version}.pth')
                 weights = torch.load(weights_path, map_location='cpu')
                 model.load_state_dict(weights)
             model = model.to(device_id)

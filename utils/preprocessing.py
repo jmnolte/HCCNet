@@ -141,7 +141,7 @@ def load_data(
         data=split_dict[k][x] if partial else seq_split_dict[k][x][0],
         classes=class_dict[x][k] if partial else seq_class_dict[x][k],
         num_partitions=dist.get_world_size(),
-        shuffle=True,
+        shuffle=(True if x != 'test' else False),
         even_divisible=False
         )[dist.get_rank()] for k in folds] for x in phases}
     if partial:
