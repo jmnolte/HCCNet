@@ -143,11 +143,8 @@ def dino_transforms(
         mean = 0.748
         std = 0.784
     elif any('T1W_IP' in mod for mod in modalities):
-        mean = -0.116
-        std = 0.567
-    elif any('T2W' in mod for mod in modalities):
-        mean = -0.299
-        std = 0.670
+        mean = -0.208
+        std = 0.619
 
     prep = [
         LoadImaged(keys=modalities, image_only=True, allow_missing_keys=True),
@@ -179,6 +176,7 @@ def dino_transforms(
             roi_center=(0.5, 0.3, 0.3),
             roi_size=(0.6, 0.5, 0.4),
             min_size=(82, 82, 82)),
+        SpatialPadd(keys='image', spatial_size=(72, 72, 72)),
         CenterSpatialCropd(keys='image', roi_size=(96, 96, 96)),
         CopyItemsd(keys='image', times=4, names=['gv1','gv2','lv1','lv2']),
         DeleteItemsd(keys=modalities + ['image','mask']),
