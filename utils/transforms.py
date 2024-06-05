@@ -54,11 +54,8 @@ def transforms(
         mean = (0.6991, 0.6642, 0.7852, 0.8884)
         std = (0.7520, 0.7403, 0.7812, 0.8444)
     elif any('T1W_IP' in mod for mod in modalities):
-        mean = (-0.2312, -0.3776)
-        std = (0.6274, 0.7104)
-    elif any('T2W' in mod for mod in modalities):
-        mean = (-0.1640, -0.0783)
-        std = (0.5422, 0.5877)
+        mean = (-0.2312, -0.3776, -0.1640, -0.0783)
+        std = (0.6274, 0.7104, 0.5422, 0.5877)
 
     prep = [
         LoadImaged(keys=modalities, image_only=True),

@@ -201,8 +201,8 @@ def load_objs(
         train_fn = BinaryCELoss(weights=pos_weight, label_smoothing=args.label_smoothing)
         loss_fn = [train_fn, BinaryCELoss(weights=pos_weight)]
     elif args.loss_fn == 'focal':
-        train_fn = FocalLoss(gamma=args.gamma, alpha=pos_weight, label_smoothing=args.label_smoothing)
-        loss_fn = [train_fn, BinaryCELoss(weights=pos_weight)]
+        train_fn = FocalLoss(gamma=args.gamma, alpha=pos_weight)
+        loss_fn = [train_fn, train_fn]
     elif args.loss_fn == 'mse':
         loss_fn = nn.MSELoss()
     elif args.loss_fn == 'dino':

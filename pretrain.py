@@ -416,7 +416,7 @@ def main(
     learning_rate = scale_learning_rate(args.effective_batch_size)
     version = 'v2' if args.use_v2 else 'v1'
     backbone_only = True if args.loss_fn == 'dino' else False
-    modality = args.suffix.split('_')[0]
+    modality = args.suffix.split('_')[0] if args.suffix.split('_')[0] != 't1iop' else 't1iop_t2'
 
     dataloader, _ = load_data(args, device_id, phase='pretrain', partial=True if backbone_only else False)
     dataloader = {x: dataloader[x][0] for x in ['train']}

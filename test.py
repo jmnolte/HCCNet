@@ -167,6 +167,7 @@ class Tester:
             modality: str
         ) -> None:
 
+        mean_x_axis = np.linspace(0, 1, 100)
         store_path = os.path.join(self.output_dir, 'model_diagnostics/roc_pr_curves', modality + '_' + metric_type + '.png')
         preds_dict = {x: {y: [] for y in suffixes} for x in models}
         labels_dict = {x: {y: [] for y in suffixes} for x in models}
@@ -183,33 +184,72 @@ class Tester:
         for model, version in preds_dict.items():
             metric_dict[model] = {}
             for suffix, pred_probs in version.items():
-                avg_pred_probs = np.mean(pred_probs, axis=0)
-                labels = np.mean(labels_dict[model][suffix], axis=0)
-                if metric_type == 'AUROC':
-                    x_axis, y_axis, _ = metrics.roc_curve(labels, avg_pred_probs)
-                    mean_metric = metrics.roc_auc_score(labels, avg_pred_probs)
-                elif metric_type == 'AUPRC':
-                    y_axis, x_axis, _ = metrics.precision_recall_curve(labels, avg_pred_probs)
-                    mean_metric = metrics.average_precision_score(labels, avg_pred_probs)
-                metric_dict[model][suffix] = (x_axis, y_axis, mean_metric)
+                metric_dict[model][suffix] = {}
+                results_dict = {x: [] for x in ['acc','prec','rec','f1','auc','pr']}
+                for fold in range(10):
+                    probs = pred_probs[fold]
+                    labels = labels_dict[model][suffix][fold]
+                    if metric_type == 'AUROC':
+                        x_axis, y_axis, _ = metrics.roc_curve(labels, probs)
+                    elif metric_type == 'AUPRC':
+                        y_axis, x_axis, _ = metrics.precision_recall_curve(labels, probs)
+                    y_axes = np.interp(mean_x_axis, x_axis, y_axis)
+                    y_axes[0] = 0.0
+
+                    f1_scores = []
+                    for thres in np.arange(0.0, 1.0, 0.001):
+                        score = metrics.f1_score(labels, [1 if x >= thres else 0 for x in probs])
+                        f1_scores.append((thres, score))
+                    best_thres, _ = max(f1_scores, key=lambda x: x[1])
+
+                    results_dict['acc'].append(metrics.accuracy_score(labels, np.where(probs >= best_thres, 1, 0)))
+                    results_dict['prec'].append(metrics.precision_score(labels, np.where(probs >= best_thres, 1, 0)))
+                    results_dict['rec'].append(metrics.recall_score(labels, np.where(probs >= best_thres, 1, 0)))
+                    results_dict['f1'].append(metrics.f1_score(labels, np.where(probs >= best_thres, 1, 0)))
+                    results_dict['auc'].append(metrics.roc_auc_score(labels, probs))
+                    results_dict['pr'].append(metrics.average_precision_score(labels, probs))
+                    metric_dict[model][suffix][fold] = (y_axes, results_dict['auc'] if metric_type == 'AUROC' else results_dict['pr'], labels, probs)
+                mean_metrics = [np.mean(results_dict[x]) for x in ['acc','prec','rec','f1','auc','pr']]
+                print(f'{model} {suffix} Accuracy: {mean_metrics[0]:.3f} STD: {np.std(results_dict["acc"]):.3f}')
+                print(f'Precision: {mean_metrics[1]:.3f} STD: {np.std(results_dict["prec"]):.3f}')
+                print(f'Recall: {mean_metrics[2]:.3f} STD: {np.std(results_dict["rec"]):.3f}')
+                print(f'F1: {mean_metrics[3]:.3f} STD: {np.std(results_dict["f1"]):.3f}')
+                print(f'AUC: {mean_metrics[4]:.3f} STD: {np.std(results_dict["auc"]):.3f}')
+                print(f'AUPRC: {mean_metrics[5]:.3f} STD: {np.std(results_dict["pr"]):.3f}')
 
         colors = ['blue', 'green', 'red', 'purple']
         linestyles = ['-', '--']
 
+        axis_dict = {x: {y: [] for y in suffixes} for x in models}
+        results_dict = {x: {y: [] for y in suffixes} for x in models}
+        target_dict = {x: {y: [] for y in suffixes} for x in models}
+        probs_dict = {x: {y: [] for y in suffixes} for x in models}
         for i, (model, model_data) in enumerate(metric_dict.items()):
             for j, suffix in enumerate(suffixes):
-                x_axis, y_axis, mean_metric = model_data[suffix]
+                for fold in range(self.num_folds):
+                    y_axes, fold_metric, labels, probs = model_data[suffix][fold]
+                    axis_dict[model][suffix].append(y_axes)
+                    results_dict[model][suffix].append(fold_metric)
+                    target_dict[model][suffix].append(labels)
+                    probs_dict[model][suffix].append(probs)
+                mean_y_axis = np.mean(axis_dict[model][suffix], axis=0)
+                mean_y_axis[-1] = 1.0
+                if metric_type == 'AUPRC':
+                    mean_y_axis, mean_x_axis, _ = metrics.precision_recall_curve(np.concatenate(target_dict[model][suffix]), np.concatenate(probs_dict[model][suffix]))
+                mean_metric = metrics.auc(mean_x_axis, mean_y_axis) if metric_type == 'AUROC' else np.mean(results_dict[model][suffix])
+                std_metric = np.std(results_dict[model][suffix])
                 version = 'pretrained' if suffix.startswith('pre') else ''
-                plt.plot(x_axis, y_axis, color=colors[i], linestyle=linestyles[j],
-                        label=f'HCCNet-{model.capitalize()} {version} (AUC = {mean_metric:.2f})')
+                plt.plot(mean_x_axis, mean_y_axis, color=colors[i], linestyle=linestyles[j], linewidth=1,
+                        label=f'HCCNet-{model[0].capitalize()} {version} (AUC = {mean_metric:.3f} $\pm$ {std_metric:.3f})')
 
         if metric_type == 'AUROC':
-            plt.plot([0, 1], [0, 1], linestyle='--')
+            plt.plot([0, 1], [0, 1], linestyle='--', color='black', linewidth=1)
         else:
-            plt.plot([0, 1], [0.138, 0.138], linestyle='--')
+            plt.plot([0, 1], [0.138, 0.138], linestyle='--', color='black', linewidth=1)
         plt.ylabel('True Positive Rate' if metric_type == 'AUROC' else 'Precision', fontsize=20, labelpad=10)
         plt.xlabel('False Positive Rate' if metric_type == 'AUROC' else 'Recall', fontsize=20, labelpad=10)
-        plt.legend(loc=4)
+        plt.legend(fontsize=8, loc=4)
+        plt.show()
         plt.savefig(store_path, dpi=300, bbox_inches="tight")
         plt.close()
 
@@ -259,9 +299,9 @@ def main(
     dataloader, _ = load_data(args, device_id, phase='test')
     dataloader = {x: dataloader[x][0] for x in ['test']}
     set_track_meta(False)
-    modality = args.suffix.split('_')[0]
+    modality = args.suffix.split('_')[0] if args.suffix.split('_')[0] != 't1iop' else 't1iop_t2'
     models = ['femto','pico','nano','tiny']
-    suffixes = ['pre_800steps','1600steps']
+    suffixes = ['pre_400steps','400steps']
 
     for arch in models:
         for suffix in suffixes:
