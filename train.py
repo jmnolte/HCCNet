@@ -381,7 +381,7 @@ def main(
     num_classes = args.num_classes if args.num_classes > 2 else 1
     num_folds = args.k_folds if args.k_folds > 0 else 1
     seeds = np.random.randint(1000, 10000, args.num_seeds)
-    modality = args.suffix.split('_')[0]
+    modality = args.suffix.split('_')[0] if args.suffix.split('_')[0] != 't1iop' else 't1iop_t2'
 
     cv_dataloader, pos_weight = load_data(args, device_id)
     # We disable tracking of metadata for optimized performance
