@@ -88,40 +88,40 @@ After pre-training, we initialize the model with the weights obtained after pre-
       <td>T1 DCE-MRI</td>
       <td>HCCNet-F</td>
       <td>12.4M</td>
-      <td>0.356</td>
-      <td>0.740</td>
-      <td>0.442</td>
-      <td>0.792</td>
+      <td>0.389</td>
+      <td>0.755</td>
+      <td>0.436</td>
+      <td>0.790</td>
       <td><a href="https://drive.google.com/file/d/1VIIfsGj2NwPkB5NMrPpPmDQ5VymUnFA-/view?usp=share_link" >model weights</a></td>
     </tr>
     <tr>
       <td></td>
       <td>HCCNet-P</td>
       <td>22.0M</td>
-      <td>0.371</td>
-      <td>0.753</td>
-      <td>0.478</td>
-      <td>0.801</td>
+      <td>0.402</td>
+      <td>0.773</td>
+      <td>0.450</td>
+      <td>0.777</td>
       <td><a href="https://drive.google.com/file/d/10HtFZ8miAN7z3U2V7R-cs5CsBGlbeUje/view?usp=share_link" >model weights</a></td>
     </tr>
     <tr>
       <td></td>
       <td>HCCNet-N</td>
       <td>45.9M</td>
-      <td>0.366</td>
+      <td>0.340</td>
       <td>0.746</td>
-      <td>0.463</td>
-      <td>0.764</td>
+      <td>0.388</td>
+      <td>0.727</td>
       <td><a href="https://drive.google.com/file/d/1Ic952xETjs-dyHD5Sw18BT4hPBdQIHJS/view?usp=share_link" >model weights</a></td>
     </tr>
     <tr>
       <td></td>
       <td>HCCNet-T</td>
       <td>72.4M</td>
-      <td>0.385</td>
-      <td>0.769</td>
-      <td>0.521</td>
-      <td>0.827</td>
+      <td>0.361</td>
+      <td>0.751</td>
+      <td>0.535</td>
+      <td>0.779</td>
       <td><a href="https://drive.google.com/file/d/1wXpCS8sdYbQ18jdB6hVKIm6fKZSeuaq_/view?usp=share_link" >model weights</a></td>
     </tr>
   </tbody>
