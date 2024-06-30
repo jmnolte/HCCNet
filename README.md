@@ -124,6 +124,46 @@ After pre-training, we initialize the model with the weights obtained after pre-
       <td>0.779</td>
       <td><a href="https://drive.google.com/file/d/1cRX8bJBYVxura9_txlwTWeJtUcdQJJay/view?usp=sharing" >model weights</a></td>
     </tr>
+    <tr>
+      <td>T1 IOP & T2-MRI</td>
+      <td>HCCNet-F</td>
+      <td>12.4M</td>
+      <td>0.427</td>
+      <td>0.672</td>
+      <td>0.223</td>
+      <td>0.615</td>
+      <td><a href="https://drive.google.com/file/d/1wkoDKHlBxTyYyuy2TBG6XWQyOu8hjZDc/view?usp=sharing" >model weights</a></td>
+    </tr>
+    <tr>
+      <td></td>
+      <td>HCCNet-P</td>
+      <td>22.0M</td>
+      <td>0.349</td>
+      <td>0.675</td>
+      <td>0.282</td>
+      <td>0.666</td>
+      <td><a href="https://drive.google.com/file/d/1XcYeggfQKC7RE3ZAKGZ7E8G97djEtLcX/view?usp=sharing" >model weights</a></td>
+    </tr>
+    <tr>
+      <td></td>
+      <td>HCCNet-N</td>
+      <td>45.9M</td>
+      <td>0.319</td>
+      <td>0.642</td>
+      <td>0.338</td>
+      <td>0.703</td>
+      <td><a href="https://drive.google.com/file/d/1VYXmZzFYNfCtd160JBtjXjSA_pphwWCV/view?usp=sharing" >model weights</a></td>
+    </tr>
+    <tr>
+      <td></td>
+      <td>HCCNet-T</td>
+      <td>72.4M</td>
+      <td>0.298</td>
+      <td>0.632</td>
+      <td>0.268</td>
+      <td>0.665</td>
+      <td><a href="https://drive.google.com/file/d/1y-kkamZEHqGJbhjzUOaCpzbuXibJZQN-/view?usp=sharing" >model weights</a></td>
+    </tr>
   </tbody>
 </table>
 
