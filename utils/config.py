@@ -25,15 +25,19 @@ def parse_args() -> argparse.Namespace:
     
     # Training specifics
     parser.add_argument("--loss-fn", type=str, default='bce',
-                        help="Loss function to use.")
+                        help="Loss function to use. Can dino, or BCE.")
     parser.add_argument("--distributed", action='store_true',
                         help="Whether to enable distributed training.")
     parser.add_argument("--amp", action='store_true',
                         help="Whether to enable automated mixed precision training.")
     parser.add_argument("--pretrained", action='store_true',
                         help="Flag to use pretrained weights.")
+    parser.add_argument("--partial", action='store_true',
+                        help="Flag to only use DINO pretrained weights.")
     parser.add_argument("--k-folds", default=5, type=int, 
                         help="Number of folds to use in cross validation. Defaults to 5.")
+    parser.add_argument("--max-delta", default=3, type=int, 
+                        help="Maximum time before diagnosis. Defaults to 3.")
     parser.add_argument("--num-seeds", default=3, type=int, 
                         help="Number of random seeds to run training over. Defaults to 3.")
 
@@ -81,7 +85,7 @@ def parse_args() -> argparse.Namespace:
 
     # File paths and auxiliaries
     parser.add_argument("--mod-list", default=MOD_LIST, nargs='+', 
-                        help="List of modalities to use for training")
+                        help="List of modalities to use for training. Can be DWI_b0, DWI_b150, DWI_b400, DWI_b800, T1WI, T1A, T1D, T1V, T1W_IP, T1W_OOP, T2W_TES, T2W_TEL")
     parser.add_argument("--seed", default=1234, type=int, 
                         help="Seed to use for reproducibility")
     parser.add_argument("--suffix", default='MedNet', type=str, 

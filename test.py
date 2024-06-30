@@ -9,15 +9,6 @@ import pandas as pd
 from sklearn import metrics
 import matplotlib.pyplot as plt
 from torch.cuda.amp import GradScaler, autocast
-from torchmetrics import MetricCollection
-from torchmetrics.classification import (
-    BinaryAccuracy, 
-    BinaryRecall,
-    BinaryPrecision,
-    BinaryF1Score,
-    BinaryAveragePrecision, 
-    BinaryAUROC
-)
 from monai.data import (
     ThreadDataLoader,
     CacheDataset,
@@ -46,6 +37,7 @@ class Tester:
             model: nn.Module, 
             dataloaders: dict, 
             num_folds: int = 5,
+            max_delta: int = 3,
             amp: bool = True,
             suffix: str | None = None,
             output_dir: str | None = None
@@ -64,14 +56,10 @@ class Tester:
         self.model = model
         self.dataloaders = dataloaders
         self.num_folds = num_folds
+        self.max_delta = max_delta
         self.amp = amp
         self.suffix = suffix
         self.output_dir = output_dir
-
-        self.metrics = MetricCollection([
-            BinaryAccuracy(), BinaryRecall(), BinaryPrecision(), BinaryF1Score(),
-            BinaryAveragePrecision(), BinaryAUROC()
-        ]).to(self.gpu_id)
 
     @torch.no_grad()
     def test_step(
@@ -91,7 +79,6 @@ class Tester:
             logits = self.model(inputs, pad_mask=padding_mask, pos=delta)
 
         probs = F.sigmoid(logits.squeeze(-1))
-        self.metrics.update(probs, labels.int())
         return probs, labels
 
     def test(
@@ -106,17 +93,11 @@ class Tester:
 
         out_dict = {x: [] for x in ['probs','labels','uid']}
         for batch in self.dataloaders['test']:
-            uid = batch['uid']
-            uid = uid[0].split('_')[0] + '_' + uid[0].split('_')[1]
             probs, labels = self.test_step(batch)
             out_dict['probs'].append(probs.cpu())
             out_dict['labels'].append(labels.cpu())
-            out_dict['uid'].append(uid)
-        
-        results = self.metrics.compute()
-        if self.gpu_id == 0:
-            print(results)
-        self.metrics.reset()
+            out_dict['uid'].append(batch['uid'])
+
         probs = torch.cat(out_dict['probs'])
         labels = torch.cat(out_dict['labels'])
         self.save_output(out_dict, 'preds', fold)
@@ -141,11 +122,11 @@ class Tester:
             exit(1)
         
         if output_type == 'weights':
-            folder_name = f'weights_fold{fold}_' + self.suffix + '.pth'
+            folder_name = f'weights_fold{fold}_{self.suffix}.pth'
         elif output_type == 'history':
-            folder_name = f'hist_fold{fold}_' + self.suffix + '.npy'
+            folder_name = f'hist_fold{fold}_{self.suffix}.npy'
         elif output_type == 'preds':
-            folder_name = f'preds_fold{fold}_' + self.suffix + '.npy'
+            folder_name = f'preds_fold{fold}_{self.suffix}.npy'
         folder_path = os.path.join(self.output_dir, 'model_' + output_type, folder_name)
         folder_path_root = os.path.join(self.output_dir, 'model_' + output_type)
 
@@ -296,7 +277,7 @@ def main(
     num_classes = args.num_classes if args.num_classes > 2 else 1
     num_folds = args.k_folds if args.k_folds > 0 else 1
 
-    dataloader, _ = load_data(args, device_id, phase='test')
+    dataloader, _ = load_data(args, device_id, phase='test', max_delta=args.max_delta)
     dataloader = {x: dataloader[x][0] for x in ['test']}
     set_track_meta(False)
     modality = args.suffix.split('_')[0] if args.suffix.split('_')[0] != 't1iop' else 't1iop_t2'
@@ -325,8 +306,9 @@ def main(
                     model=model, 
                     dataloaders=dataloader, 
                     num_folds=k,
+                    max_delta=args.max_delta,
                     amp=args.amp,
-                    suffix=f'{modality}_{arch}_{suffix}',
+                    suffix=f'{modality}_{arch}_{suffix}_{args.max_delta}months',
                     output_dir=args.results_dir)
                 tester.test(fold=k)
     tester.visualize_results(metric_type='AUROC', models=models, suffixes=suffixes, modality=modality)

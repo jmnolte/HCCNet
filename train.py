@@ -345,6 +345,21 @@ class Trainer:
         plt.savefig(file_path, dpi=300, bbox_inches="tight")
         plt.close()
 
+def load_weights(
+        args: argparse.Namespace,
+        weights_path: str
+    ) -> dict:
+
+    '''
+    Args:
+        args (argparse.Namespace): Command line arguments.
+        weights_path (str): Path to weights directory.
+    '''
+
+    weights = torch.load(weights_path, map_location='cpu')
+    weights['backbone.downsample_layers.0.0.weight'] = weights['backbone.downsample_layers.0.0.weight'].repeat(1, len(args.mod_list), 1, 1, 1)
+    return weights
+
 def setup() -> None:
 
     '''
@@ -403,8 +418,12 @@ def main(
             if args.pretrained:
                 weights_version = 'te' if any(args.arch in x for x in ['femto', 'pico']) else 'te_1gpu'
                 weights_path = os.path.join(args.results_dir, f'model_weights/weights_fold8000_{modality}_{args.arch}_{weights_version}.pth')
-                weights = torch.load(weights_path, map_location='cpu')
-                model.load_state_dict(weights)
+                if args.partial:
+                    weights = load_weights(args, os.path.join(args.results_dir, f'model_weights/weights_fold32000_{modality}_{args.arch}.pth'))
+                    model.load_state_dict(weights, strict=False)
+                else:
+                    weights = torch.load(weights_path, map_location='cpu')
+                    model.load_state_dict(weights)
             model = model.to(device_id)
             if args.distributed:
                 model = nn.parallel.DistributedDataParallel(model, device_ids=[device_id])
