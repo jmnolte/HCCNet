@@ -52,7 +52,7 @@ After pre-training, we initialize the model with the weights obtained after pre-
       <td>0.706</td>
       <td>0.690</td>
       <td>0.916</td>
-      <td><a href="https://drive.google.com/file/d/1NE32AjbCksuk_0DMJgyRGmQjP0loNYfw/view?usp=share_link" >model weights</a></td>
+      <td><a href="https://drive.google.com/file/d/1nz3L3FJRdo8fB3AHVqzO5nkyf9FQFvpg/view?usp=sharing" >model weights</a></td>
     </tr>
     <tr>
       <td></td>
@@ -62,7 +62,7 @@ After pre-training, we initialize the model with the weights obtained after pre-
       <td>0.715</td>
       <td>0.744</td>
       <td>0.936</td>
-      <td><a href="https://drive.google.com/file/d/1R8AiBwWq3VMRwgU32AWCFqL8luNckV81/view?usp=share_link" >model weights</a></td>
+      <td><a href="https://drive.google.com/file/d/1F9zDDAfxMfzVKSHg8eavjK5DV8t9gGRF/view?usp=sharing" >model weights</a></td>
     </tr>
     <tr>
       <td></td>
@@ -72,7 +72,7 @@ After pre-training, we initialize the model with the weights obtained after pre-
       <td>0.712</td>
       <td>0.689</td>
       <td>0.930</td>
-      <td><a href="https://drive.google.com/file/d/1PRxlPqMqF17RsQJ9lW6tAsxcG7kX8bDI/view?usp=share_link" >model weights</a></td>
+      <td><a href="https://drive.google.com/file/d/17PFeHEHT-yb7nDKY5hcMmeulptSON9bQ/view?usp=sharing" >model weights</a></td>
     </tr>
     <tr>
       <td></td>
@@ -82,7 +82,7 @@ After pre-training, we initialize the model with the weights obtained after pre-
       <td>0.717</td>
       <td>0.624</td>
       <td>0.928</td>
-      <td><a href="https://drive.google.com/file/d/1TnFdq85wVLL_T17jo3pOSvvBjtua9KAJ/view?usp=share_link" >model weights</a></td>
+      <td><a href="https://drive.google.com/file/d/1XlgSBT_2-fFyVgSimmjvw8jB9A5yp57S/view?usp=sharing" >model weights</a></td>
     </tr>
     <tr>
       <td>T1 DCE-MRI</td>
@@ -92,7 +92,7 @@ After pre-training, we initialize the model with the weights obtained after pre-
       <td>0.755</td>
       <td>0.436</td>
       <td>0.790</td>
-      <td><a href="https://drive.google.com/file/d/1VIIfsGj2NwPkB5NMrPpPmDQ5VymUnFA-/view?usp=share_link" >model weights</a></td>
+      <td><a href="https://drive.google.com/file/d/1UNWm6OhhPFc_e_STdRRzTIPC_pLWtBBy/view?usp=sharing" >model weights</a></td>
     </tr>
     <tr>
       <td></td>
@@ -102,7 +102,7 @@ After pre-training, we initialize the model with the weights obtained after pre-
       <td>0.773</td>
       <td>0.450</td>
       <td>0.777</td>
-      <td><a href="https://drive.google.com/file/d/10HtFZ8miAN7z3U2V7R-cs5CsBGlbeUje/view?usp=share_link" >model weights</a></td>
+      <td><a href="https://drive.google.com/file/d/1D2kB7LjmetJjLGAIUlK6pO-kLOJEEHxr/view?usp=sharing" >model weights</a></td>
     </tr>
     <tr>
       <td></td>
@@ -112,7 +112,7 @@ After pre-training, we initialize the model with the weights obtained after pre-
       <td>0.746</td>
       <td>0.388</td>
       <td>0.727</td>
-      <td><a href="https://drive.google.com/file/d/1Ic952xETjs-dyHD5Sw18BT4hPBdQIHJS/view?usp=share_link" >model weights</a></td>
+      <td><a href="https://drive.google.com/file/d/1prpkZ6N2wyJZ5_HbCEuSmmSBax3PYVhW/view?usp=sharing" >model weights</a></td>
     </tr>
     <tr>
       <td></td>
@@ -122,7 +122,7 @@ After pre-training, we initialize the model with the weights obtained after pre-
       <td>0.751</td>
       <td>0.535</td>
       <td>0.779</td>
-      <td><a href="https://drive.google.com/file/d/1wXpCS8sdYbQ18jdB6hVKIm6fKZSeuaq_/view?usp=share_link" >model weights</a></td>
+      <td><a href="https://drive.google.com/file/d/1cRX8bJBYVxura9_txlwTWeJtUcdQJJay/view?usp=sharing" >model weights</a></td>
     </tr>
   </tbody>
 </table>
