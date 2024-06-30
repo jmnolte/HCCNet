@@ -167,14 +167,13 @@ After pre-training, we initialize the model with the weights obtained after pre-
   </tbody>
 </table>
 
-Diffusion weighted MRI's (i.e., DW-MRI) compose a four channel image with diffusion coefficients `b = 0, 150, 400, and 800`. Contrarily, dynamic contrast enhanced T1 weighted MRIs comprise of one pre-contrast and three post-contrast (i.e., late aterial, portal venous, and delayed phase) scans.
+Diffusion weighted MRI's (i.e., DW-MRI) compose a four channel image with diffusion coefficients `b = 0, 150, 400, and 800`. Contrarily, dynamic contrast enhanced T1 weighted MRIs comprise of one pre-contrast and three post-contrast (i.e., late aterial, portal venous, and delayed phase) scans. T1 IOP & T2-MRI comprise T1-weighted in- and out-of-phase MRI as well as T2-weighted MRI with short and long echo times.
 
 ## Future Additions
 
 - [x] Add results for diffusion MRI
 - [x] Add results for T1 contrast enhanced MRI
-- [ ] Add results for T1 in- and out-of-phase MRI
-- [ ] Add results for T2 MRI
+- [x] Add results for T1 in- and out-of-phase and T2 MRI 
 
 ## License
 
