@@ -83,7 +83,8 @@ def load_data(
         args: argparse.Namespace,
         device: torch.device,
         phase: str = 'train',
-        partial: bool = False
+        partial: bool = False,
+        max_delta: int = 3
     ) -> tuple:
 
     '''
@@ -96,6 +97,7 @@ def load_data(
     folds = range(args.k_folds) if args.k_folds > 0 else range(1)
     if phase == 'test':
         phases = ['test']
+        # labels_file = f'labels_{max_delta}months.csv'
     elif phase == 'pretrain':
         phases = ['train']
     else:
