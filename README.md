@@ -22,6 +22,8 @@ We pretrain the CNN backbone adapting the DINO pretraining framework proposed in
 
 After pre-training, we initialize the model with the weights obtained after pre-training, add a linear pooling layer to the architecture, and fine-tune the full model on our downstream task. We train the model over 10 runs with different random seeds and ensemble the runs' predictions by averaging over the predicted probabilities. 
 
+<!---
+
 ## Results
 
 <table>
@@ -174,6 +176,8 @@ Diffusion weighted MRI's (i.e., DW-MRI) compose a four channel image with diffus
 - [x] Add results for diffusion MRI
 - [x] Add results for T1 contrast enhanced MRI
 - [x] Add results for T1 in- and out-of-phase and T2 MRI 
+
+--->
 
 ## License
 
