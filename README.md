@@ -6,7 +6,7 @@ For hepatocellular carcinoma (HCC) patients, early-stage diagnosis continues to 
 
 ## Model Architecture
 
-![Model Architecture](https://github.com/jmnolte/thesis/blob/master/report/architecture.png)
+![Model Architecture](https://github.com/jmnolte/thesis/blob/master/report/figure_outline.png)
 
 The model embeds the raw MR images in higher-dimensional feature space, adds time-based positional encodings, and subsequently processes the sequence of embedded image representations to predict the likelihood of future HCC development.
 
