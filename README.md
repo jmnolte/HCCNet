@@ -1,4 +1,7 @@
-# HCCNet: Early Prediction of Hepatocellular Carcinoma Using Longitudinal MRI
+# HCCNet: A CNN-Transformer for Classification of Longitudinal 3D MRI Images
+
+This repository is the official pytorch implementation for: A CNN-Transformer for Classification of Longitudinal 3D MRI Images – A Case Study on Hepatocellular Carcinoma Prediction [[arXiv]](https://arxiv.org/abs/2501.10733)
+
 
 ## Abstract
 
