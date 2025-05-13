@@ -189,3 +189,15 @@ The repository is licensed under the `apache-2.0` license.
 [^1]: Liu, Z., Mao, H., Wu, C.Y., Feichtenhofer, C., Darrell, T., Xie, S., 2022. A ConvNet for the 2020s. URL: http://arxiv.org/abs/2201.03545. arXiv:2201.03545.
 [^2]: Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones, L., Gomez, A.N., Kaiser, L., Polosukhin, I., 2023. Attention Is All You Need. URL: http://arxiv.org/abs/1706.03762. arXiv:1706.03762.
 [^3]: Caron, M., Touvron, H., Misra, I., J ́egou, H., Mairal, J., Bojanowski, P., Joulin, A., 2021. Emerging Properties in Self-Supervised Vision Transformers. URL: http://arxiv.org/abs/2104.14294. arXiv:2104.14294.
+
+## Citation
+
+If you use this work in your research, please cite:
+
+```bibtex
+@article{nolte2025cnn,
+  title={A CNN-Transformer for Classification of Longitudinal 3D MRI Images--A Case Study on Hepatocellular Carcinoma Prediction},
+  author={Nolte, Jakob and Guichelaar, Maureen MJ and Bouman, Donald E and Berg, Stephanie M and Haeri, Maryam Amir},
+  journal={arXiv preprint arXiv:2501.10733},
+  year={2025}
+}
